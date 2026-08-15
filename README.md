@@ -40,3 +40,8 @@ PathHydra is intended to provide:
 - a clean boundary between stored facts and inferred conclusions.
 
 The project is in its early design stage. Interfaces and storage formats are not yet stable.
+
+## Build plans
+
+- [Project scaffolding](docs/plans/00-project-scaffolding.md)
+- [First core slice: exact identity catalog](docs/plans/01-exact-identity-catalog.md)

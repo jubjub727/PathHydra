@@ -45,4 +45,4 @@ Use these terms consistently in code and documentation.
 
 ## Definition of done
 
-A change is done when its behaviour is tested, edge cases are covered, public behaviour is documented, and CPU/GPU graph selections agree where both implementations exist.
+A change is done when its behaviour is tested, edge cases are covered, public behaviour is documented, and CPU/GPU routing results agree where both implementations exist.
