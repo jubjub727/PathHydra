@@ -5,19 +5,22 @@ use std::{
 };
 
 use pathhydra_core::{
-    Candidate, CandidateId, ConfirmedRecord, NodeId, NodeName, NodeRecord, RelationId,
-    RelationName, RelationRecord,
+    BaseWeight, Candidate, CandidateId, ConfirmedRecord, EdgeId, EdgeRecord, NodeId, NodeName,
+    NodePayload, NodeRecord, RelationId, RelationName, RelationRecord,
 };
-use rocksdb::{ColumnFamily, DB, IteratorMode, Options, WriteBatch};
+use rocksdb::{ColumnFamily, DB, Direction, IteratorMode, Options, WriteBatch};
 
 use crate::{
     codec::{
-        self, CodecError, decode_candidate, decode_format_version, decode_id_key, decode_name_key,
-        decode_node, decode_relation, decode_u64_record, encode_candidate, encode_format_version,
+        self, CodecError, decode_adjacency_key, decode_adjacency_value, decode_candidate,
+        decode_edge, decode_id_key, decode_legacy_candidate, decode_legacy_node,
+        decode_legacy_relation, decode_legacy_u64_record, decode_name_key, decode_node,
+        decode_relation, decode_storage_format, decode_u64_record, encode_adjacency_key,
+        encode_adjacency_value, encode_candidate, encode_edge, encode_format_version,
         encode_id_key, encode_name_key, encode_node, encode_relation, encode_u64_record,
     },
     column_families,
-    error::{CatalogError, ConfirmedId, RecordKind},
+    error::{CatalogError, ConfirmedId, EdgeEndpoint, RecordKind},
 };
 
 const META_FORMAT: &[u8] = b"storage-format";
@@ -25,25 +28,78 @@ const META_GRAPH_VERSION: &[u8] = b"graph-version";
 const META_NEXT_CANDIDATE_ID: &[u8] = b"next-candidate-id";
 const META_NEXT_NODE_ID: &[u8] = b"next-node-id";
 const META_NEXT_RELATION_ID: &[u8] = b"next-relation-id";
+const META_NEXT_EDGE_ID: &[u8] = b"next-edge-id";
 const INITIAL_ID: u64 = 1;
 
 type NodeNameIndex = HashMap<Box<str>, NodeId>;
 type RelationNameIndex = HashMap<Box<str>, RelationId>;
 
-/// A durable exact-name catalog.
+/// A version-pinned, payload-free view of the complete confirmed graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfirmedGraph {
+    graph_version: u64,
+    node_ids: Vec<NodeId>,
+    relation_kind_ids: Vec<RelationId>,
+    edges: Vec<EdgeRecord>,
+}
+
+impl ConfirmedGraph {
+    #[must_use]
+    pub const fn graph_version(&self) -> u64 {
+        self.graph_version
+    }
+
+    #[must_use]
+    pub fn node_ids(&self) -> &[NodeId] {
+        &self.node_ids
+    }
+
+    #[must_use]
+    pub fn relation_kind_ids(&self) -> &[RelationId] {
+        &self.relation_kind_ids
+    }
+
+    #[must_use]
+    pub fn edges(&self) -> &[EdgeRecord] {
+        &self.edges
+    }
+}
+
+/// A durable store for exact identities and confirmed directed graph records.
 ///
-/// Candidate insertion does not make a name visible. The caller must validate
-/// it externally and then cross the explicit confirmation boundary:
+/// Candidates do not affect confirmed lookup or adjacency until the caller
+/// validates and explicitly promotes them. Edge promotion and cascading node
+/// deletion are each one atomic RocksDB batch:
 ///
 /// ```no_run
-/// use pathhydra_store::Catalog;
+/// use pathhydra_store::{Catalog, ConfirmedRecord};
 ///
 /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let catalog = Catalog::open("pathhydra.db")?;
-/// let candidate = catalog.insert_node_candidate("Exact Name")?;
-/// assert_eq!(catalog.lookup_node_exact("Exact Name")?, None);
-/// catalog.confirm_validated_candidate(candidate)?;
-/// assert!(catalog.lookup_node_exact("Exact Name")?.is_some());
+/// let source = catalog.insert_node_candidate("source")?;
+/// let destination = catalog.insert_node_candidate("destination")?;
+/// let kind = catalog.insert_relation_candidate("depends on")?;
+/// let ConfirmedRecord::Node(source) = catalog.confirm_validated_candidate(source)? else {
+///     unreachable!()
+/// };
+/// let ConfirmedRecord::Node(destination) = catalog.confirm_validated_candidate(destination)? else {
+///     unreachable!()
+/// };
+/// let ConfirmedRecord::Relation(kind) = catalog.confirm_validated_candidate(kind)? else {
+///     unreachable!()
+/// };
+/// let edge = catalog.insert_edge_candidate(
+///     source.id(),
+///     destination.id(),
+///     kind.id(),
+///     0.25,
+/// )?;
+/// let ConfirmedRecord::Edge(edge) = catalog.confirm_validated_candidate(edge)? else {
+///     unreachable!()
+/// };
+/// assert_eq!(catalog.outgoing_edges(source.id())?, vec![edge]);
+/// catalog.remove_node(source.id())?;
+/// assert!(catalog.outgoing_edges(destination.id())?.is_empty());
 /// # Ok(())
 /// # }
 /// ```
@@ -55,15 +111,16 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    /// Opens a catalog and rebuilds its confirmed exact-name indexes.
+    /// Opens, migrates if necessary, and validates a complete catalog before
+    /// publishing it.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CatalogError> {
         let mut options = Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
 
         let db = DB::open_cf_descriptors(&options, path, column_families::descriptors())?;
-        initialize_metadata(&db)?;
-        let (node_names, relation_names) = rebuild_indexes(&db)?;
+        initialize_or_migrate_metadata(&db)?;
+        let (node_names, relation_names) = rebuild_indexes_and_validate(&db)?;
 
         Ok(Self {
             db,
@@ -73,18 +130,67 @@ impl Catalog {
         })
     }
 
+    /// Inserts a provisional node candidate with an explicitly empty payload.
     pub fn insert_node_candidate(
         &self,
         name: impl Into<NodeName>,
     ) -> Result<CandidateId, CatalogError> {
-        self.insert_candidate(CandidateName::Node(name.into()))
+        self.insert_node_candidate_with_payload(name, NodePayload::default())
     }
 
+    /// Inserts a provisional node candidate and preserves its opaque payload.
+    pub fn insert_node_candidate_with_payload(
+        &self,
+        name: impl Into<NodeName>,
+        payload: impl Into<NodePayload>,
+    ) -> Result<CandidateId, CatalogError> {
+        self.insert_candidate(CandidateInput::Node {
+            name: name.into(),
+            payload: payload.into(),
+        })
+    }
+
+    /// Inserts a provisional relation-kind candidate.
     pub fn insert_relation_candidate(
         &self,
         name: impl Into<RelationName>,
     ) -> Result<CandidateId, CatalogError> {
-        self.insert_candidate(CandidateName::Relation(name.into()))
+        self.insert_candidate(CandidateInput::Relation(name.into()))
+    }
+
+    /// Inserts a provisional directed edge candidate.
+    ///
+    /// Endpoint and relation-kind existence is checked only at promotion. The
+    /// base weight is validated before any durable write.
+    pub fn insert_edge_candidate(
+        &self,
+        source: NodeId,
+        destination: NodeId,
+        relation_kind: RelationId,
+        base_weight: f32,
+    ) -> Result<CandidateId, CatalogError> {
+        self.insert_edge_candidate_with_base_weight(
+            source,
+            destination,
+            relation_kind,
+            BaseWeight::new(base_weight)?,
+        )
+    }
+
+    /// Inserts an edge candidate whose base weight was already validated.
+    pub fn insert_edge_candidate_with_base_weight(
+        &self,
+        source: NodeId,
+        destination: NodeId,
+        relation_kind: RelationId,
+        base_weight: BaseWeight,
+    ) -> Result<CandidateId, CatalogError> {
+        self.insert_candidate(CandidateInput::Edge {
+            source,
+            destination,
+            relation_kind,
+            base_weight,
+        })
     }
 
     pub fn get_candidate(&self, id: CandidateId) -> Result<Candidate, CatalogError> {
@@ -100,20 +206,22 @@ impl Catalog {
             .map_err(|error| record_error(column_families::CANDIDATES, id.to_string(), error))
     }
 
-    /// Confirms a candidate that the caller has already validated externally.
-    ///
-    /// The confirmed record, name mapping, candidate removal, counters, and
-    /// graph version are committed in one RocksDB write batch.
+    /// Promotes one externally validated candidate in one durable batch.
     pub fn confirm_validated_candidate(
         &self,
         id: CandidateId,
     ) -> Result<ConfirmedRecord, CatalogError> {
         let _write = self.write_guard()?;
-        let candidate = self.get_candidate(id)?;
-
-        match candidate {
-            Candidate::Node { id, name } => self.confirm_node(id, name),
+        match self.get_candidate(id)? {
+            Candidate::Node { id, name, payload } => self.confirm_node(id, name, payload),
             Candidate::Relation { id, name } => self.confirm_relation(id, name),
+            Candidate::Edge {
+                id,
+                source,
+                destination,
+                relation_kind,
+                base_weight,
+            } => self.confirm_edge(id, source, destination, relation_kind, base_weight),
         }
     }
 
@@ -140,29 +248,131 @@ impl Catalog {
     }
 
     pub fn get_node(&self, id: NodeId) -> Result<NodeRecord, CatalogError> {
-        let cf = column_family(&self.db, column_families::NODES)?;
-        let value =
-            self.db
-                .get_cf(cf, encode_id_key(id.as_u64()))?
-                .ok_or(CatalogError::NotFound {
-                    kind: RecordKind::Node,
-                    id: id.as_u64(),
-                })?;
-        decode_node(&value, id.as_u64())
-            .map_err(|error| record_error(column_families::NODES, id.to_string(), error))
+        get_node_from_db(&self.db, id)
     }
 
     pub fn get_relation(&self, id: RelationId) -> Result<RelationRecord, CatalogError> {
-        let cf = column_family(&self.db, column_families::RELATION_KINDS)?;
-        let value =
-            self.db
-                .get_cf(cf, encode_id_key(id.as_u64()))?
-                .ok_or(CatalogError::NotFound {
-                    kind: RecordKind::Relation,
-                    id: id.as_u64(),
-                })?;
-        decode_relation(&value, id.as_u64())
-            .map_err(|error| record_error(column_families::RELATION_KINDS, id.to_string(), error))
+        get_relation_from_db(&self.db, id)
+    }
+
+    pub fn get_edge(&self, id: EdgeId) -> Result<EdgeRecord, CatalogError> {
+        get_edge_from_db(&self.db, id)
+    }
+
+    /// Reads only confirmed outgoing edges through the source-prefix index.
+    pub fn outgoing_edges(&self, source: NodeId) -> Result<Vec<EdgeRecord>, CatalogError> {
+        let _write = self.write_guard()?;
+        self.get_node(source)?;
+        incident_edges(&self.db, column_families::OUTGOING_EDGES, source, true)
+    }
+
+    /// Reads only confirmed incoming edges through the destination-prefix index.
+    pub fn incoming_edges(&self, destination: NodeId) -> Result<Vec<EdgeRecord>, CatalogError> {
+        let _write = self.write_guard()?;
+        self.get_node(destination)?;
+        incident_edges(
+            &self.db,
+            column_families::INCOMING_EDGES,
+            destination,
+            false,
+        )
+    }
+
+    /// Returns one consistent, payload-free confirmed graph view for a future
+    /// routing snapshot compiler.
+    pub fn confirmed_graph(&self) -> Result<ConfirmedGraph, CatalogError> {
+        let _write = self.write_guard()?;
+        let graph_version = self.graph_version()?;
+        let node_ids = collect_ids(&self.db, column_families::NODES)?
+            .into_iter()
+            .map(NodeId::from_u64)
+            .collect();
+        let relation_kind_ids = collect_ids(&self.db, column_families::RELATION_KINDS)?
+            .into_iter()
+            .map(RelationId::from_u64)
+            .collect();
+        let edges = all_edges(&self.db)?;
+        Ok(ConfirmedGraph {
+            graph_version,
+            node_ids,
+            relation_kind_ids,
+            edges,
+        })
+    }
+
+    /// Removes one exact confirmed edge and both adjacency entries atomically.
+    pub fn remove_edge(&self, id: EdgeId) -> Result<u64, CatalogError> {
+        let _write = self.write_guard()?;
+        let edge = self.get_edge(id)?;
+        validate_exact_adjacency(&self.db, &edge)?;
+        let next_graph_version = next_graph_version(&self.db)?;
+
+        let edges = column_family(&self.db, column_families::EDGES)?;
+        let outgoing = column_family(&self.db, column_families::OUTGOING_EDGES)?;
+        let incoming = column_family(&self.db, column_families::INCOMING_EDGES)?;
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(edges, encode_id_key(id.as_u64()));
+        batch.delete_cf(outgoing, encode_adjacency_key(edge.source(), id));
+        batch.delete_cf(incoming, encode_adjacency_key(edge.destination(), id));
+        batch.put(META_GRAPH_VERSION, encode_u64_record(next_graph_version));
+        self.db.write(batch)?;
+        Ok(next_graph_version)
+    }
+
+    /// Removes a confirmed node, every incident confirmed edge, and the exact
+    /// node-name mapping in one atomic batch.
+    pub fn remove_node(&self, id: NodeId) -> Result<u64, CatalogError> {
+        let _write = self.write_guard()?;
+        let node = self.get_node(id)?;
+        let outgoing_edges = incident_edges(&self.db, column_families::OUTGOING_EDGES, id, true)?;
+        let incoming_edges = incident_edges(&self.db, column_families::INCOMING_EDGES, id, false)?;
+        let mut incident = HashMap::new();
+        for edge in outgoing_edges.into_iter().chain(incoming_edges) {
+            if let Some(existing) = incident.insert(edge.id(), edge.clone())
+                && existing != edge
+            {
+                return Err(corrupt(
+                    column_families::EDGES,
+                    edge.id().to_string(),
+                    "incident indexes resolve to different canonical edge records",
+                ));
+            }
+        }
+        for edge in incident.values() {
+            validate_exact_adjacency(&self.db, edge)?;
+        }
+
+        let name_key = encode_name_key(node.name().as_str()).map_err(codec_input_error)?;
+        let next_graph_version = next_graph_version(&self.db)?;
+        let nodes = column_family(&self.db, column_families::NODES)?;
+        let names = column_family(&self.db, column_families::NODE_NAMES)?;
+        let edges = column_family(&self.db, column_families::EDGES)?;
+        let outgoing = column_family(&self.db, column_families::OUTGOING_EDGES)?;
+        let incoming = column_family(&self.db, column_families::INCOMING_EDGES)?;
+        let mut index = self.node_index_write()?;
+        if index.get(node.name().as_str()) != Some(&id) {
+            return Err(corrupt(
+                column_families::NODE_NAMES,
+                node.name().as_str(),
+                "in-memory exact-name mapping disagrees with the confirmed node",
+            ));
+        }
+
+        let mut batch = WriteBatch::default();
+        for edge in incident.values() {
+            batch.delete_cf(edges, encode_id_key(edge.id().as_u64()));
+            batch.delete_cf(outgoing, encode_adjacency_key(edge.source(), edge.id()));
+            batch.delete_cf(
+                incoming,
+                encode_adjacency_key(edge.destination(), edge.id()),
+            );
+        }
+        batch.delete_cf(nodes, encode_id_key(id.as_u64()));
+        batch.delete_cf(names, name_key);
+        batch.put(META_GRAPH_VERSION, encode_u64_record(next_graph_version));
+        self.db.write(batch)?;
+        index.remove(node.name().as_str());
+        Ok(next_graph_version)
     }
 
     #[must_use = "errors reading durable metadata must be handled"]
@@ -170,7 +380,7 @@ impl Catalog {
         read_metadata(&self.db, META_GRAPH_VERSION, "graph-version")
     }
 
-    fn insert_candidate(&self, candidate_name: CandidateName) -> Result<CandidateId, CatalogError> {
+    fn insert_candidate(&self, input: CandidateInput) -> Result<CandidateId, CatalogError> {
         let _write = self.write_guard()?;
         let next_id = read_metadata(&self.db, META_NEXT_CANDIDATE_ID, "next-candidate-id")?;
         let following_id = next_id
@@ -179,9 +389,21 @@ impl Catalog {
                 counter: "candidate ID",
             })?;
         let id = CandidateId::from_u64(next_id);
-        let candidate = match candidate_name {
-            CandidateName::Node(name) => Candidate::Node { id, name },
-            CandidateName::Relation(name) => Candidate::Relation { id, name },
+        let candidate = match input {
+            CandidateInput::Node { name, payload } => Candidate::Node { id, name, payload },
+            CandidateInput::Relation(name) => Candidate::Relation { id, name },
+            CandidateInput::Edge {
+                source,
+                destination,
+                relation_kind,
+                base_weight,
+            } => Candidate::Edge {
+                id,
+                source,
+                destination,
+                relation_kind,
+                base_weight,
+            },
         };
         let encoded = encode_candidate(&candidate).map_err(codec_input_error)?;
 
@@ -197,6 +419,7 @@ impl Catalog {
         &self,
         candidate_id: CandidateId,
         name: NodeName,
+        payload: NodePayload,
     ) -> Result<ConfirmedRecord, CatalogError> {
         let name_key = encode_name_key(name.as_str()).map_err(codec_input_error)?;
         let names_cf = column_family(&self.db, column_families::NODE_NAMES)?;
@@ -213,14 +436,8 @@ impl Catalog {
         let following_id = next_id
             .checked_add(1)
             .ok_or(CatalogError::CounterOverflow { counter: "node ID" })?;
-        let graph_version = self.graph_version()?;
-        let next_graph_version =
-            graph_version
-                .checked_add(1)
-                .ok_or(CatalogError::CounterOverflow {
-                    counter: "graph version",
-                })?;
-        let record = NodeRecord::new(NodeId::from_u64(next_id), name);
+        let next_graph_version = next_graph_version(&self.db)?;
+        let record = NodeRecord::new(NodeId::from_u64(next_id), name, payload);
         let encoded_record = encode_node(&record).map_err(codec_input_error)?;
         let mut index = self.node_index_write()?;
 
@@ -261,13 +478,7 @@ impl Catalog {
             .ok_or(CatalogError::CounterOverflow {
                 counter: "relation ID",
             })?;
-        let graph_version = self.graph_version()?;
-        let next_graph_version =
-            graph_version
-                .checked_add(1)
-                .ok_or(CatalogError::CounterOverflow {
-                    counter: "graph version",
-                })?;
+        let next_graph_version = next_graph_version(&self.db)?;
         let record = RelationRecord::new(RelationId::from_u64(next_id), name);
         let encoded_record = encode_relation(&record).map_err(codec_input_error)?;
         let mut index = self.relation_index_write()?;
@@ -284,6 +495,54 @@ impl Catalog {
 
         index.insert(record.name().as_str().into(), record.id());
         Ok(ConfirmedRecord::Relation(record))
+    }
+
+    fn confirm_edge(
+        &self,
+        candidate_id: CandidateId,
+        source: NodeId,
+        destination: NodeId,
+        relation_kind: RelationId,
+        base_weight: BaseWeight,
+    ) -> Result<ConfirmedRecord, CatalogError> {
+        require_node(&self.db, source, EdgeEndpoint::Source)?;
+        require_node(&self.db, destination, EdgeEndpoint::Destination)?;
+        require_relation_kind(&self.db, relation_kind)?;
+
+        let next_id = read_metadata(&self.db, META_NEXT_EDGE_ID, "next-edge-id")?;
+        let following_id = next_id
+            .checked_add(1)
+            .ok_or(CatalogError::CounterOverflow { counter: "edge ID" })?;
+        let next_graph_version = next_graph_version(&self.db)?;
+        let record = EdgeRecord::new(
+            EdgeId::from_u64(next_id),
+            source,
+            destination,
+            relation_kind,
+            base_weight,
+        );
+
+        let candidates = column_family(&self.db, column_families::CANDIDATES)?;
+        let edges = column_family(&self.db, column_families::EDGES)?;
+        let outgoing = column_family(&self.db, column_families::OUTGOING_EDGES)?;
+        let incoming = column_family(&self.db, column_families::INCOMING_EDGES)?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(edges, encode_id_key(next_id), encode_edge(&record));
+        batch.put_cf(
+            outgoing,
+            encode_adjacency_key(source, record.id()),
+            encode_adjacency_value(record.id()),
+        );
+        batch.put_cf(
+            incoming,
+            encode_adjacency_key(destination, record.id()),
+            encode_adjacency_value(record.id()),
+        );
+        batch.delete_cf(candidates, encode_id_key(candidate_id.as_u64()));
+        batch.put(META_NEXT_EDGE_ID, encode_u64_record(following_id));
+        batch.put(META_GRAPH_VERSION, encode_u64_record(next_graph_version));
+        self.db.write(batch)?;
+        Ok(ConfirmedRecord::Edge(record))
     }
 
     fn write_guard(&self) -> Result<MutexGuard<'_, ()>, CatalogError> {
@@ -313,26 +572,34 @@ impl Catalog {
     }
 }
 
-enum CandidateName {
-    Node(NodeName),
+enum CandidateInput {
+    Node {
+        name: NodeName,
+        payload: NodePayload,
+    },
     Relation(RelationName),
+    Edge {
+        source: NodeId,
+        destination: NodeId,
+        relation_kind: RelationId,
+        base_weight: BaseWeight,
+    },
 }
 
-fn initialize_metadata(db: &DB) -> Result<(), CatalogError> {
+fn initialize_or_migrate_metadata(db: &DB) -> Result<(), CatalogError> {
     match db.get(META_FORMAT)? {
-        Some(value) => {
-            decode_format_version(&value)
-                .map_err(|error| record_error("default", "storage-format", error))?;
-            for (key, id) in [
-                (META_GRAPH_VERSION, "graph-version"),
-                (META_NEXT_CANDIDATE_ID, "next-candidate-id"),
-                (META_NEXT_NODE_ID, "next-node-id"),
-                (META_NEXT_RELATION_ID, "next-relation-id"),
-            ] {
-                read_metadata(db, key, id)?;
-            }
-            Ok(())
-        }
+        Some(value) => match decode_storage_format(&value)
+            .map_err(|error| record_error("default", "storage-format", error))?
+        {
+            codec::FORMAT_VERSION => validate_metadata(db),
+            codec::LEGACY_FORMAT_VERSION => migrate_v1_to_v2(db),
+            found => Err(CatalogError::IncompatibleFormat {
+                key_space: "default",
+                record_id: "storage-format".to_owned(),
+                found,
+                supported: codec::FORMAT_VERSION,
+            }),
+        },
         None => {
             ensure_database_empty(db)?;
             let mut batch = WriteBatch::default();
@@ -341,10 +608,142 @@ fn initialize_metadata(db: &DB) -> Result<(), CatalogError> {
             batch.put(META_NEXT_CANDIDATE_ID, encode_u64_record(INITIAL_ID));
             batch.put(META_NEXT_NODE_ID, encode_u64_record(INITIAL_ID));
             batch.put(META_NEXT_RELATION_ID, encode_u64_record(INITIAL_ID));
+            batch.put(META_NEXT_EDGE_ID, encode_u64_record(INITIAL_ID));
             db.write(batch)?;
             Ok(())
         }
     }
+}
+
+fn validate_metadata(db: &DB) -> Result<(), CatalogError> {
+    for (key, id) in [
+        (META_GRAPH_VERSION, "graph-version"),
+        (META_NEXT_CANDIDATE_ID, "next-candidate-id"),
+        (META_NEXT_NODE_ID, "next-node-id"),
+        (META_NEXT_RELATION_ID, "next-relation-id"),
+        (META_NEXT_EDGE_ID, "next-edge-id"),
+    ] {
+        read_metadata(db, key, id)?;
+    }
+    Ok(())
+}
+
+fn migrate_v1_to_v2(db: &DB) -> Result<(), CatalogError> {
+    for name in [
+        column_families::EDGES,
+        column_families::OUTGOING_EDGES,
+        column_families::INCOMING_EDGES,
+    ] {
+        let cf = column_family(db, name)?;
+        if db
+            .iterator_cf(cf, IteratorMode::Start)
+            .next()
+            .transpose()?
+            .is_some()
+        {
+            return Err(corrupt(
+                name,
+                "first record",
+                "version 1 catalog contains version 2 graph records",
+            ));
+        }
+    }
+
+    let metadata = [
+        (META_GRAPH_VERSION, "graph-version"),
+        (META_NEXT_CANDIDATE_ID, "next-candidate-id"),
+        (META_NEXT_NODE_ID, "next-node-id"),
+        (META_NEXT_RELATION_ID, "next-relation-id"),
+    ]
+    .map(|(key, id)| {
+        let value = db
+            .get(key)?
+            .ok_or_else(|| corrupt("default", id, "required legacy metadata record is missing"))?;
+        let decoded =
+            decode_legacy_u64_record(&value).map_err(|error| record_error("default", id, error))?;
+        Ok::<_, CatalogError>((key, decoded))
+    });
+
+    let mut batch = WriteBatch::default();
+    for item in metadata {
+        let (key, value) = item?;
+        batch.put(key, encode_u64_record(value));
+    }
+    migrate_candidate_records(db, &mut batch)?;
+    migrate_node_records(db, &mut batch)?;
+    migrate_relation_records(db, &mut batch)?;
+    migrate_name_values(db, &mut batch, column_families::NODE_NAMES)?;
+    migrate_name_values(db, &mut batch, column_families::RELATION_NAMES)?;
+    batch.put(META_NEXT_EDGE_ID, encode_u64_record(INITIAL_ID));
+    batch.put(META_FORMAT, encode_format_version());
+    db.write(batch)?;
+    Ok(())
+}
+
+fn migrate_candidate_records(db: &DB, batch: &mut WriteBatch) -> Result<(), CatalogError> {
+    let cf = column_family(db, column_families::CANDIDATES)?;
+    for entry in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, value) = entry?;
+        let id = decode_id_key(&key)
+            .map_err(|error| record_error(column_families::CANDIDATES, bytes_id(&key), error))?;
+        let candidate = decode_legacy_candidate(&value, id)
+            .map_err(|error| record_error(column_families::CANDIDATES, id.to_string(), error))?;
+        batch.put_cf(
+            cf,
+            key,
+            encode_candidate(&candidate).map_err(codec_input_error)?,
+        );
+    }
+    Ok(())
+}
+
+fn migrate_node_records(db: &DB, batch: &mut WriteBatch) -> Result<(), CatalogError> {
+    let cf = column_family(db, column_families::NODES)?;
+    for entry in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, value) = entry?;
+        let id = decode_id_key(&key)
+            .map_err(|error| record_error(column_families::NODES, bytes_id(&key), error))?;
+        let node = decode_legacy_node(&value, id)
+            .map_err(|error| record_error(column_families::NODES, id.to_string(), error))?;
+        batch.put_cf(cf, key, encode_node(&node).map_err(codec_input_error)?);
+    }
+    Ok(())
+}
+
+fn migrate_relation_records(db: &DB, batch: &mut WriteBatch) -> Result<(), CatalogError> {
+    let cf = column_family(db, column_families::RELATION_KINDS)?;
+    for entry in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, value) = entry?;
+        let id = decode_id_key(&key).map_err(|error| {
+            record_error(column_families::RELATION_KINDS, bytes_id(&key), error)
+        })?;
+        let relation = decode_legacy_relation(&value, id).map_err(|error| {
+            record_error(column_families::RELATION_KINDS, id.to_string(), error)
+        })?;
+        batch.put_cf(
+            cf,
+            key,
+            encode_relation(&relation).map_err(codec_input_error)?,
+        );
+    }
+    Ok(())
+}
+
+fn migrate_name_values(
+    db: &DB,
+    batch: &mut WriteBatch,
+    column_family_name: &'static str,
+) -> Result<(), CatalogError> {
+    let cf = column_family(db, column_family_name)?;
+    for entry in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, value) = entry?;
+        decode_name_key(&key)
+            .map_err(|error| record_error(column_family_name, bytes_id(&key), error))?;
+        let id = decode_legacy_u64_record(&value)
+            .map_err(|error| record_error(column_family_name, bytes_id(&key), error))?;
+        batch.put_cf(cf, key, encode_u64_record(id));
+    }
+    Ok(())
 }
 
 fn ensure_database_empty(db: &DB) -> Result<(), CatalogError> {
@@ -354,11 +753,11 @@ fn ensure_database_empty(db: &DB) -> Result<(), CatalogError> {
         .transpose()?
         .is_some()
     {
-        return Err(CatalogError::CorruptRecord {
-            key_space: "default",
-            record_id: "storage-format".to_owned(),
-            reason: "format marker is missing from a non-empty database".to_owned(),
-        });
+        return Err(corrupt(
+            "default",
+            "storage-format",
+            "format marker is missing from a non-empty database",
+        ));
     }
     for name in column_families::ALL {
         let cf = column_family(db, name)?;
@@ -368,168 +767,451 @@ fn ensure_database_empty(db: &DB) -> Result<(), CatalogError> {
             .transpose()?
             .is_some()
         {
-            return Err(CatalogError::CorruptRecord {
-                key_space: name,
-                record_id: "first record".to_owned(),
-                reason: "format marker is missing from a non-empty database".to_owned(),
-            });
+            return Err(corrupt(
+                name,
+                "first record",
+                "format marker is missing from a non-empty database",
+            ));
         }
     }
     Ok(())
 }
 
-fn rebuild_indexes(db: &DB) -> Result<(NodeNameIndex, RelationNameIndex), CatalogError> {
+fn rebuild_indexes_and_validate(
+    db: &DB,
+) -> Result<(NodeNameIndex, RelationNameIndex), CatalogError> {
     validate_candidates(db)?;
-
-    let mut nodes = HashMap::new();
-    let node_names_cf = column_family(db, column_families::NODE_NAMES)?;
-    let nodes_cf = column_family(db, column_families::NODES)?;
-    for entry in db.iterator_cf(node_names_cf, IteratorMode::Start) {
-        let (key, value) = entry?;
-        let key_id = bytes_id(&key);
-        let name = decode_name_key(&key)
-            .map_err(|error| record_error(column_families::NODE_NAMES, key_id, error))?;
-        let id = decode_u64_record(&value)
-            .map_err(|error| record_error(column_families::NODE_NAMES, name.to_string(), error))?;
-        let record_value =
-            db.get_cf(nodes_cf, encode_id_key(id))?
-                .ok_or_else(|| CatalogError::CorruptRecord {
-                    key_space: column_families::NODE_NAMES,
-                    record_id: name.to_string(),
-                    reason: format!("mapped node record {id} is missing"),
-                })?;
-        let record = decode_node(&record_value, id)
-            .map_err(|error| record_error(column_families::NODES, id.to_string(), error))?;
-        if record.name().as_str() != name.as_ref() {
-            return Err(CatalogError::CorruptRecord {
-                key_space: column_families::NODE_NAMES,
-                record_id: name.to_string(),
-                reason: format!("mapped node record {id} contains a different exact name"),
-            });
-        }
-        if nodes.insert(name.clone(), NodeId::from_u64(id)).is_some() {
-            return Err(CatalogError::CorruptRecord {
-                key_space: column_families::NODE_NAMES,
-                record_id: name.to_string(),
-                reason: "duplicate exact-name mapping".to_owned(),
-            });
-        }
-    }
-    verify_all_nodes_are_mapped(db, &nodes)?;
-
-    let mut relations = HashMap::new();
-    let relation_names_cf = column_family(db, column_families::RELATION_NAMES)?;
-    let relations_cf = column_family(db, column_families::RELATION_KINDS)?;
-    for entry in db.iterator_cf(relation_names_cf, IteratorMode::Start) {
-        let (key, value) = entry?;
-        let key_id = bytes_id(&key);
-        let name = decode_name_key(&key)
-            .map_err(|error| record_error(column_families::RELATION_NAMES, key_id, error))?;
-        let id = decode_u64_record(&value).map_err(|error| {
-            record_error(column_families::RELATION_NAMES, name.to_string(), error)
-        })?;
-        let record_value = db.get_cf(relations_cf, encode_id_key(id))?.ok_or_else(|| {
-            CatalogError::CorruptRecord {
-                key_space: column_families::RELATION_NAMES,
-                record_id: name.to_string(),
-                reason: format!("mapped relation record {id} is missing"),
-            }
-        })?;
-        let record = decode_relation(&record_value, id).map_err(|error| {
-            record_error(column_families::RELATION_KINDS, id.to_string(), error)
-        })?;
-        if record.name().as_str() != name.as_ref() {
-            return Err(CatalogError::CorruptRecord {
-                key_space: column_families::RELATION_NAMES,
-                record_id: name.to_string(),
-                reason: format!("mapped relation record {id} contains a different exact name"),
-            });
-        }
-        if relations
-            .insert(name.clone(), RelationId::from_u64(id))
-            .is_some()
-        {
-            return Err(CatalogError::CorruptRecord {
-                key_space: column_families::RELATION_NAMES,
-                record_id: name.to_string(),
-                reason: "duplicate exact-name mapping".to_owned(),
-            });
-        }
-    }
-    verify_all_relations_are_mapped(db, &relations)?;
+    let nodes = rebuild_node_index(db)?;
+    let relations = rebuild_relation_index(db)?;
+    validate_edges_and_adjacency(db)?;
+    validate_next_id_counters(db)?;
     Ok((nodes, relations))
+}
+
+fn validate_next_id_counters(db: &DB) -> Result<(), CatalogError> {
+    for (metadata_key, metadata_name, family) in [
+        (
+            META_NEXT_CANDIDATE_ID,
+            "next-candidate-id",
+            column_families::CANDIDATES,
+        ),
+        (META_NEXT_NODE_ID, "next-node-id", column_families::NODES),
+        (
+            META_NEXT_RELATION_ID,
+            "next-relation-id",
+            column_families::RELATION_KINDS,
+        ),
+        (META_NEXT_EDGE_ID, "next-edge-id", column_families::EDGES),
+    ] {
+        let next = read_metadata(db, metadata_key, metadata_name)?;
+        if next == 0 {
+            return Err(corrupt(
+                "default",
+                metadata_name,
+                "next ID must be at least 1",
+            ));
+        }
+        let maximum = collect_ids(db, family)?.into_iter().max().unwrap_or(0);
+        if next <= maximum {
+            return Err(corrupt(
+                "default",
+                metadata_name,
+                format!("next ID {next} does not follow existing ID {maximum}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_candidates(db: &DB) -> Result<(), CatalogError> {
     let cf = column_family(db, column_families::CANDIDATES)?;
     for entry in db.iterator_cf(cf, IteratorMode::Start) {
         let (key, value) = entry?;
-        let key_id = bytes_id(&key);
         let id = decode_id_key(&key)
-            .map_err(|error| record_error(column_families::CANDIDATES, key_id, error))?;
+            .map_err(|error| record_error(column_families::CANDIDATES, bytes_id(&key), error))?;
         decode_candidate(&value, id)
             .map_err(|error| record_error(column_families::CANDIDATES, id.to_string(), error))?;
     }
     Ok(())
 }
 
-fn verify_all_nodes_are_mapped(db: &DB, names: &NodeNameIndex) -> Result<(), CatalogError> {
-    let cf = column_family(db, column_families::NODES)?;
-    for entry in db.iterator_cf(cf, IteratorMode::Start) {
+fn rebuild_node_index(db: &DB) -> Result<NodeNameIndex, CatalogError> {
+    let mut names = HashMap::new();
+    let names_cf = column_family(db, column_families::NODE_NAMES)?;
+    let records_cf = column_family(db, column_families::NODES)?;
+    for entry in db.iterator_cf(names_cf, IteratorMode::Start) {
         let (key, value) = entry?;
-        let key_id = bytes_id(&key);
+        let name = decode_name_key(&key)
+            .map_err(|error| record_error(column_families::NODE_NAMES, bytes_id(&key), error))?;
+        let id = decode_u64_record(&value)
+            .map_err(|error| record_error(column_families::NODE_NAMES, name.to_string(), error))?;
+        let record_value = db.get_cf(records_cf, encode_id_key(id))?.ok_or_else(|| {
+            corrupt(
+                column_families::NODE_NAMES,
+                name.to_string(),
+                format!("mapped node record {id} is missing"),
+            )
+        })?;
+        let record = decode_node(&record_value, id)
+            .map_err(|error| record_error(column_families::NODES, id.to_string(), error))?;
+        if record.name().as_str() != name.as_ref() {
+            return Err(corrupt(
+                column_families::NODE_NAMES,
+                name.to_string(),
+                format!("mapped node record {id} contains a different exact name"),
+            ));
+        }
+        if names.insert(name.clone(), record.id()).is_some() {
+            return Err(corrupt(
+                column_families::NODE_NAMES,
+                name.to_string(),
+                "duplicate exact-name mapping",
+            ));
+        }
+    }
+    for entry in db.iterator_cf(records_cf, IteratorMode::Start) {
+        let (key, value) = entry?;
         let id = decode_id_key(&key)
-            .map_err(|error| record_error(column_families::NODES, key_id, error))?;
+            .map_err(|error| record_error(column_families::NODES, bytes_id(&key), error))?;
         let record = decode_node(&value, id)
             .map_err(|error| record_error(column_families::NODES, id.to_string(), error))?;
         if names.get(record.name().as_str()) != Some(&record.id()) {
-            return Err(CatalogError::CorruptRecord {
-                key_space: column_families::NODES,
-                record_id: id.to_string(),
-                reason: "confirmed node has no matching exact-name mapping".to_owned(),
-            });
+            return Err(corrupt(
+                column_families::NODES,
+                id.to_string(),
+                "confirmed node has no matching exact-name mapping",
+            ));
         }
     }
-    Ok(())
+    Ok(names)
 }
 
-fn verify_all_relations_are_mapped(db: &DB, names: &RelationNameIndex) -> Result<(), CatalogError> {
-    let cf = column_family(db, column_families::RELATION_KINDS)?;
-    for entry in db.iterator_cf(cf, IteratorMode::Start) {
+fn rebuild_relation_index(db: &DB) -> Result<RelationNameIndex, CatalogError> {
+    let mut names = HashMap::new();
+    let names_cf = column_family(db, column_families::RELATION_NAMES)?;
+    let records_cf = column_family(db, column_families::RELATION_KINDS)?;
+    for entry in db.iterator_cf(names_cf, IteratorMode::Start) {
         let (key, value) = entry?;
-        let key_id = bytes_id(&key);
-        let id = decode_id_key(&key)
-            .map_err(|error| record_error(column_families::RELATION_KINDS, key_id, error))?;
+        let name = decode_name_key(&key).map_err(|error| {
+            record_error(column_families::RELATION_NAMES, bytes_id(&key), error)
+        })?;
+        let id = decode_u64_record(&value).map_err(|error| {
+            record_error(column_families::RELATION_NAMES, name.to_string(), error)
+        })?;
+        let record_value = db.get_cf(records_cf, encode_id_key(id))?.ok_or_else(|| {
+            corrupt(
+                column_families::RELATION_NAMES,
+                name.to_string(),
+                format!("mapped relation-kind record {id} is missing"),
+            )
+        })?;
+        let record = decode_relation(&record_value, id).map_err(|error| {
+            record_error(column_families::RELATION_KINDS, id.to_string(), error)
+        })?;
+        if record.name().as_str() != name.as_ref() {
+            return Err(corrupt(
+                column_families::RELATION_NAMES,
+                name.to_string(),
+                format!("mapped relation-kind record {id} contains a different exact name"),
+            ));
+        }
+        if names.insert(name.clone(), record.id()).is_some() {
+            return Err(corrupt(
+                column_families::RELATION_NAMES,
+                name.to_string(),
+                "duplicate exact-name mapping",
+            ));
+        }
+    }
+    for entry in db.iterator_cf(records_cf, IteratorMode::Start) {
+        let (key, value) = entry?;
+        let id = decode_id_key(&key).map_err(|error| {
+            record_error(column_families::RELATION_KINDS, bytes_id(&key), error)
+        })?;
         let record = decode_relation(&value, id).map_err(|error| {
             record_error(column_families::RELATION_KINDS, id.to_string(), error)
         })?;
         if names.get(record.name().as_str()) != Some(&record.id()) {
-            return Err(CatalogError::CorruptRecord {
-                key_space: column_families::RELATION_KINDS,
-                record_id: id.to_string(),
-                reason: "confirmed relation has no matching exact-name mapping".to_owned(),
-            });
+            return Err(corrupt(
+                column_families::RELATION_KINDS,
+                id.to_string(),
+                "confirmed relation kind has no matching exact-name mapping",
+            ));
+        }
+    }
+    Ok(names)
+}
+
+fn validate_edges_and_adjacency(db: &DB) -> Result<(), CatalogError> {
+    let mut edges = HashMap::new();
+    for edge in all_edges(db)? {
+        require_node(db, edge.source(), EdgeEndpoint::Source).map_err(|_| {
+            corrupt(
+                column_families::EDGES,
+                edge.id().to_string(),
+                format!("source node {} is not confirmed", edge.source()),
+            )
+        })?;
+        require_node(db, edge.destination(), EdgeEndpoint::Destination).map_err(|_| {
+            corrupt(
+                column_families::EDGES,
+                edge.id().to_string(),
+                format!("destination node {} is not confirmed", edge.destination()),
+            )
+        })?;
+        require_relation_kind(db, edge.relation_kind()).map_err(|_| {
+            corrupt(
+                column_families::EDGES,
+                edge.id().to_string(),
+                format!("relation kind {} is not confirmed", edge.relation_kind()),
+            )
+        })?;
+        edges.insert(edge.id(), edge);
+    }
+
+    let mut outgoing_count = HashMap::new();
+    validate_adjacency_family(
+        db,
+        column_families::OUTGOING_EDGES,
+        &edges,
+        true,
+        &mut outgoing_count,
+    )?;
+    let mut incoming_count = HashMap::new();
+    validate_adjacency_family(
+        db,
+        column_families::INCOMING_EDGES,
+        &edges,
+        false,
+        &mut incoming_count,
+    )?;
+    for edge in edges.values() {
+        if outgoing_count.get(&edge.id()) != Some(&1) {
+            return Err(corrupt(
+                column_families::EDGES,
+                edge.id().to_string(),
+                "canonical edge does not have exactly one matching outgoing entry",
+            ));
+        }
+        if incoming_count.get(&edge.id()) != Some(&1) {
+            return Err(corrupt(
+                column_families::EDGES,
+                edge.id().to_string(),
+                "canonical edge does not have exactly one matching incoming entry",
+            ));
         }
     }
     Ok(())
 }
 
+fn validate_adjacency_family(
+    db: &DB,
+    name: &'static str,
+    edges: &HashMap<EdgeId, EdgeRecord>,
+    outgoing: bool,
+    counts: &mut HashMap<EdgeId, usize>,
+) -> Result<(), CatalogError> {
+    let cf = column_family(db, name)?;
+    for entry in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, value) = entry?;
+        let (node, edge_id) = decode_adjacency_key(&key)
+            .map_err(|error| record_error(name, bytes_id(&key), error))?;
+        decode_adjacency_value(&value, edge_id)
+            .map_err(|error| record_error(name, bytes_id(&key), error))?;
+        let edge = edges.get(&edge_id).ok_or_else(|| {
+            corrupt(
+                name,
+                bytes_id(&key),
+                format!("canonical edge {edge_id} is missing"),
+            )
+        })?;
+        let expected = if outgoing {
+            edge.source()
+        } else {
+            edge.destination()
+        };
+        if node != expected {
+            return Err(corrupt(
+                name,
+                bytes_id(&key),
+                format!("indexed endpoint {node} does not match canonical endpoint {expected}"),
+            ));
+        }
+        *counts.entry(edge_id).or_default() += 1;
+    }
+    Ok(())
+}
+
+fn incident_edges(
+    db: &DB,
+    index_name: &'static str,
+    node: NodeId,
+    outgoing: bool,
+) -> Result<Vec<EdgeRecord>, CatalogError> {
+    let cf = column_family(db, index_name)?;
+    let prefix = node.as_u64().to_be_bytes();
+    let mut edges = Vec::new();
+    for entry in db.iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward)) {
+        let (key, value) = entry?;
+        if key.get(..8) != Some(prefix.as_slice()) {
+            break;
+        }
+        let (indexed_node, edge_id) = decode_adjacency_key(&key)
+            .map_err(|error| record_error(index_name, bytes_id(&key), error))?;
+        if indexed_node != node {
+            return Err(corrupt(
+                index_name,
+                bytes_id(&key),
+                "adjacency prefix does not match decoded endpoint",
+            ));
+        }
+        decode_adjacency_value(&value, edge_id)
+            .map_err(|error| record_error(index_name, bytes_id(&key), error))?;
+        let edge = get_edge_from_db(db, edge_id).map_err(|error| match error {
+            CatalogError::NotFound { .. } => corrupt(
+                index_name,
+                bytes_id(&key),
+                format!("canonical edge {edge_id} is missing"),
+            ),
+            other => other,
+        })?;
+        let endpoint = if outgoing {
+            edge.source()
+        } else {
+            edge.destination()
+        };
+        if endpoint != node {
+            return Err(corrupt(
+                index_name,
+                bytes_id(&key),
+                format!("canonical edge {edge_id} has endpoint {endpoint}"),
+            ));
+        }
+        edges.push(edge);
+    }
+    Ok(edges)
+}
+
+fn validate_exact_adjacency(db: &DB, edge: &EdgeRecord) -> Result<(), CatalogError> {
+    for (name, node) in [
+        (column_families::OUTGOING_EDGES, edge.source()),
+        (column_families::INCOMING_EDGES, edge.destination()),
+    ] {
+        let cf = column_family(db, name)?;
+        let key = encode_adjacency_key(node, edge.id());
+        let value = db.get_cf(cf, key)?.ok_or_else(|| {
+            corrupt(
+                name,
+                edge.id().to_string(),
+                "required adjacency entry is missing",
+            )
+        })?;
+        decode_adjacency_value(&value, edge.id())
+            .map_err(|error| record_error(name, edge.id().to_string(), error))?;
+    }
+    Ok(())
+}
+
+fn get_node_from_db(db: &DB, id: NodeId) -> Result<NodeRecord, CatalogError> {
+    let cf = column_family(db, column_families::NODES)?;
+    let value = db
+        .get_cf(cf, encode_id_key(id.as_u64()))?
+        .ok_or(CatalogError::NotFound {
+            kind: RecordKind::Node,
+            id: id.as_u64(),
+        })?;
+    decode_node(&value, id.as_u64())
+        .map_err(|error| record_error(column_families::NODES, id.to_string(), error))
+}
+
+fn get_relation_from_db(db: &DB, id: RelationId) -> Result<RelationRecord, CatalogError> {
+    let cf = column_family(db, column_families::RELATION_KINDS)?;
+    let value = db
+        .get_cf(cf, encode_id_key(id.as_u64()))?
+        .ok_or(CatalogError::NotFound {
+            kind: RecordKind::Relation,
+            id: id.as_u64(),
+        })?;
+    decode_relation(&value, id.as_u64())
+        .map_err(|error| record_error(column_families::RELATION_KINDS, id.to_string(), error))
+}
+
+fn get_edge_from_db(db: &DB, id: EdgeId) -> Result<EdgeRecord, CatalogError> {
+    let cf = column_family(db, column_families::EDGES)?;
+    let value = db
+        .get_cf(cf, encode_id_key(id.as_u64()))?
+        .ok_or(CatalogError::NotFound {
+            kind: RecordKind::Edge,
+            id: id.as_u64(),
+        })?;
+    decode_edge(&value, id.as_u64())
+        .map_err(|error| record_error(column_families::EDGES, id.to_string(), error))
+}
+
+fn require_node(db: &DB, id: NodeId, endpoint: EdgeEndpoint) -> Result<(), CatalogError> {
+    match get_node_from_db(db, id) {
+        Ok(_) => Ok(()),
+        Err(CatalogError::NotFound { .. }) => Err(CatalogError::MissingEdgeEndpoint {
+            endpoint,
+            node_id: id,
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+fn require_relation_kind(db: &DB, id: RelationId) -> Result<(), CatalogError> {
+    match get_relation_from_db(db, id) {
+        Ok(_) => Ok(()),
+        Err(CatalogError::NotFound { .. }) => Err(CatalogError::MissingEdgeRelationKind {
+            relation_kind_id: id,
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+fn collect_ids(db: &DB, name: &'static str) -> Result<Vec<u64>, CatalogError> {
+    let cf = column_family(db, name)?;
+    let mut ids = Vec::new();
+    for entry in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, _) = entry?;
+        ids.push(decode_id_key(&key).map_err(|error| record_error(name, bytes_id(&key), error))?);
+    }
+    Ok(ids)
+}
+
+fn all_edges(db: &DB) -> Result<Vec<EdgeRecord>, CatalogError> {
+    let cf = column_family(db, column_families::EDGES)?;
+    let mut edges = Vec::new();
+    for entry in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, value) = entry?;
+        let id = decode_id_key(&key)
+            .map_err(|error| record_error(column_families::EDGES, bytes_id(&key), error))?;
+        edges.push(
+            decode_edge(&value, id)
+                .map_err(|error| record_error(column_families::EDGES, id.to_string(), error))?,
+        );
+    }
+    Ok(edges)
+}
+
+fn next_graph_version(db: &DB) -> Result<u64, CatalogError> {
+    read_metadata(db, META_GRAPH_VERSION, "graph-version")?
+        .checked_add(1)
+        .ok_or(CatalogError::CounterOverflow {
+            counter: "graph version",
+        })
+}
+
 fn read_metadata(db: &DB, key: &[u8], record_id: &'static str) -> Result<u64, CatalogError> {
-    let value = db.get(key)?.ok_or_else(|| CatalogError::CorruptRecord {
-        key_space: "default",
-        record_id: record_id.to_owned(),
-        reason: "required metadata record is missing".to_owned(),
-    })?;
+    let value = db
+        .get(key)?
+        .ok_or_else(|| corrupt("default", record_id, "required metadata record is missing"))?;
     decode_u64_record(&value).map_err(|error| record_error("default", record_id, error))
 }
 
 fn column_family<'a>(db: &'a DB, name: &'static str) -> Result<&'a ColumnFamily, CatalogError> {
     db.cf_handle(name)
-        .ok_or_else(|| CatalogError::CorruptRecord {
-            key_space: "database",
-            record_id: name.to_owned(),
-            reason: "required column family is missing".to_owned(),
-        })
+        .ok_or_else(|| corrupt("database", name, "required column family is missing"))
 }
 
 fn record_error(
@@ -556,11 +1238,24 @@ fn record_error(
 fn codec_input_error(error: CodecError) -> CatalogError {
     match error {
         CodecError::NameTooLong(byte_length) => CatalogError::NameTooLong { byte_length },
+        CodecError::PayloadTooLong(byte_length) => CatalogError::PayloadTooLong { byte_length },
         other => CatalogError::CorruptRecord {
             key_space: "input",
-            record_id: "name".to_owned(),
+            record_id: "candidate".to_owned(),
             reason: other.to_string(),
         },
+    }
+}
+
+fn corrupt(
+    key_space: &'static str,
+    record_id: impl Into<String>,
+    reason: impl Into<String>,
+) -> CatalogError {
+    CatalogError::CorruptRecord {
+        key_space,
+        record_id: record_id.into(),
+        reason: reason.into(),
     }
 }
 

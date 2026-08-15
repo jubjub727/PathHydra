@@ -28,5 +28,6 @@ macro_rules! durable_id {
 }
 
 durable_id!(CandidateId);
+durable_id!(EdgeId);
 durable_id!(NodeId);
 durable_id!(RelationId);

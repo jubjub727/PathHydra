@@ -1,8 +1,10 @@
 use pathhydra_core::{
-    Candidate, CandidateId, NodeId, NodeName, NodeRecord, RelationId, RelationName, RelationRecord,
+    BaseWeight, Candidate, CandidateId, EdgeId, EdgeRecord, MAX_NODE_PAYLOAD_BYTES, NodeId,
+    NodeName, NodePayload, NodeRecord, RelationId, RelationName, RelationRecord,
 };
 
-pub(crate) const FORMAT_VERSION: u8 = 1;
+pub(crate) const FORMAT_VERSION: u8 = 2;
+pub(crate) const LEGACY_FORMAT_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CodecError {
@@ -12,8 +14,10 @@ pub(crate) enum CodecError {
     InvalidLength(u32),
     InvalidUtf8,
     InvalidCandidateKind(u8),
+    InvalidBaseWeight(u32),
     IdMismatch { expected: u64, found: u64 },
     NameTooLong(usize),
+    PayloadTooLong(usize),
 }
 
 impl std::fmt::Display for CodecError {
@@ -22,9 +26,12 @@ impl std::fmt::Display for CodecError {
             Self::Truncated => formatter.write_str("truncated input"),
             Self::TrailingGarbage => formatter.write_str("trailing garbage"),
             Self::UnknownVersion(version) => write!(formatter, "unknown format version {version}"),
-            Self::InvalidLength(length) => write!(formatter, "invalid string byte length {length}"),
+            Self::InvalidLength(length) => write!(formatter, "invalid byte length {length}"),
             Self::InvalidUtf8 => formatter.write_str("invalid UTF-8"),
             Self::InvalidCandidateKind(kind) => write!(formatter, "unknown candidate kind {kind}"),
+            Self::InvalidBaseWeight(bits) => {
+                write!(formatter, "invalid base-weight bits 0x{bits:08x}")
+            }
             Self::IdMismatch { expected, found } => {
                 write!(
                     formatter,
@@ -32,6 +39,9 @@ impl std::fmt::Display for CodecError {
                 )
             }
             Self::NameTooLong(length) => write!(formatter, "name is too long: {length} bytes"),
+            Self::PayloadTooLong(length) => {
+                write!(formatter, "node payload is too long: {length} bytes")
+            }
         }
     }
 }
@@ -56,6 +66,15 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
+    fn version(&mut self, expected: u8) -> Result<(), CodecError> {
+        let found = self.byte()?;
+        if found == expected {
+            Ok(())
+        } else {
+            Err(CodecError::UnknownVersion(found))
+        }
+    }
+
     fn u32(&mut self) -> Result<u32, CodecError> {
         let bytes = self.take(4)?;
         let mut value = [0; 4];
@@ -70,12 +89,29 @@ impl<'a> Reader<'a> {
         Ok(u64::from_be_bytes(value))
     }
 
-    fn string(&mut self) -> Result<Box<str>, CodecError> {
+    fn bytes(&mut self) -> Result<Box<[u8]>, CodecError> {
         let length = self.u32()?;
         let length = usize::try_from(length).map_err(|_| CodecError::InvalidLength(length))?;
-        let bytes = self.take(length)?;
-        let value = std::str::from_utf8(bytes).map_err(|_| CodecError::InvalidUtf8)?;
+        Ok(self.take(length)?.into())
+    }
+
+    fn payload(&mut self) -> Result<NodePayload, CodecError> {
+        let bytes = self.bytes()?;
+        if bytes.len() > MAX_NODE_PAYLOAD_BYTES {
+            return Err(CodecError::PayloadTooLong(bytes.len()));
+        }
+        Ok(NodePayload::new(bytes))
+    }
+
+    fn string(&mut self) -> Result<Box<str>, CodecError> {
+        let bytes = self.bytes()?;
+        let value = std::str::from_utf8(&bytes).map_err(|_| CodecError::InvalidUtf8)?;
         Ok(value.into())
+    }
+
+    fn weight(&mut self) -> Result<BaseWeight, CodecError> {
+        let bits = self.u32()?;
+        BaseWeight::from_bits(bits).map_err(|_| CodecError::InvalidBaseWeight(bits))
     }
 
     fn take(&mut self, length: usize) -> Result<&'a [u8], CodecError> {
@@ -91,15 +127,6 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
-    fn version(&mut self) -> Result<(), CodecError> {
-        let found = self.byte()?;
-        if found == FORMAT_VERSION {
-            Ok(())
-        } else {
-            Err(CodecError::UnknownVersion(found))
-        }
-    }
-
     fn finish(self) -> Result<(), CodecError> {
         if self.position == self.bytes.len() {
             Ok(())
@@ -107,6 +134,16 @@ impl<'a> Reader<'a> {
             Err(CodecError::TrailingGarbage)
         }
     }
+}
+
+fn push_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), CodecError> {
+    if value.len() > MAX_NODE_PAYLOAD_BYTES {
+        return Err(CodecError::PayloadTooLong(value.len()));
+    }
+    let length = u32::try_from(value.len()).map_err(|_| CodecError::PayloadTooLong(value.len()))?;
+    output.extend_from_slice(&length.to_be_bytes());
+    output.extend_from_slice(value);
+    Ok(())
 }
 
 fn push_string(output: &mut Vec<u8>, value: &str) -> Result<(), CodecError> {
@@ -127,6 +164,40 @@ pub(crate) fn decode_id_key(bytes: &[u8]) -> Result<u64, CodecError> {
     Ok(value)
 }
 
+pub(crate) fn encode_adjacency_key(node: NodeId, edge: EdgeId) -> [u8; 16] {
+    let mut output = [0; 16];
+    output[..8].copy_from_slice(&node.as_u64().to_be_bytes());
+    output[8..].copy_from_slice(&edge.as_u64().to_be_bytes());
+    output
+}
+
+pub(crate) fn decode_adjacency_key(bytes: &[u8]) -> Result<(NodeId, EdgeId), CodecError> {
+    let mut reader = Reader::new(bytes);
+    let node = NodeId::from_u64(reader.u64()?);
+    let edge = EdgeId::from_u64(reader.u64()?);
+    reader.finish()?;
+    Ok((node, edge))
+}
+
+pub(crate) fn encode_adjacency_value(edge: EdgeId) -> [u8; 9] {
+    encode_u64_record(edge.as_u64())
+}
+
+pub(crate) fn decode_adjacency_value(
+    bytes: &[u8],
+    expected_edge: EdgeId,
+) -> Result<(), CodecError> {
+    let found = decode_u64_record(bytes)?;
+    if found == expected_edge.as_u64() {
+        Ok(())
+    } else {
+        Err(CodecError::IdMismatch {
+            expected: expected_edge.as_u64(),
+            found,
+        })
+    }
+}
+
 pub(crate) fn encode_name_key(name: &str) -> Result<Vec<u8>, CodecError> {
     let mut output = Vec::with_capacity(4 + name.len());
     push_string(&mut output, name)?;
@@ -144,48 +215,90 @@ pub(crate) fn encode_format_version() -> [u8; 1] {
     [FORMAT_VERSION]
 }
 
-pub(crate) fn decode_format_version(bytes: &[u8]) -> Result<(), CodecError> {
+pub(crate) fn decode_storage_format(bytes: &[u8]) -> Result<u8, CodecError> {
     let mut reader = Reader::new(bytes);
-    reader.version()?;
-    reader.finish()
+    let version = reader.byte()?;
+    reader.finish()?;
+    Ok(version)
 }
 
 pub(crate) fn encode_u64_record(value: u64) -> [u8; 9] {
+    encode_versioned_u64(FORMAT_VERSION, value)
+}
+
+pub(crate) fn decode_u64_record(bytes: &[u8]) -> Result<u64, CodecError> {
+    decode_versioned_u64(bytes, FORMAT_VERSION)
+}
+
+fn encode_versioned_u64(version: u8, value: u64) -> [u8; 9] {
     let mut output = [0; 9];
-    output[0] = FORMAT_VERSION;
+    output[0] = version;
     output[1..].copy_from_slice(&value.to_be_bytes());
     output
 }
 
-pub(crate) fn decode_u64_record(bytes: &[u8]) -> Result<u64, CodecError> {
+fn decode_versioned_u64(bytes: &[u8], version: u8) -> Result<u64, CodecError> {
     let mut reader = Reader::new(bytes);
-    reader.version()?;
+    reader.version(version)?;
     let value = reader.u64()?;
     reader.finish()?;
     Ok(value)
 }
 
+pub(crate) fn decode_legacy_u64_record(bytes: &[u8]) -> Result<u64, CodecError> {
+    decode_versioned_u64(bytes, LEGACY_FORMAT_VERSION)
+}
+
 pub(crate) fn encode_candidate(candidate: &Candidate) -> Result<Vec<u8>, CodecError> {
-    let mut output = Vec::new();
-    output.push(FORMAT_VERSION);
+    let mut output = vec![FORMAT_VERSION];
     match candidate {
-        Candidate::Node { id, name } => {
+        Candidate::Node { id, name, payload } => {
             output.push(1);
             output.extend_from_slice(&id.as_u64().to_be_bytes());
             push_string(&mut output, name.as_str())?;
+            push_bytes(&mut output, payload.as_bytes())?;
         }
         Candidate::Relation { id, name } => {
             output.push(2);
             output.extend_from_slice(&id.as_u64().to_be_bytes());
             push_string(&mut output, name.as_str())?;
         }
+        Candidate::Edge {
+            id,
+            source,
+            destination,
+            relation_kind,
+            base_weight,
+        } => {
+            output.push(3);
+            output.extend_from_slice(&id.as_u64().to_be_bytes());
+            output.extend_from_slice(&source.as_u64().to_be_bytes());
+            output.extend_from_slice(&destination.as_u64().to_be_bytes());
+            output.extend_from_slice(&relation_kind.as_u64().to_be_bytes());
+            output.extend_from_slice(&base_weight.to_bits().to_be_bytes());
+        }
     }
     Ok(output)
 }
 
 pub(crate) fn decode_candidate(bytes: &[u8], expected_id: u64) -> Result<Candidate, CodecError> {
+    decode_candidate_at_version(bytes, expected_id, FORMAT_VERSION)
+}
+
+pub(crate) fn decode_legacy_candidate(
+    bytes: &[u8],
+    expected_id: u64,
+) -> Result<Candidate, CodecError> {
+    decode_candidate_at_version(bytes, expected_id, LEGACY_FORMAT_VERSION)
+}
+
+fn decode_candidate_at_version(
+    bytes: &[u8],
+    expected_id: u64,
+    version: u8,
+) -> Result<Candidate, CodecError> {
     let mut reader = Reader::new(bytes);
-    reader.version()?;
+    reader.version(version)?;
     let kind = reader.byte()?;
     let id = reader.u64()?;
     if id != expected_id {
@@ -194,174 +307,250 @@ pub(crate) fn decode_candidate(bytes: &[u8], expected_id: u64) -> Result<Candida
             found: id,
         });
     }
-    let name = reader.string()?;
-    reader.finish()?;
     let id = CandidateId::from_u64(id);
-    match kind {
-        1 => Ok(Candidate::Node {
+    let candidate = match kind {
+        1 => {
+            let name = NodeName::new(reader.string()?);
+            let payload = if version == LEGACY_FORMAT_VERSION {
+                NodePayload::default()
+            } else {
+                reader.payload()?
+            };
+            Candidate::Node { id, name, payload }
+        }
+        2 => Candidate::Relation {
             id,
-            name: NodeName::new(name),
-        }),
-        2 => Ok(Candidate::Relation {
+            name: RelationName::new(reader.string()?),
+        },
+        3 if version == FORMAT_VERSION => Candidate::Edge {
             id,
-            name: RelationName::new(name),
-        }),
-        other => Err(CodecError::InvalidCandidateKind(other)),
-    }
+            source: NodeId::from_u64(reader.u64()?),
+            destination: NodeId::from_u64(reader.u64()?),
+            relation_kind: RelationId::from_u64(reader.u64()?),
+            base_weight: reader.weight()?,
+        },
+        other => return Err(CodecError::InvalidCandidateKind(other)),
+    };
+    reader.finish()?;
+    Ok(candidate)
 }
 
 pub(crate) fn encode_node(record: &NodeRecord) -> Result<Vec<u8>, CodecError> {
-    encode_confirmed(record.id().as_u64(), record.name().as_str())
+    let mut output = Vec::new();
+    output.push(FORMAT_VERSION);
+    output.extend_from_slice(&record.id().as_u64().to_be_bytes());
+    push_string(&mut output, record.name().as_str())?;
+    push_bytes(&mut output, record.payload().as_bytes())?;
+    Ok(output)
 }
 
 pub(crate) fn decode_node(bytes: &[u8], expected_id: u64) -> Result<NodeRecord, CodecError> {
-    let (id, name) = decode_confirmed(bytes, expected_id)?;
-    Ok(NodeRecord::new(NodeId::from_u64(id), NodeName::new(name)))
+    let mut reader = Reader::new(bytes);
+    reader.version(FORMAT_VERSION)?;
+    let id = checked_id(&mut reader, expected_id)?;
+    let name = NodeName::new(reader.string()?);
+    let payload = reader.payload()?;
+    reader.finish()?;
+    Ok(NodeRecord::new(NodeId::from_u64(id), name, payload))
+}
+
+pub(crate) fn decode_legacy_node(bytes: &[u8], expected_id: u64) -> Result<NodeRecord, CodecError> {
+    let mut reader = Reader::new(bytes);
+    reader.version(LEGACY_FORMAT_VERSION)?;
+    let id = checked_id(&mut reader, expected_id)?;
+    let name = NodeName::new(reader.string()?);
+    reader.finish()?;
+    Ok(NodeRecord::new(
+        NodeId::from_u64(id),
+        name,
+        NodePayload::default(),
+    ))
 }
 
 pub(crate) fn encode_relation(record: &RelationRecord) -> Result<Vec<u8>, CodecError> {
-    encode_confirmed(record.id().as_u64(), record.name().as_str())
+    encode_named_record(record.id().as_u64(), record.name().as_str())
 }
 
 pub(crate) fn decode_relation(
     bytes: &[u8],
     expected_id: u64,
 ) -> Result<RelationRecord, CodecError> {
-    let (id, name) = decode_confirmed(bytes, expected_id)?;
+    decode_relation_at_version(bytes, expected_id, FORMAT_VERSION)
+}
+
+pub(crate) fn decode_legacy_relation(
+    bytes: &[u8],
+    expected_id: u64,
+) -> Result<RelationRecord, CodecError> {
+    decode_relation_at_version(bytes, expected_id, LEGACY_FORMAT_VERSION)
+}
+
+fn decode_relation_at_version(
+    bytes: &[u8],
+    expected_id: u64,
+    version: u8,
+) -> Result<RelationRecord, CodecError> {
+    let mut reader = Reader::new(bytes);
+    reader.version(version)?;
+    let id = checked_id(&mut reader, expected_id)?;
+    let name = reader.string()?;
+    reader.finish()?;
     Ok(RelationRecord::new(
         RelationId::from_u64(id),
         RelationName::new(name),
     ))
 }
 
-fn encode_confirmed(id: u64, name: &str) -> Result<Vec<u8>, CodecError> {
-    let mut output = Vec::new();
-    output.push(FORMAT_VERSION);
+fn encode_named_record(id: u64, name: &str) -> Result<Vec<u8>, CodecError> {
+    let mut output = vec![FORMAT_VERSION];
     output.extend_from_slice(&id.to_be_bytes());
     push_string(&mut output, name)?;
     Ok(output)
 }
 
-fn decode_confirmed(bytes: &[u8], expected_id: u64) -> Result<(u64, Box<str>), CodecError> {
+pub(crate) fn encode_edge(record: &EdgeRecord) -> Vec<u8> {
+    let mut output = Vec::with_capacity(37);
+    output.push(FORMAT_VERSION);
+    output.extend_from_slice(&record.id().as_u64().to_be_bytes());
+    output.extend_from_slice(&record.source().as_u64().to_be_bytes());
+    output.extend_from_slice(&record.destination().as_u64().to_be_bytes());
+    output.extend_from_slice(&record.relation_kind().as_u64().to_be_bytes());
+    output.extend_from_slice(&record.base_weight().to_bits().to_be_bytes());
+    output
+}
+
+pub(crate) fn decode_edge(bytes: &[u8], expected_id: u64) -> Result<EdgeRecord, CodecError> {
     let mut reader = Reader::new(bytes);
-    reader.version()?;
-    let id = reader.u64()?;
-    if id != expected_id {
-        return Err(CodecError::IdMismatch {
-            expected: expected_id,
-            found: id,
-        });
-    }
-    let name = reader.string()?;
+    reader.version(FORMAT_VERSION)?;
+    let id = checked_id(&mut reader, expected_id)?;
+    let source = NodeId::from_u64(reader.u64()?);
+    let destination = NodeId::from_u64(reader.u64()?);
+    let relation_kind = RelationId::from_u64(reader.u64()?);
+    let base_weight = reader.weight()?;
     reader.finish()?;
-    Ok((id, name))
+    Ok(EdgeRecord::new(
+        EdgeId::from_u64(id),
+        source,
+        destination,
+        relation_kind,
+        base_weight,
+    ))
+}
+
+fn checked_id(reader: &mut Reader<'_>, expected: u64) -> Result<u64, CodecError> {
+    let found = reader.u64()?;
+    if found == expected {
+        Ok(found)
+    } else {
+        Err(CodecError::IdMismatch { expected, found })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use pathhydra_core::{
-        Candidate, CandidateId, NodeId, NodeName, NodeRecord, RelationId, RelationName,
-        RelationRecord,
-    };
-
     use super::*;
 
     #[test]
-    fn every_codec_round_trips() {
+    fn every_v2_codec_round_trips() {
         let node_candidate = Candidate::Node {
             id: CandidateId::from_u64(7),
             name: NodeName::new(" toke\u{301}n "),
+            payload: NodePayload::from([0, 0xff]),
         };
-        let relation_candidate = Candidate::Relation {
+        let edge_candidate = Candidate::Edge {
             id: CandidateId::from_u64(8),
-            name: RelationName::new("TOKEN!"),
+            source: NodeId::from_u64(2),
+            destination: NodeId::from_u64(3),
+            relation_kind: RelationId::from_u64(4),
+            base_weight: BaseWeight::new(0.25).unwrap(),
         };
-        let node = NodeRecord::new(NodeId::from_u64(11), NodeName::new("tokén"));
+        let node = NodeRecord::new(
+            NodeId::from_u64(11),
+            NodeName::new("tokén"),
+            NodePayload::from([0xff]),
+        );
         let relation =
             RelationRecord::new(RelationId::from_u64(12), RelationName::new("contains "));
+        let edge = EdgeRecord::new(
+            EdgeId::from_u64(13),
+            node.id(),
+            NodeId::from_u64(14),
+            relation.id(),
+            BaseWeight::MAX,
+        );
 
         assert_eq!(decode_id_key(&encode_id_key(42)), Ok(42));
         assert_eq!(
             decode_name_key(&encode_name_key("Exact").unwrap()).as_deref(),
             Ok("Exact")
         );
-        assert_eq!(decode_format_version(&encode_format_version()), Ok(()));
+        assert_eq!(decode_storage_format(&encode_format_version()), Ok(2));
         assert_eq!(decode_u64_record(&encode_u64_record(91)), Ok(91));
         assert_eq!(
             decode_candidate(&encode_candidate(&node_candidate).unwrap(), 7),
             Ok(node_candidate)
         );
         assert_eq!(
-            decode_candidate(&encode_candidate(&relation_candidate).unwrap(), 8),
-            Ok(relation_candidate)
+            decode_candidate(&encode_candidate(&edge_candidate).unwrap(), 8),
+            Ok(edge_candidate)
         );
         assert_eq!(decode_node(&encode_node(&node).unwrap(), 11), Ok(node));
         assert_eq!(
             decode_relation(&encode_relation(&relation).unwrap(), 12),
             Ok(relation)
         );
+        assert_eq!(decode_edge(&encode_edge(&edge), 13), Ok(edge.clone()));
+        let key = encode_adjacency_key(NodeId::from_u64(11), EdgeId::from_u64(13));
+        assert_eq!(
+            decode_adjacency_key(&key),
+            Ok((NodeId::from_u64(11), EdgeId::from_u64(13)))
+        );
+        assert_eq!(
+            decode_adjacency_value(&encode_adjacency_value(edge.id()), edge.id()),
+            Ok(())
+        );
     }
 
     #[test]
-    fn malformed_codecs_reject_truncation_trailing_bytes_versions_and_lengths() {
+    fn malformed_values_are_rejected() {
         assert_eq!(decode_id_key(&[0; 7]), Err(CodecError::Truncated));
         assert_eq!(decode_id_key(&[0; 9]), Err(CodecError::TrailingGarbage));
         assert_eq!(
-            decode_format_version(&[2]),
-            Err(CodecError::UnknownVersion(2))
-        );
-        assert_eq!(
-            decode_u64_record(&[FORMAT_VERSION; 8]),
-            Err(CodecError::Truncated)
-        );
-        assert_eq!(
-            decode_name_key(&[0, 0, 0, 2, b'a']),
-            Err(CodecError::Truncated)
+            decode_u64_record(&[1; 9]),
+            Err(CodecError::UnknownVersion(1))
         );
         assert_eq!(
             decode_name_key(&[0, 0, 0, 1, 0xff]),
             Err(CodecError::InvalidUtf8)
         );
 
-        let mut candidate = encode_candidate(&Candidate::Node {
-            id: CandidateId::from_u64(3),
-            name: NodeName::new("x"),
-        })
-        .unwrap();
-        candidate.push(0);
+        let mut edge = encode_edge(&EdgeRecord::new(
+            EdgeId::from_u64(1),
+            NodeId::from_u64(1),
+            NodeId::from_u64(2),
+            RelationId::from_u64(1),
+            BaseWeight::MIN,
+        ));
+        edge[33..37].copy_from_slice(&f32::NAN.to_bits().to_be_bytes());
         assert_eq!(
-            decode_candidate(&candidate, 3),
-            Err(CodecError::TrailingGarbage)
+            decode_edge(&edge, 1),
+            Err(CodecError::InvalidBaseWeight(f32::NAN.to_bits()))
         );
+    }
 
-        let mut bad_kind = candidate[..candidate.len() - 1].to_vec();
-        bad_kind[1] = 9;
+    #[test]
+    fn legacy_records_decode_with_empty_payloads() {
+        let mut bytes = vec![1, 1];
+        bytes.extend_from_slice(&7_u64.to_be_bytes());
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.push(b'n');
         assert_eq!(
-            decode_candidate(&bad_kind, 3),
-            Err(CodecError::InvalidCandidateKind(9))
-        );
-        assert_eq!(
-            decode_candidate(&bad_kind, 4),
-            Err(CodecError::IdMismatch {
-                expected: 4,
-                found: 3
-            })
-        );
-
-        let node = NodeRecord::new(NodeId::from_u64(1), NodeName::new("x"));
-        let mut encoded_node = encode_node(&node).unwrap();
-        encoded_node[0] = 99;
-        assert_eq!(
-            decode_node(&encoded_node, 1),
-            Err(CodecError::UnknownVersion(99))
-        );
-
-        let relation = RelationRecord::new(RelationId::from_u64(1), RelationName::new("x"));
-        let mut encoded_relation = encode_relation(&relation).unwrap();
-        encoded_relation.truncate(5);
-        assert_eq!(
-            decode_relation(&encoded_relation, 1),
-            Err(CodecError::Truncated)
+            decode_legacy_candidate(&bytes, 7).unwrap(),
+            Candidate::Node {
+                id: CandidateId::from_u64(7),
+                name: NodeName::new("n"),
+                payload: NodePayload::default(),
+            }
         );
     }
 }

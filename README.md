@@ -44,15 +44,16 @@ The project is in its early design stage. Interfaces and storage formats are not
 
 ## Implementation status
 
-The Rust core now provides durable exact-name catalogs for node identities and
-relation kinds. It supports provisional candidates, atomic confirmation,
-case-sensitive exact lookup, stable numeric IDs, graph-version increments, and
-validated in-memory index rebuilding after a RocksDB restart. Names are stored
-exactly; no trimming, case folding, Unicode normalization, or aliasing occurs.
+The Rust core now provides a durable, versioned graph store. It preserves
+opaque node payloads; exact node and relation-kind names; provisional node,
+relation-kind, and edge candidates; and confirmed typed, directed, normalized
+weighted edges. Promotion and deletion are atomic, parallel and self-edges
+have independent identities, node deletion cascades through both adjacency
+directions, and version 1 catalogs migrate without changing existing IDs or
+names. Startup validates every confirmed record and index relationship.
 
-Edges, payloads, deletion, routing, GPU acceleration, hydration, and
-caller-owned subgraph composition are not implemented yet. The catalog's
-version 1 layout is documented in
+Routing, GPU acceleration, hydration, and caller-owned subgraph composition
+are not implemented yet. The catalog's version 2 layout is documented in
 [the storage-format reference](docs/storage-format.md).
 
 ## Development
@@ -60,6 +61,10 @@ version 1 layout is documented in
 Building `pathhydra-store` requires a C++ toolchain and LLVM/libclang because
 the RocksDB binding compiles native code and generates bindings. On Windows,
 ensure LLVM's `bin` directory is on `PATH` (or set `LIBCLANG_PATH`).
+If the `librocksdb-sys` build helper exits with `STATUS_DLL_NOT_FOUND`, ensure
+the selected LLVM installation's `libclang.dll` and its native runtime are
+discoverable on `PATH`; this is a toolchain startup failure, not a graph-store
+failure.
 
 Run the authoritative local checks from the repository root:
 
@@ -69,8 +74,3 @@ cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
-
-## Build plans
-
-- [Project scaffolding](docs/plans/00-project-scaffolding.md)
-- [First core slice: exact identity catalog](docs/plans/01-exact-identity-catalog.md)

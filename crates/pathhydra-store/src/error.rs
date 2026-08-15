@@ -1,12 +1,13 @@
 use std::{error::Error, fmt};
 
-use pathhydra_core::{NodeId, RelationId};
+use pathhydra_core::{InvalidBaseWeight, MAX_NODE_PAYLOAD_BYTES, NodeId, RelationId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecordKind {
     Candidate,
     Node,
     Relation,
+    Edge,
 }
 
 impl fmt::Display for RecordKind {
@@ -14,7 +15,8 @@ impl fmt::Display for RecordKind {
         match self {
             Self::Candidate => formatter.write_str("candidate"),
             Self::Node => formatter.write_str("node"),
-            Self::Relation => formatter.write_str("relation"),
+            Self::Relation => formatter.write_str("relation kind"),
+            Self::Edge => formatter.write_str("edge"),
         }
     }
 }
@@ -29,7 +31,7 @@ impl fmt::Display for ConfirmedId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Node(id) => write!(formatter, "node {id}"),
-            Self::Relation(id) => write!(formatter, "relation {id}"),
+            Self::Relation(id) => write!(formatter, "relation kind {id}"),
         }
     }
 }
@@ -43,6 +45,13 @@ pub enum CatalogError {
     NameAlreadyConfirmed {
         name: Box<str>,
         existing_id: ConfirmedId,
+    },
+    MissingEdgeEndpoint {
+        endpoint: EdgeEndpoint,
+        node_id: NodeId,
+    },
+    MissingEdgeRelationKind {
+        relation_kind_id: RelationId,
     },
     CorruptRecord {
         key_space: &'static str,
@@ -61,6 +70,10 @@ pub enum CatalogError {
     NameTooLong {
         byte_length: usize,
     },
+    PayloadTooLong {
+        byte_length: usize,
+    },
+    InvalidBaseWeight(InvalidBaseWeight),
     LockPoisoned {
         lock: &'static str,
     },
@@ -77,6 +90,13 @@ impl fmt::Display for CatalogError {
                     "exact name {name:?} is already confirmed as {existing_id}"
                 )
             }
+            Self::MissingEdgeEndpoint { endpoint, node_id } => {
+                write!(formatter, "edge {endpoint} node {node_id} is not confirmed")
+            }
+            Self::MissingEdgeRelationKind { relation_kind_id } => write!(
+                formatter,
+                "edge relation kind {relation_kind_id} is not confirmed"
+            ),
             Self::CorruptRecord {
                 key_space,
                 record_id,
@@ -100,8 +120,28 @@ impl fmt::Display for CatalogError {
                 "name is {byte_length} bytes; the durable format supports at most {} bytes",
                 u32::MAX
             ),
+            Self::PayloadTooLong { byte_length } => write!(
+                formatter,
+                "node payload is {byte_length} bytes; the durable store supports at most {MAX_NODE_PAYLOAD_BYTES} bytes"
+            ),
+            Self::InvalidBaseWeight(error) => error.fmt(formatter),
             Self::LockPoisoned { lock } => write!(formatter, "{lock} lock is poisoned"),
             Self::RocksDb(error) => write!(formatter, "RocksDB failure: {error}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EdgeEndpoint {
+    Source,
+    Destination,
+}
+
+impl fmt::Display for EdgeEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source => formatter.write_str("source"),
+            Self::Destination => formatter.write_str("destination"),
         }
     }
 }
@@ -110,8 +150,15 @@ impl Error for CatalogError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::RocksDb(error) => Some(error),
+            Self::InvalidBaseWeight(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+impl From<InvalidBaseWeight> for CatalogError {
+    fn from(value: InvalidBaseWeight) -> Self {
+        Self::InvalidBaseWeight(value)
     }
 }
 

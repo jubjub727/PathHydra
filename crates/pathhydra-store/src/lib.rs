@@ -1,16 +1,18 @@
-//! Durable exact-name identity catalogs for PathHydra.
+//! Durable, versioned graph storage for PathHydra.
 //!
-//! Provisional candidates remain outside confirmed lookup until an external
-//! validator calls [`Catalog::confirm_validated_candidate`].
+//! Provisional node, relation-kind, and edge candidates remain outside the
+//! confirmed graph until an external validator calls
+//! [`Catalog::confirm_validated_candidate`].
 
 mod catalog;
 mod codec;
 mod column_families;
 mod error;
 
-pub use catalog::Catalog;
-pub use error::{CatalogError, ConfirmedId, RecordKind};
+pub use catalog::{Catalog, ConfirmedGraph};
+pub use error::{CatalogError, ConfirmedId, EdgeEndpoint, RecordKind};
 pub use pathhydra_core::{
-    Candidate, CandidateId, ConfirmedRecord, NodeId, NodeName, NodeRecord, RelationId,
-    RelationName, RelationRecord,
+    BaseWeight, Candidate, CandidateId, ConfirmedRecord, EdgeId, EdgeRecord, InvalidBaseWeight,
+    MAX_NODE_PAYLOAD_BYTES, NodeId, NodeName, NodePayload, NodeRecord, RelationId, RelationName,
+    RelationRecord,
 };

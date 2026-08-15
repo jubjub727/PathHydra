@@ -1,17 +1,33 @@
-use crate::{CandidateId, NodeId, NodeName, RelationId, RelationName};
+use crate::{
+    BaseWeight, CandidateId, EdgeRecord, NodeId, NodeName, NodePayload, RelationId, RelationName,
+};
 
 /// Stored proposed graph material that is not visible through confirmed lookup.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Candidate {
-    Node { id: CandidateId, name: NodeName },
-    Relation { id: CandidateId, name: RelationName },
+    Node {
+        id: CandidateId,
+        name: NodeName,
+        payload: NodePayload,
+    },
+    Relation {
+        id: CandidateId,
+        name: RelationName,
+    },
+    Edge {
+        id: CandidateId,
+        source: NodeId,
+        destination: NodeId,
+        relation_kind: RelationId,
+        base_weight: BaseWeight,
+    },
 }
 
 impl Candidate {
     #[must_use]
     pub const fn id(&self) -> CandidateId {
         match self {
-            Self::Node { id, .. } | Self::Relation { id, .. } => *id,
+            Self::Node { id, .. } | Self::Relation { id, .. } | Self::Edge { id, .. } => *id,
         }
     }
 }
@@ -21,12 +37,13 @@ impl Candidate {
 pub struct NodeRecord {
     id: NodeId,
     name: NodeName,
+    payload: NodePayload,
 }
 
 impl NodeRecord {
     #[must_use]
-    pub fn new(id: NodeId, name: NodeName) -> Self {
-        Self { id, name }
+    pub fn new(id: NodeId, name: NodeName, payload: NodePayload) -> Self {
+        Self { id, name, payload }
     }
 
     #[must_use]
@@ -37,6 +54,11 @@ impl NodeRecord {
     #[must_use]
     pub const fn name(&self) -> &NodeName {
         &self.name
+    }
+
+    #[must_use]
+    pub const fn payload(&self) -> &NodePayload {
+        &self.payload
     }
 }
 
@@ -69,4 +91,5 @@ impl RelationRecord {
 pub enum ConfirmedRecord {
     Node(NodeRecord),
     Relation(RelationRecord),
+    Edge(EdgeRecord),
 }

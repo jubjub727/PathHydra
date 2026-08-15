@@ -10,12 +10,15 @@ use pathhydra_store::{
 use rocksdb::{DB, Options};
 use tempfile::TempDir;
 
-const COLUMN_FAMILIES: [&str; 5] = [
+const COLUMN_FAMILIES: [&str; 8] = [
     "candidates",
     "nodes",
     "node_names",
     "relation_kinds",
     "relation_names",
+    "edges",
+    "outgoing_edges",
+    "incoming_edges",
 ];
 const EXACT_NAMES: [&str; 7] = [
     "token",
@@ -40,12 +43,14 @@ fn node_candidate_lifecycle_preserves_exact_identity_across_restart() {
         Candidate::Node {
             id: candidate_id,
             name: "token ".into(),
+            payload: Default::default(),
         }
     );
 
     let node = match catalog.confirm_validated_candidate(candidate_id).unwrap() {
         ConfirmedRecord::Node(node) => node,
         ConfirmedRecord::Relation(_) => panic!("node candidate became a relation"),
+        ConfirmedRecord::Edge(_) => panic!("node candidate became an edge"),
     };
     assert_eq!(
         catalog.lookup_node_exact("token ").unwrap(),
@@ -84,6 +89,7 @@ fn relation_candidate_lifecycle_preserves_exact_identity_across_restart() {
     let relation = match catalog.confirm_validated_candidate(candidate_id).unwrap() {
         ConfirmedRecord::Relation(relation) => relation,
         ConfirmedRecord::Node(_) => panic!("relation candidate became a node"),
+        ConfirmedRecord::Edge(_) => panic!("relation candidate became an edge"),
     };
     drop(catalog);
 
@@ -246,7 +252,7 @@ fn malformed_candidate_makes_open_fail_without_panicking() {
     db.put_cf(
         db.cf_handle("candidates").unwrap(),
         candidate.as_u64().to_be_bytes(),
-        [1, 2, 0],
+        [2, 2, 0],
     )
     .unwrap();
     drop(db);
@@ -288,7 +294,7 @@ fn counter_overflow_does_not_remove_candidate_or_change_graph_version() {
     drop(catalog);
 
     let db = open_raw(directory.path());
-    let mut maximum = vec![1];
+    let mut maximum = vec![2];
     maximum.extend_from_slice(&u64::MAX.to_be_bytes());
     db.put(b"next-node-id", maximum).unwrap();
     drop(db);
