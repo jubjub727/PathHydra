@@ -28,6 +28,8 @@ Use these terms consistently in code and documentation.
 - Do not hide graph semantics behind vague names such as `item`, `link`, or `data` when a precise term exists.
 - Keep storage, graph selection, and hydration separate.
 - Treat relation direction and category as part of correctness.
+- Treat node and relation names as exact, case-sensitive strings. Do not normalize, fold, correct, alias, or merge them.
+- Use hashes to accelerate exact-name lookup, never as unverified identity. Hash collisions must compare the complete name.
 - Never expose provisional candidates as confirmed graph data or include them in routing snapshots.
 - Removing a node must atomically remove every incoming and outgoing relation plus its lookup records.
 - Removing a relation must remove every durable and routing representation of that relation.

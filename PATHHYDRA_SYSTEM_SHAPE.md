@@ -79,6 +79,7 @@ The minimum durable records are:
 ```text
 Vertex
   external_id
+  name
   payload
 
 RelationKind
@@ -96,9 +97,20 @@ Provisional candidates also need durable identity and lifecycle state. They may 
 
 An edge also needs an unambiguous handle if duplicate edges with the same endpoints and relation kind are allowed. Whether that is a standalone edge ID or a compound key remains open until duplicate-edge behaviour is fixed. Routing must never merge parallel edges merely because their endpoints match.
 
+Node and relation names are preserved exactly as supplied. They are case-sensitive and are never normalized, folded, corrected, stemmed, or treated as synonyms. Different spellings, punctuation, casing, or Unicode sequences identify different names. Within the node namespace, one exact name maps to one node ID. Within the relation namespace, one exact name maps to one relation ID.
+
 Relation labels are descriptive data, not executable definitions. The relation ID, edge direction, base weight, and request multiplier contain everything search needs.
 
-Names and aliases used to find vertices belong in a lookup index. Their normalization rules are stored format rules: Unicode normalization, case handling, punctuation, alias collisions, and normalization version cannot depend on the process locale.
+Exact node and relation names belong in durable lookup indexes. The hot in-process baseline is a pair of hash maps:
+
+```text
+exact node name     -> external node ID
+exact relation name -> relation ID
+```
+
+Hashing chooses where to look; complete string equality decides whether the key matches. A raw hash value is therefore not used as a permanent ID, and hash collisions cannot merge different names. The numeric ID returned by the map is then used for direct array indexing in routing snapshots and request profiles.
+
+The confirmed mappings remain durable in RocksDB. The in-memory maps are rebuildable indexes and contain confirmed names only. Provisional candidates cannot enter them before promotion.
 
 ## Numeric contract
 
@@ -133,7 +145,7 @@ The durable layout needs logical key spaces for:
 - outgoing adjacency;
 - incoming adjacency or an equivalent incident-edge index for complete node deletion;
 - external-to-dense mappings for published snapshots;
-- normalized name and alias lookup;
+- exact node-name and relation-name lookup;
 - routing snapshot manifests.
 
 These may become column families or prefixed regions. The number of column families is not fixed early because RocksDB gives each one separate memtables and table files, which affects memory and tuning.
@@ -154,16 +166,15 @@ Record encodings require a magic value, schema version, fixed byte order, length
 
 ## Name resolution
 
-Routing uses IDs. A separate resolver maps normalized text and aliases to external vertex IDs without scanning vertex payloads.
+Routing uses IDs. A separate resolver maps an exact supplied name to node or relation IDs without scanning payloads. Comparison uses the complete stored string and is case-sensitive. There is no alias, synonym, fuzzy, spelling, punctuation, locale, or Unicode-normalization step.
 
 The resolver returns one of:
 
 - one match;
-- an ambiguity set;
 - no match;
 - invalid input.
 
-Choosing among ambiguous matches is a caller concern unless a deterministic selection rule is added later. Name lookup is not fuzzy search, embedding search, or query interpretation.
+The same exact name always resolves to the same ID inside its namespace. No near-match lookup is performed. Promotion cannot create a second confirmed ID for an already confirmed exact name.
 
 ## Routing snapshot compiler
 
@@ -377,7 +388,7 @@ How candidates are produced, validated, grouped, revised, rejected, or reviewed 
 
 ## Confirmed graph deletion
 
-The Rust API supports direct removal of a confirmed directed relation and removal of a confirmed node. Node removal cascades across every confirmed incoming and outgoing relation in the same atomic mutation. It also removes aliases, lookup entries, and other confirmed indexes owned by that node.
+The Rust API supports direct removal of a confirmed directed relation and removal of a confirmed node. Node removal cascades across every confirmed incoming and outgoing relation in the same atomic mutation. It also removes the node's exact-name lookup entry and other confirmed indexes owned by that node.
 
 Deletion advances the durable graph version and is reflected in the next published routing epoch. A request already pinned to an older immutable epoch may finish against that version; no newly admitted request may select a deleted node or relation after the deletion epoch is published.
 
@@ -387,7 +398,7 @@ A provisional candidate that refers to an endpoint removed before promotion cann
 
 The stable boundary is a narrow typed graph API rather than a general graph query language. It needs calls equivalent to:
 
-- resolve a name or alias;
+- resolve an exact node or relation name;
 - insert provisional candidates;
 - confirm candidates after external validation;
 - remove a confirmed directed relation;
@@ -424,6 +435,7 @@ Correctness fixtures cover:
 - a single edge and a multi-hop winner;
 - context profiles that change the selected graph;
 - directed edges that cannot be traversed backward;
+- exact-name lookup preserving case, spelling, punctuation, and Unicode-sequence differences;
 - parallel edges;
 - self-edges and zero-weight cycles;
 - equal-cost selection candidates;
@@ -493,6 +505,7 @@ PathHydra-owned engine code is Rust. RocksDB itself is implemented in C++ and wi
 | BAML consumes the Rust graph API. | This boundary is fixed; BAML's internal design and use of the API are not. |
 | Rust owns the graph library/API. | The graph engine needs deterministic systems code, explicit resource control, and a stable typed caller boundary. This is a fixed project constraint. |
 | Candidate data is provisional until promoted. | Unvalidated proposals must not affect the confirmed graph or any inference result. The validation method remains outside the engine. |
+| Exact-name lookup uses a hash index. | Case-sensitive string hashing followed by full equality provides the required exact-key behaviour, while the resulting numeric IDs support direct array indexing. |
 | RocksDB is the durable source of truth. | It is embedded, ordered, persistent, supports atomic batches and consistent views, and has a no-fee open-source licence. |
 | Routing uses a separate compact snapshot. | Durable payload storage and accelerator traversal have different access patterns; device memory is finite and distinct from host storage. |
 | The reference result is exact. | Graph membership is driven by minimum context-adjusted distance, so approximation could change the selected graph. |
@@ -504,6 +517,7 @@ PathHydra-owned engine code is Rust. RocksDB itself is implemented in C++ and wi
 ## Decisions deliberately left open
 
 - Rust workspace and crate boundaries;
+- concrete hash-map implementation, concurrency strategy, and full-residency threshold;
 - GPU vendor and programming API;
 - exact accelerator algorithm and tuning parameters;
 - stored and accumulated numeric types;
@@ -525,6 +539,7 @@ Each becomes fixed only after its required workload, correctness constraint, tar
 ## Evidence for the early choices
 
 - [The Rust project](https://github.com/rust-lang/rust) provides the compiler, standard library, Cargo tooling, and records its MIT and Apache 2.0 licensing.
+- Rust's standard-library [HashMap documentation](https://doc.rust-lang.org/stable/std/collections/struct.HashMap.html) documents its hashed key map and full key equality requirements.
 - [BAML's repository](https://github.com/BoundaryML/baml) records its Apache 2.0 licence.
 - [RocksDB overview](https://rocksdb.org/) describes an embedded persistent store using arbitrary byte keys and values and optimized for fast storage.
 - [RocksDB column families](https://github.com/facebook/rocksdb/wiki/Column-Families) documents logical partitioning, consistent cross-family views, and atomic writes across column families.
