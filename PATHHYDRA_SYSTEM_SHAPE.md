@@ -48,7 +48,7 @@ input and application state
 | - lookup and persistence    |
 | - snapshot compilation      |
 | - CPU/GPU graph selection   |
-| - reconstruction/hydration  |
+| - paths/subgraphs/hydration |
 +-----------------------------+
             |
             v
@@ -379,6 +379,27 @@ Reads are deduplicated and batched. Relation labels may be cached because they a
 
 Hydration returns records; it does not decide how the caller composes them.
 
+## Subgraph construction
+
+The Rust API provides a graph-shaped result container without imposing a policy for what belongs in it. A subgraph is pinned to one confirmed graph version and stores sets of vertex and edge handles from that version.
+
+The construction surface needs operations equivalent to:
+
+- create an empty subgraph for a graph version;
+- add a vertex handle;
+- add an edge handle together with its endpoints;
+- add every handle from a reconstructed path;
+- union another subgraph from the same graph version;
+- remove an edge;
+- remove a vertex and every incident edge currently in the subgraph;
+- test membership and enumerate vertices and edges;
+- hydrate the current contents;
+- encode the result for return across the Rust API boundary.
+
+Insertion is idempotent by identity, so shared vertices and edges are stored once. Adding an edge guarantees that both endpoints are present. Combining different graph versions must fail rather than silently bind stale handles to current records.
+
+Subgraph operations change only the caller-owned result container. They do not mutate confirmed or provisional database state. The caller decides which construction operations to apply; the Rust layer only enforces structural and version invariants.
+
 ## Provisional candidates
 
 Newly proposed graph material enters the Rust layer as provisional candidate data. It remains excluded from confirmed lookup, snapshot compilation, graph selection, and hydration. After validation occurs outside this system, an explicit confirmation promotes it into the confirmed graph in one atomic mutation.
@@ -405,6 +426,7 @@ The stable boundary is a narrow typed graph API rather than a general graph quer
 - submit one-origin/many-destination routing requests;
 - reconstruct requested paths;
 - hydrate caller-specified node and relation handles;
+- construct, combine, edit, and hydrate version-pinned subgraphs;
 - inspect available graph versions and capabilities;
 - cancel work and read health information.
 
@@ -452,6 +474,9 @@ Correctness fixtures cover:
 - node deletion removing every incoming and outgoing relation;
 - old and new routing epochs active together;
 - hydration against the correct version.
+- idempotent subgraph insertion and union;
+- subgraph node removal cascading through its incident edges;
+- rejection of handles or subgraphs from a different graph version;
 
 Property tests generate graphs and profiles, compare CPU and GPU outcomes, and verify every returned path has the reported minimum distance. Adversarial tests concentrate high degree, long chains, dense components, repeated relaxations, and unreachable regions.
 
@@ -506,6 +531,7 @@ PathHydra-owned engine code is Rust. RocksDB itself is implemented in C++ and wi
 | Rust owns the graph library/API. | The graph engine needs deterministic systems code, explicit resource control, and a stable typed caller boundary. This is a fixed project constraint. |
 | Candidate data is provisional until promoted. | Unvalidated proposals must not affect the confirmed graph or any inference result. The validation method remains outside the engine. |
 | Exact-name lookup uses a hash index. | Case-sensitive string hashing followed by full equality provides the required exact-key behaviour, while the resulting numeric IDs support direct array indexing. |
+| Rust exposes subgraph construction primitives. | Callers need graph-shaped composition without forcing one composition strategy into the engine. Version pinning prevents stale handles from being mixed silently. |
 | RocksDB is the durable source of truth. | It is embedded, ordered, persistent, supports atomic batches and consistent views, and has a no-fee open-source licence. |
 | Routing uses a separate compact snapshot. | Durable payload storage and accelerator traversal have different access patterns; device memory is finite and distinct from host storage. |
 | The reference result is exact. | Every reachable destination has an exact minimum context-adjusted distance, so approximation would change the routing contract. |
@@ -532,7 +558,8 @@ PathHydra-owned engine code is Rust. RocksDB itself is implemented in C++ and wi
 - batch width and lane scheduling;
 - out-of-core partitioning and I/O transport;
 - in-process Rust library or separately hosted Rust API packaging;
-- request and response encoding.
+- request, response, and serialized subgraph encoding;
+- in-memory subgraph representation.
 
 Each becomes fixed only after its required workload, correctness constraint, target platform, and benchmark evidence are recorded.
 

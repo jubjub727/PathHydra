@@ -25,6 +25,7 @@ The long-term goal is to perform that selection in parallel on the GPU and retur
 - **Relation:** a typed connection between two nodes.
 - **Logical distance:** the accumulated context-adjusted weight used during graph selection.
 - **Routing result:** exact destination distances and optional path identities.
+- **Subgraph:** a caller-constructed set of nodes and relations assembled through the Rust API.
 - **Hydration:** resolving caller-specified node and relation IDs into their full records.
 
 ## Direction
@@ -34,6 +35,7 @@ PathHydra is intended to provide:
 - typed graph storage;
 - constrained, GPU-accelerated pathfinding;
 - exact context-weighted routing;
+- version-safe subgraph construction;
 - traceable inference results;
 - a clean boundary between stored facts and inferred conclusions.
 
