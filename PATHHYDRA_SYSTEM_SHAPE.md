@@ -16,6 +16,7 @@ PathHydra operates on a directed, weighted graph.
 - Path weight is the sum of its effective edge weights.
 - Shortest-path distance is used to select the relevant portion of the graph.
 - The inference result is the selected graph, not a path. It may branch and reconnect any number of times.
+- Newly proposed graph material is stored as provisional candidate data. It cannot affect lookup, routing, or hydration as confirmed fact until an external validation decision promotes it.
 
 There is no rule system after search. The selected graph does not need approval from an ontology or another semantic layer. Context changes the arithmetic, and the arithmetic changes the selection.
 
@@ -27,7 +28,7 @@ The main query shape is one origin and any number of destinations. Work can be s
 
 BAML sits above the graph engine as its consumer. Its prompts, models, workflows, application structure, and use of graph results are outside this document.
 
-The Rust layer is a deterministic graph engine. It accepts concrete records and graph-selection requests, validates them, persists them, runs selection, and returns structured results. It does not depend on how the caller produced those inputs or how the caller will use the output.
+The Rust layer is a deterministic graph engine. It accepts provisional candidates and graph-selection requests, enforces record and lifecycle invariants, persists provisional and confirmed data, runs selection, and returns structured results. It does not depend on how candidates were produced, how they are validated, or how results will be used.
 
 ```text
 input and application state
@@ -43,7 +44,7 @@ input and application state
             v
 +-----------------------------+
 | Rust graph library/API      |
-| - validation and mutation   |
+| - record checks/lifecycle   |
 | - lookup and persistence    |
 | - snapshot compilation      |
 | - CPU/GPU graph selection   |
@@ -91,6 +92,8 @@ Edge
   base_weight
 ```
 
+Provisional candidates also need durable identity and lifecycle state. They may be stored in separate key spaces or marked records, but the physical choice must make accidental inclusion in the confirmed graph impossible. The Rust layer records the promotion decision; it does not define or perform the factual validation that precedes it.
+
 An edge also needs an unambiguous handle if duplicate edges with the same endpoints and relation kind are allowed. Whether that is a standalone edge ID or a compound key remains open until duplicate-edge behaviour is fixed. Routing must never merge parallel edges merely because their endpoints match.
 
 Relation labels are descriptive data, not executable definitions. The relation ID, edge direction, base weight, and request multiplier contain everything search needs.
@@ -126,8 +129,9 @@ The durable layout needs logical key spaces for:
 - vertex records;
 - relation ID-to-name records;
 - canonical edges;
+- provisional candidates and their lifecycle state;
 - outgoing adjacency;
-- optional incoming adjacency for maintenance or future reverse lookup;
+- incoming adjacency or an equivalent incident-edge index for complete node deletion;
 - external-to-dense mappings for published snapshots;
 - normalized name and alias lookup;
 - routing snapshot manifests.
@@ -144,7 +148,7 @@ The choice belongs to workload measurements covering ingest rate, random mutatio
 
 One logical mutation may touch a canonical edge and multiple indexes. Those writes must become visible atomically. RocksDB `WriteBatch` provides atomic multi-key and cross-column-family writes. If adjacency updates require concurrent read-modify-write conflict detection, the graph layer must either serialize them or use RocksDB's transaction support; atomic batches alone do not detect application-level conflicts.
 
-Deletion needs an explicit contract. Removing a vertex must prevent all incident outgoing edges from appearing in any later published routing snapshot. Incoming adjacency, an incident-edge index, tombstones, or deferred cleanup are possible implementations, but dangling traversable edges are not.
+Deletion is part of the graph contract. Removing one directed relation deletes its canonical record and every adjacency/index entry for that relation. Removing a vertex atomically deletes the vertex, its lookup records, and every relation whose source or destination is that vertex. An incoming adjacency or equivalent incident-edge index is therefore required so the engine can find all affected relations without a graph-wide scan. Tombstones or deferred cleanup may support the implementation, but they do not satisfy deletion while incident relations remain part of the confirmed graph.
 
 Record encodings require a magic value, schema version, fixed byte order, length checks, and migration policy. Corrupt or unknown records must fail visibly.
 
@@ -163,7 +167,7 @@ Choosing among ambiguous matches is a caller concern unless a deterministic sele
 
 ## Routing snapshot compiler
 
-The compiler turns one consistent durable graph view into a query-independent routing image.
+The compiler turns one consistent view of the confirmed durable graph into a query-independent routing image. Provisional candidates are excluded regardless of whether their proposed records are structurally complete.
 
 Its output contains only what expansion and reconstruction require:
 
@@ -175,7 +179,7 @@ Its output contains only what expansion and reconstruction require:
 - edge handles needed to hydrate the selected graph precisely;
 - maps between external and dense vertex IDs.
 
-The compiler validates every endpoint, relation ID, weight, array bound, and count. It emits a manifest containing the graph version, record-format version, relation-dictionary version, numeric policy, element widths, counts, byte ranges, and checksums.
+The compiler checks every confirmed endpoint, relation ID, weight, array bound, and count. These are structural checks, not factual validation. It emits a manifest containing the graph version, record-format version, relation-dictionary version, numeric policy, element widths, counts, byte ranges, and checksums.
 
 The image is a rebuildable index, never a second source of truth. A serialized copy is useful because loading a validated contiguous file is different from rebuilding the image through a full database scan.
 
@@ -365,32 +369,29 @@ Reads are deduplicated and batched. Relation labels may be cached because they a
 
 Hydration adds records to the selected graph; it does not reconsider graph membership.
 
-## Mutation and ingestion surfaces
+## Provisional candidates
 
-The caller submits concrete mutation commands to Rust. Rust validates and applies them without needing to know how they were produced.
+Newly proposed graph material enters the Rust layer as provisional candidate data. It remains excluded from confirmed lookup, snapshot compilation, graph selection, and hydration. After validation occurs outside this system, an explicit confirmation promotes it into the confirmed graph in one atomic mutation.
 
-The graph layer needs operations for:
+How candidates are produced, validated, grouped, revised, rejected, or reviewed is outside scope. The core contract covers only provisional insertion, exclusion before confirmation, and atomic promotion after validation.
 
-- create or update a vertex;
-- create or rename a relation kind;
-- create, update, or remove an edge;
-- remove a vertex under the declared incident-edge policy;
-- atomically apply a group of graph mutations;
-- bulk import;
-- rebuild indexes;
-- validate durable invariants;
-- publish and inspect routing epochs.
+## Confirmed graph deletion
 
-Imports must use the same validation and record formats as online writes. A fast bulk path may build sorted files or packed adjacency directly, but it cannot create a database that normal mutation code would interpret differently.
+The Rust API supports direct removal of a confirmed directed relation and removal of a confirmed node. Node removal cascades across every confirmed incoming and outgoing relation in the same atomic mutation. It also removes aliases, lookup entries, and other confirmed indexes owned by that node.
 
-Renaming a relation does not alter routing. Reassigning its numeric ID or changing edge weights does and therefore requires a new routing epoch.
+Deletion advances the durable graph version and is reflected in the next published routing epoch. A request already pinned to an older immutable epoch may finish against that version; no newly admitted request may select a deleted node or relation after the deletion epoch is published.
+
+A provisional candidate that refers to an endpoint removed before promotion cannot be confirmed without a new valid endpoint state.
 
 ## Rust public API
 
 The stable boundary is a narrow typed graph API rather than a general graph query language. It needs calls equivalent to:
 
 - resolve a name or alias;
-- mutate graph records;
+- insert provisional candidates;
+- confirm candidates after external validation;
+- remove a confirmed directed relation;
+- remove a confirmed node together with all incoming and outgoing relations;
 - submit one-origin/many-destination inference;
 - retrieve hydrated result graphs;
 - inspect available graph versions and capabilities;
@@ -404,13 +405,15 @@ Expected failure classes include:
 
 - invalid records or request numbers;
 - missing IDs and relation profile entries;
+- invalid provisional-to-confirmed transitions;
+- incomplete or inconsistent deletion cascades;
 - database write or recovery errors;
 - routing image checksum or version mismatch;
 - accelerator allocation, launch, or device loss;
 - cancellation and resource exhaustion;
 - hydration data unavailable for a pinned epoch.
 
-Each failure has a typed outcome. Device failure must not damage durable graph state. A corrupt routing image is discarded and rebuilt. Publication occurs only after validation. Startup either exposes a fully valid epoch or reports that routing is unavailable.
+Each failure has a typed outcome. Device failure must not damage durable graph state. A corrupt routing image is discarded and rebuilt. A routing image is published only after its technical checks pass. Startup either exposes a fully valid epoch or reports that routing is unavailable.
 
 Backups use a documented RocksDB checkpoint or backup procedure and include the application metadata needed to interpret record formats. Rebuildable device images may be omitted from backups if startup can regenerate them.
 
@@ -431,6 +434,10 @@ Correctness fixtures cover:
 - cancellation and budget exhaustion;
 - concurrent searches with different origins and profiles;
 - mutation atomicity and crash recovery;
+- provisional candidates remaining absent from lookup, routing images, and hydrated results;
+- atomic promotion after external validation;
+- relation deletion removing every durable and routing representation;
+- node deletion removing every incoming and outgoing relation;
 - old and new routing epochs active together;
 - hydration against the correct version.
 
@@ -485,6 +492,7 @@ PathHydra-owned engine code is Rust. RocksDB itself is implemented in C++ and wi
 |---|---|
 | BAML consumes the Rust graph API. | This boundary is fixed; BAML's internal design and use of the API are not. |
 | Rust owns the graph library/API. | The graph engine needs deterministic systems code, explicit resource control, and a stable typed caller boundary. This is a fixed project constraint. |
+| Candidate data is provisional until promoted. | Unvalidated proposals must not affect the confirmed graph or any inference result. The validation method remains outside the engine. |
 | RocksDB is the durable source of truth. | It is embedded, ordered, persistent, supports atomic batches and consistent views, and has a no-fee open-source licence. |
 | Routing uses a separate compact snapshot. | Durable payload storage and accelerator traversal have different access patterns; device memory is finite and distinct from host storage. |
 | The reference result is exact. | Graph membership is driven by minimum context-adjusted distance, so approximation could change the selected graph. |

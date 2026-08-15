@@ -11,6 +11,7 @@ PathHydra is a BAML application backed by a Rust graph library/API. It stores no
 - **Logical distance:** accumulated context-adjusted edge weight used for selection.
 - **Selected graph:** the branching set of nodes and relations returned by inference.
 - **Hydration:** turning compact graph-selection results into complete, usable records.
+- **Provisional candidate:** proposed graph material that is stored but excluded from confirmed lookup, routing, and hydration until externally validated and promoted.
 
 Use these terms consistently in code and documentation.
 
@@ -27,6 +28,9 @@ Use these terms consistently in code and documentation.
 - Do not hide graph semantics behind vague names such as `item`, `link`, or `data` when a precise term exists.
 - Keep storage, graph selection, and hydration separate.
 - Treat relation direction and category as part of correctness.
+- Never expose provisional candidates as confirmed graph data or include them in routing snapshots.
+- Removing a node must atomically remove every incoming and outgoing relation plus its lookup records.
+- Removing a relation must remove every durable and routing representation of that relation.
 - Preserve the graph version, context profile, weights, and selection boundary used for every result.
 - Make search and graph-selection limits explicit: depth, fan-out, cycles, boundaries, and budgets.
 - Add a CPU reference implementation before or alongside GPU-specific work.
