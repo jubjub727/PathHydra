@@ -4,11 +4,17 @@ PathHydra stores knowledge as things and the categorical relations between them,
 
 Inference does not return a chain. Context-weighted pathfinding is used to select the relevant part of the stored graph. Hydration returns that selection as a graph, preserving its branches and shared connections:
 
-```text
-                    /--relation--> thing --relation--> thing
-thing --relation--> thing --relation--> thing --relation--> thing
-   \--relation--> thing --relation--> thing
-                         \--relation--> thing --relation--> thing
+```mermaid
+flowchart LR
+    origin["thing"] -->|relation| a["thing"]
+    origin -->|relation| b["thing"]
+    a -->|relation| c["thing"]
+    a -->|relation| d["thing"]
+    b -->|relation| d
+    b -->|relation| e["thing"]
+    c -->|relation| f["thing"]
+    d -->|relation| f
+    d -->|relation| g["thing"]
 ```
 
 The long-term goal is to perform that selection in parallel on the GPU and return the hydrated subgraph with every included connection available for inspection.
