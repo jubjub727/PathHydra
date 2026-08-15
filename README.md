@@ -1,21 +1,25 @@
 # PathHydra
 
-PathHydra stores knowledge as things and the categorical relations between them, then finds logical paths through that graph.
+PathHydra stores knowledge as things and the categorical relations between them, then finds the closest logical region of that graph for the current context.
 
-Instead of returning a loose set of related records, it hydrates a path into an explicit chain:
+Inference does not return a chain. Context-weighted pathfinding is used to select the relevant part of the stored graph. Hydration returns that selection as a graph, preserving its branches and shared connections:
 
 ```text
-thing --relation--> thing --relation--> thing
+                    /--relation--> thing --relation--> thing
+thing --relation--> thing --relation--> thing --relation--> thing
+   \--relation--> thing --relation--> thing
+                         \--relation--> thing --relation--> thing
 ```
 
-The long-term goal is to explore many candidate paths in parallel on the GPU, rank the useful ones, and return reasoning that can be inspected rather than guessed at.
+The long-term goal is to perform that selection in parallel on the GPU and return the hydrated subgraph with every included connection available for inspection.
 
 ## Core model
 
 - **Node:** a thing, concept, event, claim, or value.
 - **Relation:** a typed connection between two nodes.
-- **Path:** an ordered chain of nodes and relations.
-- **Hydration:** resolving a discovered path into the full information needed to understand or use it.
+- **Logical distance:** the accumulated context-adjusted weight used during graph selection.
+- **Result graph:** the selected network of nodes and relations, with no linear-path restriction.
+- **Hydration:** resolving the selected graph into its full nodes and named relations.
 
 ## Direction
 
@@ -23,7 +27,7 @@ PathHydra is intended to provide:
 
 - typed graph storage;
 - constrained, GPU-accelerated pathfinding;
-- path ranking and pruning;
+- exact context-weighted graph selection;
 - traceable inference results;
 - a clean boundary between stored facts and inferred conclusions.
 
