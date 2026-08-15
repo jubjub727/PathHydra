@@ -1,0 +1,11 @@
+[package]
+name = "pathhydra-store"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+pathhydra-core = { path = "../pathhydra-core" }
+
+[lints]
+workspace = true

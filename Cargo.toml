@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/pathhydra-core",
+    "crates/pathhydra-store",
+]
+
+[workspace.package]
+edition = "2024"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
