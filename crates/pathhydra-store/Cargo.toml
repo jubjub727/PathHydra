@@ -6,6 +6,10 @@ publish.workspace = true
 
 [dependencies]
 pathhydra-core = { path = "../pathhydra-core" }
+rocksdb = { version = "0.24.0", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.27.0"
 
 [lints]
 workspace = true

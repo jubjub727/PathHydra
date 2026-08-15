@@ -44,11 +44,22 @@ The project is in its early design stage. Interfaces and storage formats are not
 
 ## Implementation status
 
-The repository currently contains Rust workspace scaffolding only. The crates
-define ownership boundaries for domain and storage code; graph storage,
-routing, hydration, and caller-owned subgraph composition are not implemented.
+The Rust core now provides durable exact-name catalogs for node identities and
+relation kinds. It supports provisional candidates, atomic confirmation,
+case-sensitive exact lookup, stable numeric IDs, graph-version increments, and
+validated in-memory index rebuilding after a RocksDB restart. Names are stored
+exactly; no trimming, case folding, Unicode normalization, or aliasing occurs.
+
+Edges, payloads, deletion, routing, GPU acceleration, hydration, and
+caller-owned subgraph composition are not implemented yet. The catalog's
+version 1 layout is documented in
+[the storage-format reference](docs/storage-format.md).
 
 ## Development
+
+Building `pathhydra-store` requires a C++ toolchain and LLVM/libclang because
+the RocksDB binding compiles native code and generates bindings. On Windows,
+ensure LLVM's `bin` directory is on `PATH` (or set `LIBCLANG_PATH`).
 
 Run the authoritative local checks from the repository root:
 

@@ -1,10 +1,12 @@
-//! Dependency-light domain types and invariants for PathHydra.
+//! Dependency-free domain types and invariants for PathHydra.
 //!
-//! This crate owns IDs, exact names, records, lifecycle types, and errors that
-//! do not depend on RocksDB.
+//! Names are exact, case-sensitive UTF-8 strings. PathHydra does not trim,
+//! normalize, case-fold, or otherwise rewrite them.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_loads() {}
-}
+mod candidate;
+mod id;
+mod name;
+
+pub use candidate::{Candidate, ConfirmedRecord, NodeRecord, RelationRecord};
+pub use id::{CandidateId, NodeId, RelationId};
+pub use name::{NodeName, RelationName};

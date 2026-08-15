@@ -1,11 +1,16 @@
-//! Durable storage boundary for PathHydra.
+//! Durable exact-name identity catalogs for PathHydra.
 //!
-//! This crate owns durable encodings, column families, atomic updates, cache
-//! rebuilding, and RocksDB-specific errors. Storage behaviour is introduced in
-//! a later implementation plan.
+//! Provisional candidates remain outside confirmed lookup until an external
+//! validator calls [`Catalog::confirm_validated_candidate`].
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_loads() {}
-}
+mod catalog;
+mod codec;
+mod column_families;
+mod error;
+
+pub use catalog::Catalog;
+pub use error::{CatalogError, ConfirmedId, RecordKind};
+pub use pathhydra_core::{
+    Candidate, CandidateId, ConfirmedRecord, NodeId, NodeName, NodeRecord, RelationId,
+    RelationName, RelationRecord,
+};
