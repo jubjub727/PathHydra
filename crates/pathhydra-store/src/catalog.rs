@@ -30,6 +30,51 @@ const INITIAL_ID: u64 = 1;
 type NodeNameIndex = HashMap<Box<str>, NodeId>;
 type RelationNameIndex = HashMap<Box<str>, RelationId>;
 
+/// A self-contained, point-in-time read of every confirmed graph record.
+///
+/// Records are sorted by their stable numeric IDs. Provisional candidates and
+/// storage implementation details are deliberately absent.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ConfirmedGraphRecords {
+    nodes: Vec<NodeRecord>,
+    relation_kinds: Vec<RelationRecord>,
+    edges: Vec<EdgeRecord>,
+}
+
+impl ConfirmedGraphRecords {
+    /// Creates an aggregate from records supplied by a caller.
+    ///
+    /// The routing compiler revalidates ordering, identity, and references, so
+    /// this constructor intentionally does not claim the records are valid.
+    #[must_use]
+    pub fn new(
+        nodes: Vec<NodeRecord>,
+        relation_kinds: Vec<RelationRecord>,
+        edges: Vec<EdgeRecord>,
+    ) -> Self {
+        Self {
+            nodes,
+            relation_kinds,
+            edges,
+        }
+    }
+
+    #[must_use]
+    pub fn nodes(&self) -> &[NodeRecord] {
+        &self.nodes
+    }
+
+    #[must_use]
+    pub fn relation_kinds(&self) -> &[RelationRecord] {
+        &self.relation_kinds
+    }
+
+    #[must_use]
+    pub fn edges(&self) -> &[EdgeRecord] {
+        &self.edges
+    }
+}
+
 /// A durable store for exact identities and confirmed directed graph records.
 ///
 /// Candidates do not affect confirmed lookup or adjacency until the caller
@@ -221,6 +266,22 @@ impl Catalog {
 
     pub fn get_edge(&self, id: EdgeId) -> Result<EdgeRecord, CatalogError> {
         get_edge_from_db(&self.db, id)
+    }
+
+    /// Copies one consistent view of the complete confirmed graph.
+    ///
+    /// The catalog write mutex covers all three scans, preventing promotion or
+    /// deletion from interleaving with this read. The returned aggregate owns
+    /// its records and does not retain a RocksDB iterator or snapshot.
+    pub fn confirmed_graph_records(&self) -> Result<ConfirmedGraphRecords, CatalogError> {
+        let _write = self.write_guard()?;
+        let mut nodes = all_nodes(&self.db)?;
+        let mut relation_kinds = all_relation_kinds(&self.db)?;
+        let mut edges = all_edges(&self.db)?;
+        nodes.sort_unstable_by_key(NodeRecord::id);
+        relation_kinds.sort_unstable_by_key(RelationRecord::id);
+        edges.sort_unstable_by_key(EdgeRecord::id);
+        Ok(ConfirmedGraphRecords::new(nodes, relation_kinds, edges))
     }
 
     /// Reads only confirmed outgoing edges through the source-prefix index.
@@ -970,6 +1031,36 @@ fn collect_ids(db: &DB, name: &'static str) -> Result<Vec<u64>, CatalogError> {
         ids.push(decode_id_key(&key).map_err(|error| record_error(name, bytes_id(&key), error))?);
     }
     Ok(ids)
+}
+
+fn all_nodes(db: &DB) -> Result<Vec<NodeRecord>, CatalogError> {
+    let cf = column_family(db, column_families::NODES)?;
+    let mut nodes = Vec::new();
+    for entry in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, value) = entry?;
+        let id = decode_id_key(&key)
+            .map_err(|error| record_error(column_families::NODES, bytes_id(&key), error))?;
+        nodes.push(
+            decode_node(&value, id)
+                .map_err(|error| record_error(column_families::NODES, id.to_string(), error))?,
+        );
+    }
+    Ok(nodes)
+}
+
+fn all_relation_kinds(db: &DB) -> Result<Vec<RelationRecord>, CatalogError> {
+    let cf = column_family(db, column_families::RELATION_KINDS)?;
+    let mut relations = Vec::new();
+    for entry in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, value) = entry?;
+        let id = decode_id_key(&key).map_err(|error| {
+            record_error(column_families::RELATION_KINDS, bytes_id(&key), error)
+        })?;
+        relations.push(decode_relation(&value, id).map_err(|error| {
+            record_error(column_families::RELATION_KINDS, id.to_string(), error)
+        })?);
+    }
+    Ok(relations)
 }
 
 fn all_edges(db: &DB) -> Result<Vec<EdgeRecord>, CatalogError> {

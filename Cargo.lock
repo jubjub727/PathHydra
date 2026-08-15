@@ -215,6 +215,15 @@ name = "pathhydra-core"
 version = "0.1.0"
 
 [[package]]
+name = "pathhydra-routing"
+version = "0.1.0"
+dependencies = [
+ "pathhydra-core",
+ "pathhydra-store",
+ "tempfile",
+]
+
+[[package]]
 name = "pathhydra-store"
 version = "0.1.0"
 dependencies = [

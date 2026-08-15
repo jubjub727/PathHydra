@@ -51,9 +51,18 @@ weighted edges. Promotion and deletion are atomic, parallel and self-edges
 have independent identities, node deletion cascades through both adjacency
 directions. Startup validates every confirmed record and index relationship.
 
-Routing, GPU acceleration, hydration, and caller-owned subgraph composition
-are not implemented yet. The current catalog layout is documented in
-[the storage-format reference](docs/storage-format.md).
+The routing crate compiles one consistent confirmed-graph read into an
+immutable in-memory CSR image and performs deterministic exact CPU routing.
+Explicit relation profiles can disable relation kinds or adjust their logical
+weights, one search serves many destinations, budgets produce inspectable
+incomplete results, and optional paths preserve stable edge identities and
+weight evidence. The current boundaries are documented in
+[the storage-format reference](docs/storage-format.md) and
+[the routing-image reference](docs/routing-image.md).
+
+Active-image publication, a durable image format, GPU acceleration, hydration,
+caller-owned subgraph composition, and BAML integration are not implemented
+yet.
 
 ## Development
 
