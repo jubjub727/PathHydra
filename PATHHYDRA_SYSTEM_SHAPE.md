@@ -14,11 +14,11 @@ PathHydra operates on a directed, weighted graph.
 - A request supplies one multiplier for every usable relation kind.
 - The effective edge weight is `base weight * request multiplier`.
 - Path weight is the sum of its effective edge weights.
-- Shortest-path distance is used to select the relevant portion of the graph.
-- The inference result is the selected graph, not a path. It may branch and reconnect any number of times.
+- Every reachable requested destination has an exact minimum distance and, when requested, one path selected under the configured tie policy.
+- The Rust engine returns routing and hydration primitives. It does not prescribe how a final graph is composed from them.
 - Newly proposed graph material is stored as provisional candidate data. It cannot affect lookup, routing, or hydration as confirmed fact until an external validation decision promotes it.
 
-There is no rule system after search. The selected graph does not need approval from an ontology or another semantic layer. Context changes the arithmetic, and the arithmetic changes the selection.
+There is no rule system after search. Context changes the arithmetic, and the arithmetic changes the exact routing result.
 
 All effective weights must be non-negative. Missing multipliers, disabled relation kinds, zero weights, infinities, overflow, and invalid numeric values need declared behaviour. A resource limit produces an incomplete result, not an unreachable result.
 
@@ -187,14 +187,14 @@ Its output contains only what expansion and reconstruction require:
 - destination dense IDs;
 - relation IDs;
 - base weights;
-- edge handles needed to hydrate the selected graph precisely;
+- edge handles needed to reconstruct and hydrate requested paths precisely;
 - maps between external and dense vertex IDs.
 
 The compiler checks every confirmed endpoint, relation ID, weight, array bound, and count. These are structural checks, not factual validation. It emits a manifest containing the graph version, record-format version, relation-dictionary version, numeric policy, element widths, counts, byte ranges, and checksums.
 
 The image is a rebuildable index, never a second source of truth. A serialized copy is useful because loading a validated contiguous file is different from rebuilding the image through a full database scan.
 
-Shortest-path state is selection machinery. Its predecessor chains or frontier history are not themselves the public result. The selection output is a set of vertex and edge handles forming a subgraph whose original branching and shared connections are retained.
+Shortest-path state is internal search machinery. When paths are requested, predecessor chains provide the vertex and edge handles for each destination independently.
 
 A compressed sparse row layout with separate arrays is the baseline shape, not yet a locked file format:
 
@@ -245,11 +245,11 @@ origin external ID
 destination external IDs[]
 relation multiplier vector
 requested graph version or "current"
-include selection diagnostics? boolean
+return paths? boolean
 resource budget
 ```
 
-Selection diagnostics are optional and do not shape the normal inference response. The normal response returns a selected graph. The Rust request contract still needs a precise graph-inclusion rule that turns shortest-distance results into selected vertices and edges. That rule cannot be inferred from one predecessor chain.
+Path reconstruction is optional. A distance-only request does not require the engine to retain or return predecessor state.
 
 The multiplier vector is immutable for the request. It is validated and converted to a dense array indexed by relation ID. A missing relation entry must have one documented meaning; silently inheriting process state is not acceptable.
 
@@ -257,14 +257,13 @@ Duplicate destinations are collapsed for search and mapped back to the caller's 
 
 Per-destination selection state distinguishes:
 
-- exact distance found and included in selection;
-- exact distance found but excluded by the graph boundary;
+- exact distance found, with a path when requested;
 - unreachable after complete search;
 - missing vertex;
 - incomplete because a budget or cancellation stopped the search;
 - invalid request.
 
-Every response identifies the graph version and numeric policy used. The response graph contains stable vertex and edge handles plus enough weight information to reproduce the distances that selected it.
+Every response identifies the graph version and numeric policy used. A returned path contains stable vertex and edge handles plus enough weight information to reproduce its distance.
 
 ## Rust query runtime
 
@@ -277,7 +276,7 @@ The Rust query runtime owns work around the search algorithm:
 - reserve worst-case working memory before admitting GPU work;
 - track cancellation and budgets;
 - keep independent searches isolated when they are batched;
-- assemble and hydrate the selected graph;
+- reconstruct requested paths and hydrate caller-specified records;
 - report exactness separately for every destination.
 
 Destinations within one request share a search. Separate requests retain separate state, stopping conditions, budgets, and results even when their origin and profile happen to match. The scheduler may run them in the same device batch but does not turn them into one search.
@@ -293,7 +292,7 @@ A CPU implementation over the routing image is part of the product, not disposab
 
 For non-negative effective weights, a conventional distance-ordered single-source shortest-path implementation is the reference baseline. One frontier serves all destinations and stops after every requested destination is final or the reachable component is exhausted.
 
-The CPU and GPU implementations consume the same snapshot, multiplier vector, numeric policy, destination set, and tie policy. Agreement is checked on distances, completion states, selection membership, and the assembled result graph.
+The CPU and GPU implementations consume the same snapshot, multiplier vector, numeric policy, destination set, and tie policy. Agreement is checked on distances, completion states, and returned paths where deterministic ties apply.
 
 ## GPU routing engine
 
@@ -325,14 +324,14 @@ Per active search, the accelerator needs independent:
 - frontier or bucket state;
 - unresolved destination count;
 - completion and budget state;
-- predecessor or other selection state when the graph-inclusion rule requires it;
+- predecessor state when paths are requested;
 - generation or reset state for reused buffers.
 
 One search cannot finalize a destination because another search reached it. Batching is only a scheduling optimization.
 
 A destination is complete only when the algorithm proves its distance final. First discovery is not sufficient. Zero-weight edges and repeated relaxations must close correctly before a bucket or equivalent frontier is retired.
 
-Predecessors can be omitted when graph selection depends only on finalized distances and explicit edge criteria. If the inclusion rule needs predecessor or traversal state, that state may be retained or reproduced in a second pass against the same snapshot and profile. The memory-versus-recomputation tradeoff is a measured policy.
+Predecessors may be retained during the first search or reproduced in a second pass against the same snapshot, profile, destinations, and tie policy. The choice trades device memory for recomputation but cannot change the routing contract.
 
 The GPU API, kernel language, and supported vendors remain open. The decision depends on target hardware, operating systems, required atomics, compiler support, profiling quality, library compatibility, and measured performance. No cross-vendor abstraction should be added before there are at least two real backends to abstract.
 
@@ -363,22 +362,22 @@ If the image fits in host RAM, pinned-memory staging is the baseline candidate. 
 
 DirectStorage is optional, Windows-specific transport research. Microsoft's implementation supports reads and demonstrates file-to-GPU loading, but it does not choose graph partitions or maintain shortest-path correctness. Conventional asynchronous file reads and explicit device copies remain the comparison baseline. No transport is selected before topology size and staging traces show that I/O is actually limiting search.
 
-## Selected-graph assembly and hydration
+## Path reconstruction and hydration
 
-Search produces distance and selection state rather than a public path. The assembler collects the selected vertex and edge handles, preserving every included branch and shared connection. Predecessors may still be retained internally when the selection rule needs them, but a predecessor chain is not the hydrated result.
+When requested, reconstruction walks predecessor state from a completed destination back to the origin and returns that destination's path handles. Paths remain independent routing results; the Rust engine does not impose a final graph-building strategy.
 
-Hydration resolves the selected handles into:
+Hydration accepts caller-specified vertex and edge handles and resolves them into:
 
 - external vertex IDs;
 - requested vertex payloads;
 - directed edges with relation IDs and labels;
 - stored and effective weights for each edge;
-- selection distances and boundaries;
+- stored and effective path distances when applicable;
 - graph version and context-profile identity.
 
-Reads are deduplicated and batched. Relation labels may be cached because they are small and versioned. Vertex payloads are fetched only for the returned graph.
+Reads are deduplicated and batched. Relation labels may be cached because they are small and versioned. Only requested records are fetched.
 
-Hydration adds records to the selected graph; it does not reconsider graph membership.
+Hydration returns records; it does not decide how the caller composes them.
 
 ## Provisional candidates
 
@@ -403,8 +402,9 @@ The stable boundary is a narrow typed graph API rather than a general graph quer
 - confirm candidates after external validation;
 - remove a confirmed directed relation;
 - remove a confirmed node together with all incoming and outgoing relations;
-- submit one-origin/many-destination inference;
-- retrieve hydrated result graphs;
+- submit one-origin/many-destination routing requests;
+- reconstruct requested paths;
+- hydrate caller-specified node and relation handles;
 - inspect available graph versions and capabilities;
 - cancel work and read health information.
 
@@ -433,7 +433,7 @@ Backups use a documented RocksDB checkpoint or backup procedure and include the 
 Correctness fixtures cover:
 
 - a single edge and a multi-hop winner;
-- context profiles that change the selected graph;
+- context profiles that change shortest-path results;
 - directed edges that cannot be traversed backward;
 - exact-name lookup preserving case, spelling, punctuation, and Unicode-sequence differences;
 - parallel edges;
@@ -453,7 +453,7 @@ Correctness fixtures cover:
 - old and new routing epochs active together;
 - hydration against the correct version.
 
-Property tests generate graphs and profiles, compare CPU and GPU outcomes, and verify that selection membership follows the reported distances and boundary. Adversarial tests concentrate high degree, long chains, dense components, repeated relaxations, and unreachable regions.
+Property tests generate graphs and profiles, compare CPU and GPU outcomes, and verify every returned path has the reported minimum distance. Adversarial tests concentrate high degree, long chains, dense components, repeated relaxations, and unreachable regions.
 
 Performance reports include:
 
@@ -508,7 +508,7 @@ PathHydra-owned engine code is Rust. RocksDB itself is implemented in C++ and wi
 | Exact-name lookup uses a hash index. | Case-sensitive string hashing followed by full equality provides the required exact-key behaviour, while the resulting numeric IDs support direct array indexing. |
 | RocksDB is the durable source of truth. | It is embedded, ordered, persistent, supports atomic batches and consistent views, and has a no-fee open-source licence. |
 | Routing uses a separate compact snapshot. | Durable payload storage and accelerator traversal have different access patterns; device memory is finite and distinct from host storage. |
-| The reference result is exact. | Graph membership is driven by minimum context-adjusted distance, so approximation could change the selected graph. |
+| The reference result is exact. | Every reachable destination has an exact minimum context-adjusted distance, so approximation would change the routing contract. |
 | Effective weights cannot be negative. | The intended distance model and practical exact SSSP candidates rely on non-negative edge weights. |
 | A CPU engine remains available. | Accelerator correctness needs an independent comparator, and GPU availability is not universal. |
 | Published routing images are immutable per request. | RocksDB batches cannot atomically modify already-resident device arrays. |

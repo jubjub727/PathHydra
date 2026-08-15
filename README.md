@@ -2,7 +2,7 @@
 
 PathHydra stores knowledge as things and the categorical relations between them, then finds the closest logical region of that graph for the current context.
 
-Inference does not return a chain. Context-weighted pathfinding is used to select the relevant part of the stored graph. Hydration returns that selection as a graph, preserving its branches and shared connections:
+Context-weighted pathfinding exposes exact distances and, when requested, the paths that produced them. Those results can support branching graph structures without the Rust engine imposing one composition strategy:
 
 ```mermaid
 flowchart LR
@@ -24,8 +24,8 @@ The long-term goal is to perform that selection in parallel on the GPU and retur
 - **Node:** a thing, concept, event, claim, or value.
 - **Relation:** a typed connection between two nodes.
 - **Logical distance:** the accumulated context-adjusted weight used during graph selection.
-- **Result graph:** the selected network of nodes and relations, with no linear-path restriction.
-- **Hydration:** resolving the selected graph into its full nodes and named relations.
+- **Routing result:** exact destination distances and optional path identities.
+- **Hydration:** resolving caller-specified node and relation IDs into their full records.
 
 ## Direction
 
@@ -33,7 +33,7 @@ PathHydra is intended to provide:
 
 - typed graph storage;
 - constrained, GPU-accelerated pathfinding;
-- exact context-weighted graph selection;
+- exact context-weighted routing;
 - traceable inference results;
 - a clean boundary between stored facts and inferred conclusions.
 
