@@ -12,19 +12,15 @@ use rocksdb::{ColumnFamily, DB, Direction, IteratorMode, Options, WriteBatch};
 
 use crate::{
     codec::{
-        self, CodecError, decode_adjacency_key, decode_adjacency_value, decode_candidate,
-        decode_edge, decode_id_key, decode_legacy_candidate, decode_legacy_node,
-        decode_legacy_relation, decode_legacy_u64_record, decode_name_key, decode_node,
-        decode_relation, decode_storage_format, decode_u64_record, encode_adjacency_key,
-        encode_adjacency_value, encode_candidate, encode_edge, encode_format_version,
-        encode_id_key, encode_name_key, encode_node, encode_relation, encode_u64_record,
+        CodecError, decode_adjacency_key, decode_adjacency_value, decode_candidate, decode_edge,
+        decode_id_key, decode_name_key, decode_node, decode_relation, decode_u64_record,
+        encode_adjacency_key, encode_adjacency_value, encode_candidate, encode_edge, encode_id_key,
+        encode_name_key, encode_node, encode_relation, encode_u64_record,
     },
     column_families,
     error::{CatalogError, ConfirmedId, EdgeEndpoint, RecordKind},
 };
 
-const META_FORMAT: &[u8] = b"storage-format";
-const META_GRAPH_VERSION: &[u8] = b"graph-version";
 const META_NEXT_CANDIDATE_ID: &[u8] = b"next-candidate-id";
 const META_NEXT_NODE_ID: &[u8] = b"next-node-id";
 const META_NEXT_RELATION_ID: &[u8] = b"next-relation-id";
@@ -33,37 +29,6 @@ const INITIAL_ID: u64 = 1;
 
 type NodeNameIndex = HashMap<Box<str>, NodeId>;
 type RelationNameIndex = HashMap<Box<str>, RelationId>;
-
-/// A version-pinned, payload-free view of the complete confirmed graph.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConfirmedGraph {
-    graph_version: u64,
-    node_ids: Vec<NodeId>,
-    relation_kind_ids: Vec<RelationId>,
-    edges: Vec<EdgeRecord>,
-}
-
-impl ConfirmedGraph {
-    #[must_use]
-    pub const fn graph_version(&self) -> u64 {
-        self.graph_version
-    }
-
-    #[must_use]
-    pub fn node_ids(&self) -> &[NodeId] {
-        &self.node_ids
-    }
-
-    #[must_use]
-    pub fn relation_kind_ids(&self) -> &[RelationId] {
-        &self.relation_kind_ids
-    }
-
-    #[must_use]
-    pub fn edges(&self) -> &[EdgeRecord] {
-        &self.edges
-    }
-}
 
 /// A durable store for exact identities and confirmed directed graph records.
 ///
@@ -111,15 +76,14 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    /// Opens, migrates if necessary, and validates a complete catalog before
-    /// publishing it.
+    /// Opens and validates a complete catalog before publishing it.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CatalogError> {
         let mut options = Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
 
         let db = DB::open_cf_descriptors(&options, path, column_families::descriptors())?;
-        initialize_or_migrate_metadata(&db)?;
+        initialize_metadata(&db)?;
         let (node_names, relation_names) = rebuild_indexes_and_validate(&db)?;
 
         Ok(Self {
@@ -278,34 +242,11 @@ impl Catalog {
         )
     }
 
-    /// Returns one consistent, payload-free confirmed graph view for a future
-    /// routing snapshot compiler.
-    pub fn confirmed_graph(&self) -> Result<ConfirmedGraph, CatalogError> {
-        let _write = self.write_guard()?;
-        let graph_version = self.graph_version()?;
-        let node_ids = collect_ids(&self.db, column_families::NODES)?
-            .into_iter()
-            .map(NodeId::from_u64)
-            .collect();
-        let relation_kind_ids = collect_ids(&self.db, column_families::RELATION_KINDS)?
-            .into_iter()
-            .map(RelationId::from_u64)
-            .collect();
-        let edges = all_edges(&self.db)?;
-        Ok(ConfirmedGraph {
-            graph_version,
-            node_ids,
-            relation_kind_ids,
-            edges,
-        })
-    }
-
     /// Removes one exact confirmed edge and both adjacency entries atomically.
-    pub fn remove_edge(&self, id: EdgeId) -> Result<u64, CatalogError> {
+    pub fn remove_edge(&self, id: EdgeId) -> Result<(), CatalogError> {
         let _write = self.write_guard()?;
         let edge = self.get_edge(id)?;
         validate_exact_adjacency(&self.db, &edge)?;
-        let next_graph_version = next_graph_version(&self.db)?;
 
         let edges = column_family(&self.db, column_families::EDGES)?;
         let outgoing = column_family(&self.db, column_families::OUTGOING_EDGES)?;
@@ -314,14 +255,13 @@ impl Catalog {
         batch.delete_cf(edges, encode_id_key(id.as_u64()));
         batch.delete_cf(outgoing, encode_adjacency_key(edge.source(), id));
         batch.delete_cf(incoming, encode_adjacency_key(edge.destination(), id));
-        batch.put(META_GRAPH_VERSION, encode_u64_record(next_graph_version));
         self.db.write(batch)?;
-        Ok(next_graph_version)
+        Ok(())
     }
 
     /// Removes a confirmed node, every incident confirmed edge, and the exact
     /// node-name mapping in one atomic batch.
-    pub fn remove_node(&self, id: NodeId) -> Result<u64, CatalogError> {
+    pub fn remove_node(&self, id: NodeId) -> Result<(), CatalogError> {
         let _write = self.write_guard()?;
         let node = self.get_node(id)?;
         let outgoing_edges = incident_edges(&self.db, column_families::OUTGOING_EDGES, id, true)?;
@@ -343,7 +283,6 @@ impl Catalog {
         }
 
         let name_key = encode_name_key(node.name().as_str()).map_err(codec_input_error)?;
-        let next_graph_version = next_graph_version(&self.db)?;
         let nodes = column_family(&self.db, column_families::NODES)?;
         let names = column_family(&self.db, column_families::NODE_NAMES)?;
         let edges = column_family(&self.db, column_families::EDGES)?;
@@ -369,15 +308,9 @@ impl Catalog {
         }
         batch.delete_cf(nodes, encode_id_key(id.as_u64()));
         batch.delete_cf(names, name_key);
-        batch.put(META_GRAPH_VERSION, encode_u64_record(next_graph_version));
         self.db.write(batch)?;
         index.remove(node.name().as_str());
-        Ok(next_graph_version)
-    }
-
-    #[must_use = "errors reading durable metadata must be handled"]
-    pub fn graph_version(&self) -> Result<u64, CatalogError> {
-        read_metadata(&self.db, META_GRAPH_VERSION, "graph-version")
+        Ok(())
     }
 
     fn insert_candidate(&self, input: CandidateInput) -> Result<CandidateId, CatalogError> {
@@ -436,7 +369,6 @@ impl Catalog {
         let following_id = next_id
             .checked_add(1)
             .ok_or(CatalogError::CounterOverflow { counter: "node ID" })?;
-        let next_graph_version = next_graph_version(&self.db)?;
         let record = NodeRecord::new(NodeId::from_u64(next_id), name, payload);
         let encoded_record = encode_node(&record).map_err(codec_input_error)?;
         let mut index = self.node_index_write()?;
@@ -448,7 +380,6 @@ impl Catalog {
         batch.put_cf(names_cf, &name_key, encode_u64_record(next_id));
         batch.delete_cf(candidates, encode_id_key(candidate_id.as_u64()));
         batch.put(META_NEXT_NODE_ID, encode_u64_record(following_id));
-        batch.put(META_GRAPH_VERSION, encode_u64_record(next_graph_version));
         self.db.write(batch)?;
 
         index.insert(record.name().as_str().into(), record.id());
@@ -478,7 +409,6 @@ impl Catalog {
             .ok_or(CatalogError::CounterOverflow {
                 counter: "relation ID",
             })?;
-        let next_graph_version = next_graph_version(&self.db)?;
         let record = RelationRecord::new(RelationId::from_u64(next_id), name);
         let encoded_record = encode_relation(&record).map_err(codec_input_error)?;
         let mut index = self.relation_index_write()?;
@@ -490,7 +420,6 @@ impl Catalog {
         batch.put_cf(names_cf, &name_key, encode_u64_record(next_id));
         batch.delete_cf(candidates, encode_id_key(candidate_id.as_u64()));
         batch.put(META_NEXT_RELATION_ID, encode_u64_record(following_id));
-        batch.put(META_GRAPH_VERSION, encode_u64_record(next_graph_version));
         self.db.write(batch)?;
 
         index.insert(record.name().as_str().into(), record.id());
@@ -513,7 +442,6 @@ impl Catalog {
         let following_id = next_id
             .checked_add(1)
             .ok_or(CatalogError::CounterOverflow { counter: "edge ID" })?;
-        let next_graph_version = next_graph_version(&self.db)?;
         let record = EdgeRecord::new(
             EdgeId::from_u64(next_id),
             source,
@@ -540,7 +468,6 @@ impl Catalog {
         );
         batch.delete_cf(candidates, encode_id_key(candidate_id.as_u64()));
         batch.put(META_NEXT_EDGE_ID, encode_u64_record(following_id));
-        batch.put(META_GRAPH_VERSION, encode_u64_record(next_graph_version));
         self.db.write(batch)?;
         Ok(ConfirmedRecord::Edge(record))
     }
@@ -586,162 +513,28 @@ enum CandidateInput {
     },
 }
 
-fn initialize_or_migrate_metadata(db: &DB) -> Result<(), CatalogError> {
-    match db.get(META_FORMAT)? {
-        Some(value) => match decode_storage_format(&value)
-            .map_err(|error| record_error("default", "storage-format", error))?
-        {
-            codec::FORMAT_VERSION => validate_metadata(db),
-            codec::LEGACY_FORMAT_VERSION => migrate_v1_to_v2(db),
-            found => Err(CatalogError::IncompatibleFormat {
-                key_space: "default",
-                record_id: "storage-format".to_owned(),
-                found,
-                supported: codec::FORMAT_VERSION,
-            }),
-        },
-        None => {
-            ensure_database_empty(db)?;
-            let mut batch = WriteBatch::default();
-            batch.put(META_FORMAT, encode_format_version());
-            batch.put(META_GRAPH_VERSION, encode_u64_record(0));
-            batch.put(META_NEXT_CANDIDATE_ID, encode_u64_record(INITIAL_ID));
-            batch.put(META_NEXT_NODE_ID, encode_u64_record(INITIAL_ID));
-            batch.put(META_NEXT_RELATION_ID, encode_u64_record(INITIAL_ID));
-            batch.put(META_NEXT_EDGE_ID, encode_u64_record(INITIAL_ID));
-            db.write(batch)?;
-            Ok(())
-        }
-    }
-}
-
-fn validate_metadata(db: &DB) -> Result<(), CatalogError> {
-    for (key, id) in [
-        (META_GRAPH_VERSION, "graph-version"),
+fn initialize_metadata(db: &DB) -> Result<(), CatalogError> {
+    let metadata = [
         (META_NEXT_CANDIDATE_ID, "next-candidate-id"),
         (META_NEXT_NODE_ID, "next-node-id"),
         (META_NEXT_RELATION_ID, "next-relation-id"),
         (META_NEXT_EDGE_ID, "next-edge-id"),
-    ] {
-        read_metadata(db, key, id)?;
-    }
-    Ok(())
-}
-
-fn migrate_v1_to_v2(db: &DB) -> Result<(), CatalogError> {
-    for name in [
-        column_families::EDGES,
-        column_families::OUTGOING_EDGES,
-        column_families::INCOMING_EDGES,
-    ] {
-        let cf = column_family(db, name)?;
-        if db
-            .iterator_cf(cf, IteratorMode::Start)
-            .next()
-            .transpose()?
-            .is_some()
-        {
-            return Err(corrupt(
-                name,
-                "first record",
-                "version 1 catalog contains version 2 graph records",
-            ));
+    ];
+    let present = metadata
+        .iter()
+        .map(|(key, _)| db.get(key))
+        .collect::<Result<Vec<_>, _>>()?;
+    if present.iter().all(Option::is_none) {
+        ensure_database_empty(db)?;
+        let mut batch = WriteBatch::default();
+        for (key, _) in metadata {
+            batch.put(key, encode_u64_record(INITIAL_ID));
         }
+        db.write(batch)?;
+        return Ok(());
     }
-
-    let metadata = [
-        (META_GRAPH_VERSION, "graph-version"),
-        (META_NEXT_CANDIDATE_ID, "next-candidate-id"),
-        (META_NEXT_NODE_ID, "next-node-id"),
-        (META_NEXT_RELATION_ID, "next-relation-id"),
-    ]
-    .map(|(key, id)| {
-        let value = db
-            .get(key)?
-            .ok_or_else(|| corrupt("default", id, "required legacy metadata record is missing"))?;
-        let decoded =
-            decode_legacy_u64_record(&value).map_err(|error| record_error("default", id, error))?;
-        Ok::<_, CatalogError>((key, decoded))
-    });
-
-    let mut batch = WriteBatch::default();
-    for item in metadata {
-        let (key, value) = item?;
-        batch.put(key, encode_u64_record(value));
-    }
-    migrate_candidate_records(db, &mut batch)?;
-    migrate_node_records(db, &mut batch)?;
-    migrate_relation_records(db, &mut batch)?;
-    migrate_name_values(db, &mut batch, column_families::NODE_NAMES)?;
-    migrate_name_values(db, &mut batch, column_families::RELATION_NAMES)?;
-    batch.put(META_NEXT_EDGE_ID, encode_u64_record(INITIAL_ID));
-    batch.put(META_FORMAT, encode_format_version());
-    db.write(batch)?;
-    Ok(())
-}
-
-fn migrate_candidate_records(db: &DB, batch: &mut WriteBatch) -> Result<(), CatalogError> {
-    let cf = column_family(db, column_families::CANDIDATES)?;
-    for entry in db.iterator_cf(cf, IteratorMode::Start) {
-        let (key, value) = entry?;
-        let id = decode_id_key(&key)
-            .map_err(|error| record_error(column_families::CANDIDATES, bytes_id(&key), error))?;
-        let candidate = decode_legacy_candidate(&value, id)
-            .map_err(|error| record_error(column_families::CANDIDATES, id.to_string(), error))?;
-        batch.put_cf(
-            cf,
-            key,
-            encode_candidate(&candidate).map_err(codec_input_error)?,
-        );
-    }
-    Ok(())
-}
-
-fn migrate_node_records(db: &DB, batch: &mut WriteBatch) -> Result<(), CatalogError> {
-    let cf = column_family(db, column_families::NODES)?;
-    for entry in db.iterator_cf(cf, IteratorMode::Start) {
-        let (key, value) = entry?;
-        let id = decode_id_key(&key)
-            .map_err(|error| record_error(column_families::NODES, bytes_id(&key), error))?;
-        let node = decode_legacy_node(&value, id)
-            .map_err(|error| record_error(column_families::NODES, id.to_string(), error))?;
-        batch.put_cf(cf, key, encode_node(&node).map_err(codec_input_error)?);
-    }
-    Ok(())
-}
-
-fn migrate_relation_records(db: &DB, batch: &mut WriteBatch) -> Result<(), CatalogError> {
-    let cf = column_family(db, column_families::RELATION_KINDS)?;
-    for entry in db.iterator_cf(cf, IteratorMode::Start) {
-        let (key, value) = entry?;
-        let id = decode_id_key(&key).map_err(|error| {
-            record_error(column_families::RELATION_KINDS, bytes_id(&key), error)
-        })?;
-        let relation = decode_legacy_relation(&value, id).map_err(|error| {
-            record_error(column_families::RELATION_KINDS, id.to_string(), error)
-        })?;
-        batch.put_cf(
-            cf,
-            key,
-            encode_relation(&relation).map_err(codec_input_error)?,
-        );
-    }
-    Ok(())
-}
-
-fn migrate_name_values(
-    db: &DB,
-    batch: &mut WriteBatch,
-    column_family_name: &'static str,
-) -> Result<(), CatalogError> {
-    let cf = column_family(db, column_family_name)?;
-    for entry in db.iterator_cf(cf, IteratorMode::Start) {
-        let (key, value) = entry?;
-        decode_name_key(&key)
-            .map_err(|error| record_error(column_family_name, bytes_id(&key), error))?;
-        let id = decode_legacy_u64_record(&value)
-            .map_err(|error| record_error(column_family_name, bytes_id(&key), error))?;
-        batch.put_cf(cf, key, encode_u64_record(id));
+    for (key, id) in metadata {
+        read_metadata(db, key, id)?;
     }
     Ok(())
 }
@@ -755,8 +548,8 @@ fn ensure_database_empty(db: &DB) -> Result<(), CatalogError> {
     {
         return Err(corrupt(
             "default",
-            "storage-format",
-            "format marker is missing from a non-empty database",
+            "metadata",
+            "required metadata is missing from a non-empty database",
         ));
     }
     for name in column_families::ALL {
@@ -770,7 +563,7 @@ fn ensure_database_empty(db: &DB) -> Result<(), CatalogError> {
             return Err(corrupt(
                 name,
                 "first record",
-                "format marker is missing from a non-empty database",
+                "required metadata is missing from a non-empty database",
             ));
         }
     }
@@ -1194,14 +987,6 @@ fn all_edges(db: &DB) -> Result<Vec<EdgeRecord>, CatalogError> {
     Ok(edges)
 }
 
-fn next_graph_version(db: &DB) -> Result<u64, CatalogError> {
-    read_metadata(db, META_GRAPH_VERSION, "graph-version")?
-        .checked_add(1)
-        .ok_or(CatalogError::CounterOverflow {
-            counter: "graph version",
-        })
-}
-
 fn read_metadata(db: &DB, key: &[u8], record_id: &'static str) -> Result<u64, CatalogError> {
     let value = db
         .get(key)?
@@ -1219,19 +1004,10 @@ fn record_error(
     record_id: impl Into<String>,
     error: CodecError,
 ) -> CatalogError {
-    let record_id = record_id.into();
-    match error {
-        CodecError::UnknownVersion(found) => CatalogError::IncompatibleFormat {
-            key_space,
-            record_id,
-            found,
-            supported: codec::FORMAT_VERSION,
-        },
-        other => CatalogError::CorruptRecord {
-            key_space,
-            record_id,
-            reason: other.to_string(),
-        },
+    CatalogError::CorruptRecord {
+        key_space,
+        record_id: record_id.into(),
+        reason: error.to_string(),
     }
 }
 

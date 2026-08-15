@@ -36,7 +36,6 @@ fn node_candidate_lifecycle_preserves_exact_identity_across_restart() {
     let catalog = Catalog::open(directory.path()).unwrap();
     let candidate_id = catalog.insert_node_candidate("token ").unwrap();
 
-    assert_eq!(catalog.graph_version().unwrap(), 0);
     assert_eq!(catalog.lookup_node_exact("token ").unwrap(), None);
     assert_eq!(
         catalog.get_candidate(candidate_id).unwrap(),
@@ -57,7 +56,6 @@ fn node_candidate_lifecycle_preserves_exact_identity_across_restart() {
         Some(node.id())
     );
     assert_eq!(catalog.get_node(node.id()).unwrap(), node);
-    assert_eq!(catalog.graph_version().unwrap(), 1);
     drop(catalog);
 
     let reopened = Catalog::open(directory.path()).unwrap();
@@ -180,8 +178,6 @@ fn duplicate_confirmation_returns_existing_id_without_mutation() {
     let ConfirmedRecord::Node(node) = catalog.confirm_validated_candidate(first).unwrap() else {
         panic!("expected node");
     };
-    let version = catalog.graph_version().unwrap();
-
     let error = catalog.confirm_validated_candidate(duplicate).unwrap_err();
     assert!(matches!(
         error,
@@ -190,7 +186,6 @@ fn duplicate_confirmation_returns_existing_id_without_mutation() {
             ..
         } if id == node.id()
     ));
-    assert_eq!(catalog.graph_version().unwrap(), version);
     assert_eq!(catalog.get_candidate(duplicate).unwrap().id(), duplicate);
     assert_eq!(
         catalog.get_node(node.id()).unwrap().name().as_str(),
@@ -252,7 +247,7 @@ fn malformed_candidate_makes_open_fail_without_panicking() {
     db.put_cf(
         db.cf_handle("candidates").unwrap(),
         candidate.as_u64().to_be_bytes(),
-        [2, 2, 0],
+        [2, 0],
     )
     .unwrap();
     drop(db);
@@ -267,36 +262,14 @@ fn malformed_candidate_makes_open_fail_without_panicking() {
 }
 
 #[test]
-fn incompatible_record_version_is_reported_explicitly() {
-    let directory = TempDir::new().unwrap();
-    let catalog = Catalog::open(directory.path()).unwrap();
-    drop(catalog);
-    let db = open_raw(directory.path());
-    db.put(b"graph-version", [99, 0, 0, 0, 0, 0, 0, 0, 0])
-        .unwrap();
-    drop(db);
-
-    assert!(matches!(
-        Catalog::open(directory.path()),
-        Err(CatalogError::IncompatibleFormat {
-            key_space: "default",
-            found: 99,
-            ..
-        })
-    ));
-}
-
-#[test]
-fn counter_overflow_does_not_remove_candidate_or_change_graph_version() {
+fn counter_overflow_does_not_remove_candidate() {
     let directory = TempDir::new().unwrap();
     let catalog = Catalog::open(directory.path()).unwrap();
     let candidate = catalog.insert_node_candidate("last").unwrap();
     drop(catalog);
 
     let db = open_raw(directory.path());
-    let mut maximum = vec![2];
-    maximum.extend_from_slice(&u64::MAX.to_be_bytes());
-    db.put(b"next-node-id", maximum).unwrap();
+    db.put(b"next-node-id", u64::MAX.to_be_bytes()).unwrap();
     drop(db);
 
     let catalog = Catalog::open(directory.path()).unwrap();
@@ -304,7 +277,6 @@ fn counter_overflow_does_not_remove_candidate_or_change_graph_version() {
         catalog.confirm_validated_candidate(candidate),
         Err(CatalogError::CounterOverflow { counter: "node ID" })
     ));
-    assert_eq!(catalog.graph_version().unwrap(), 0);
     assert_eq!(catalog.get_candidate(candidate).unwrap().id(), candidate);
     assert_eq!(catalog.lookup_node_exact("last").unwrap(), None);
 }
@@ -342,7 +314,6 @@ fn simultaneous_duplicate_confirmation_creates_at_most_one_record() {
             .count(),
         1
     );
-    assert_eq!(catalog.graph_version().unwrap(), 1);
     assert!(catalog.lookup_node_exact("racing").unwrap().is_some());
 }
 

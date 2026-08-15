@@ -1,4 +1,4 @@
-//! Durable, versioned graph storage for PathHydra.
+//! Durable graph storage for PathHydra.
 //!
 //! Provisional node, relation-kind, and edge candidates remain outside the
 //! confirmed graph until an external validator calls
@@ -9,7 +9,7 @@ mod codec;
 mod column_families;
 mod error;
 
-pub use catalog::{Catalog, ConfirmedGraph};
+pub use catalog::Catalog;
 pub use error::{CatalogError, ConfirmedId, EdgeEndpoint, RecordKind};
 pub use pathhydra_core::{
     BaseWeight, Candidate, CandidateId, ConfirmedRecord, EdgeId, EdgeRecord, InvalidBaseWeight,

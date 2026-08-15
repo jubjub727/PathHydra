@@ -26,7 +26,7 @@ The long-term goal is to perform that selection in parallel on the GPU and retur
 - **Relation:** a typed, directed connection between two nodes.
 - **Logical distance:** the accumulated context-adjusted weight used during graph selection.
 - **Routing result:** exact destination distances and optional path identities.
-- **Subgraph:** a caller-owned, version-pinned set of node and relation handles assembled through the Rust API.
+- **Subgraph:** a caller-owned set of node and relation handles assembled through the Rust API.
 - **Hydration:** turning caller-specified node and relation handles into complete records.
 
 ## Direction
@@ -36,7 +36,7 @@ PathHydra is intended to provide:
 - typed graph storage;
 - constrained, GPU-accelerated pathfinding;
 - exact context-weighted routing;
-- version-safe subgraph construction;
+- structurally safe subgraph construction;
 - traceable inference results;
 - a clean boundary between stored facts and inferred conclusions.
 
@@ -44,16 +44,15 @@ The project is in its early design stage. Interfaces and storage formats are not
 
 ## Implementation status
 
-The Rust core now provides a durable, versioned graph store. It preserves
+The Rust core now provides a durable graph store. It preserves
 opaque node payloads; exact node and relation-kind names; provisional node,
 relation-kind, and edge candidates; and confirmed typed, directed, normalized
 weighted edges. Promotion and deletion are atomic, parallel and self-edges
 have independent identities, node deletion cascades through both adjacency
-directions, and version 1 catalogs migrate without changing existing IDs or
-names. Startup validates every confirmed record and index relationship.
+directions. Startup validates every confirmed record and index relationship.
 
 Routing, GPU acceleration, hydration, and caller-owned subgraph composition
-are not implemented yet. The catalog's version 2 layout is documented in
+are not implemented yet. The current catalog layout is documented in
 [the storage-format reference](docs/storage-format.md).
 
 ## Development

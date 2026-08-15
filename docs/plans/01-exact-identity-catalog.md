@@ -124,7 +124,7 @@ src/
 
 Use one RocksDB database with these column families:
 
-- default: format version, graph version, and next-ID counters;
+- default: next-ID counters;
 - `candidates`;
 - `nodes`;
 - `node_names`;
@@ -136,9 +136,8 @@ This is a small fixed set with distinct access patterns. RocksDB supports atomic
 Encoding rules:
 
 - numeric keys and values use fixed-width big-endian bytes;
-- every record value begins with a format-version byte;
 - strings use an explicit byte length followed by their exact UTF-8 bytes;
-- decoders reject truncation, trailing garbage, unknown versions, and invalid lengths;
+- decoders reject truncation, trailing garbage, unknown candidate kinds, and invalid lengths;
 - no Rust memory layout or debug representation is persisted;
 - all decode failures identify the key space and record ID involved.
 
@@ -148,15 +147,13 @@ Write round-trip and malformed-input tests for every codec before catalog method
 
 On first open, initialize:
 
-- storage-format version;
-- graph version;
 - next candidate ID;
 - next node ID;
 - next relation ID.
 
 Serialize catalog writes through one store-owned mutex in this slice. Allocate an ID and update its counter in the same RocksDB write batch that creates the corresponding record. Check overflow and return a typed error instead of wrapping.
 
-Candidate insertion does not advance the confirmed graph version. Successful confirmation does.
+Candidate insertion does not affect confirmed lookup. Successful confirmation does.
 
 ## 6. Build exact-name hash indexes
 
@@ -195,7 +192,6 @@ Catalog::lookup_node_exact(name)
 Catalog::lookup_relation_exact(name)
 Catalog::get_node(node_id)
 Catalog::get_relation(relation_id)
-Catalog::graph_version()
 ```
 
 `confirm_validated_candidate` does not perform factual validation. Its name marks the boundary: the caller is asserting that validation already happened elsewhere.
@@ -206,11 +202,11 @@ Confirmation executes under the write mutex:
 2. Check the durable exact-name index, not only the in-memory cache.
 3. If the exact name already exists, return a typed `NameAlreadyConfirmed` error containing the existing ID. Do not merge or update either record.
 4. Allocate the stable confirmed ID.
-5. In one `WriteBatch`, create the confirmed record, create the exact-name mapping, remove the provisional candidate, update the ID counter, and increment graph version.
+5. In one `WriteBatch`, create the confirmed record, create the exact-name mapping, remove the provisional candidate, and update the ID counter.
 6. Commit the batch.
 7. Update the in-memory map only after the durable commit succeeds.
 
-All public errors distinguish not found, already confirmed, corrupt record, incompatible format, counter overflow, lock poisoning, and RocksDB failure.
+All public errors distinguish not found, already confirmed, corrupt record, counter overflow, lock poisoning, and RocksDB failure.
 
 ## 8. Verify restart and failure behaviour
 
@@ -221,7 +217,6 @@ Add integration tests for:
 - node and relation namespaces allowing the same exact text independently;
 - duplicate confirmation returning the existing ID without mutation;
 - failed confirmation leaving the candidate provisional;
-- graph version changing only after successful confirmation;
 - close/reopen preserving IDs and exact bytes;
 - cache rebuild detecting a missing confirmed record;
 - malformed values returning errors rather than panicking;
@@ -235,7 +230,7 @@ Tests must use temporary directories and close every RocksDB handle before clean
 
 Add rustdoc examples for exact lookup and candidate confirmation. Update the README implementation-status section to state only what now works.
 
-Record the column-family names, key encoding, value versions, and confirmation batch in a short storage-format document. Do not describe later edge or routing formats as settled.
+Record the column-family names, key encoding, value encodings, and confirmation batch in a short storage-layout document. Do not describe later edge or routing formats as settled.
 
 ## 10. Completion checks
 

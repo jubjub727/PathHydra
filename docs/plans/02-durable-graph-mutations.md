@@ -9,13 +9,13 @@ remove confirmed edges or nodes without leaving stale adjacency or lookup
 records.
 
 This is the store boundary required by the routing snapshot compiler. Routing
-does not begin until the confirmed graph can be read as a structurally valid,
-versioned source of truth.
+does not begin until the confirmed graph is a structurally valid source of
+truth.
 
 ## Why this is the next slice
 
 Plan 01 established stable node and relation-kind identities, exact-name
-resolution, provisional-to-confirmed promotion, and graph-version increments.
+resolution and provisional-to-confirmed promotion.
 The nearest missing dependency in `PATHHYDRA_SYSTEM_SHAPE.md` is the confirmed
 graph itself:
 
@@ -86,7 +86,7 @@ from the base-weight choice made here.
 
 If representative range evidence is unavailable, stop before fixing the new
 durable format and obtain it. A temporary numeric choice must not leak into a
-versioned RocksDB record.
+RocksDB record.
 
 ## 3. Add precise domain records
 
@@ -112,15 +112,13 @@ same endpoints and relation kind. Every promoted edge candidate receives its
 own ID. Never deduplicate edges by endpoints, relation kind, weight, or a hash.
 Self-edges are valid.
 
-## 4. Define storage format version 2 and its migration
+## 4. Extend the current storage layout
 
 Extend the RocksDB layout with:
 
 - `edges`: edge ID to canonical edge record;
-- `outgoing_edges`: `(source node ID, edge ID)` to a small versioned index
-  value;
-- `incoming_edges`: `(destination node ID, edge ID)` to a small versioned index
-  value;
+- `outgoing_edges`: `(source node ID, edge ID)` to an edge-ID index value;
+- `incoming_edges`: `(destination node ID, edge ID)` to an edge-ID index value;
 - `next-edge-id` metadata.
 
 The two adjacency keys use fixed-width big-endian components so every incident
@@ -128,23 +126,11 @@ edge for one node is available through a bounded prefix read. The canonical
 edge record remains authoritative; adjacency entries are indexes and must
 identify one exact edge rather than collapse parallel edges.
 
-Payloads and new candidate/edge variants require storage format version 2.
-Implement one restart-safe, idempotent migration from the existing version 1
-catalog:
+PathHydra is unreleased. Update the existing record encodings in place and keep
+only the current layout; do not add format markers, migration code, or
+compatibility fixtures. Initialize `next-edge-id` to 1 for a new catalog.
 
-1. open or create the new column families;
-2. convert version 1 candidates and confirmed records to version 2, assigning
-   empty payloads to version 1 node records and node candidates;
-3. initialize `next-edge-id` to 1;
-4. write the version 2 format marker only after every conversion succeeds;
-5. on restart, safely resume or repeat any work left before the marker update.
-
-Do not discard or renumber any existing candidate, node, or relation-kind ID.
-Reject unknown versions and malformed legacy records visibly. Test migration
-against a real version 1 fixture rather than reconstructing the fixture with
-version 2 code.
-
-Document all version 2 keys, values, index invariants, and the migration in
+Document all current keys, values, and index invariants in
 `docs/storage-format.md`.
 
 ## 5. Implement provisional edge insertion and atomic promotion
@@ -160,8 +146,7 @@ Catalog::get_edge(edge_id)
 
 Insertion validates the base-weight representation and stores only a
 provisional candidate. It does not require its endpoints to remain confirmed
-forever, does not enter either adjacency index, and does not advance the graph
-version.
+forever and does not enter either adjacency index.
 
 Edge confirmation runs under the existing store write mutex. It must:
 
@@ -170,11 +155,11 @@ Edge confirmation runs under the existing store write mutex. It must:
 3. allocate a new edge ID without wrapping;
 4. create the canonical edge and both adjacency entries;
 5. remove the provisional candidate;
-6. advance the next-edge counter and graph version;
+6. advance the next-edge counter;
 7. commit all changes in one RocksDB `WriteBatch`.
 
 Missing endpoints or a missing relation kind produce typed errors and leave the
-candidate, counters, indexes, and graph version unchanged. This is especially
+candidate, counters, and indexes unchanged. This is especially
 important when a node was removed after the edge candidate was inserted.
 
 No provisional candidate may appear through `get_edge`, adjacency inspection,
@@ -190,9 +175,8 @@ Catalog::remove_node(node_id)
 ```
 
 Removing an edge loads its canonical record and, in one batch, deletes the
-canonical record, its outgoing index entry, and its incoming index entry, then
-increments the graph version. A missing edge returns a typed not-found error
-without changing the version.
+canonical record, its outgoing index entry, and its incoming index entry. A
+missing edge returns a typed not-found error.
 
 Removing a node runs under the same write mutex and performs bounded prefix
 reads of both incident indexes. Deduplicate self-edges by `EdgeId`, verify every
@@ -201,8 +185,7 @@ index entry against its canonical record, and build one atomic batch that:
 - deletes every incoming and outgoing canonical edge;
 - deletes both adjacency entries for every removed edge;
 - deletes the confirmed node record;
-- deletes its exact-name mapping;
-- increments the graph version exactly once.
+- deletes its exact-name mapping.
 
 If any canonical/index relationship is missing or inconsistent, fail visibly
 before committing. Do not partially clean up a corrupt cascade. Provisional
@@ -228,8 +211,8 @@ invariants hold:
 - provisional candidates decode correctly but are never required to have
   currently confirmed endpoints.
 
-Return typed corruption or incompatible-format errors rather than repairing,
-dropping, or merging records during open.
+Return typed corruption errors rather than repairing, dropping, or merging
+records during open.
 
 ## 8. Test the mutation contracts first
 
@@ -243,18 +226,14 @@ Add integration fixtures covering:
 - zero and numeric-boundary base weights;
 - rejection of invalid base weights before any write;
 - failed promotion for a missing source, destination, or relation kind;
-- failed promotion leaving the candidate and graph version unchanged;
+- failed promotion leaving the candidate and counters unchanged;
 - successful promotion atomically creating all three edge representations;
 - edge deletion removing the canonical, outgoing, and incoming records;
 - node deletion removing all incoming and outgoing edges plus the exact-name
   lookup while preserving unrelated graph material;
-- one graph-version increment per successful promotion or deletion and none per
-  failed or provisional-only operation;
 - two concurrent promotions and deletion/promotion races serialized without
   dangling indexes;
 - restart detection of missing, duplicate, malformed, or mismatched adjacency;
-- successful version 1 to version 2 migration with all old IDs and exact names
-  preserved.
 
 Use small fixtures whose incident edges are obvious, plus one high-degree node
 fixture to exercise the cascade without a graph-wide scan. Where practical,
@@ -263,14 +242,9 @@ durable state rather than only public-method behaviour.
 
 ## 9. Keep the next compiler boundary narrow
 
-Organize canonical record decoding and bounded confirmed-edge iteration so the
-next plan can compile a routing snapshot from one consistent RocksDB view. Do
-not expose raw RocksDB handles or make routing code depend on column-family
+Keep canonical record decoding and bounded adjacency reads inside the store.
+Do not expose raw RocksDB handles or make routing code depend on column-family
 details, and do not design the final public transport API in this slice.
-
-The next plan should consume only confirmed node IDs, edge records, relation
-kinds, graph version, and a consistent store snapshot. Payload bytes must stay
-out of its routing arrays.
 
 ## 10. Documentation and completion checks
 
@@ -283,14 +257,11 @@ error.
 Run the four authoritative checks. Plan 02 is complete only when:
 
 - all existing exact-identity behaviour still passes;
-- version 1 catalogs migrate without changing existing identities or exact
-  names;
 - no provisional edge affects confirmed reads or indexes;
 - every successful edge promotion is one durable atomic batch;
 - edge and node deletion leave no canonical or adjacency representation behind;
 - open rejects every tested structural inconsistency;
-- all mutation outcomes report the graph version they changed or preserved;
-- public behaviour and storage format version 2 are documented;
+- public behaviour and the current storage layout are documented;
 - no routing, GPU, hydration, subgraph, BAML, or GitHub Actions code is added.
 
 Suggested commit message:
@@ -301,7 +272,6 @@ Implement durable graph mutations
 
 ## Following slice
 
-Once this plan is complete, Plan 03 should compile an immutable CPU-consumable
-routing snapshot from a version-pinned confirmed-store view. That plan can then
-fix dense node mappings, CSR arrays, manifests, checksums, and snapshot
-publication without mixing those concerns into mutation correctness.
+Once this plan is complete, Plan 03 can design the CPU-consumable routing data
+needed by the reference engine without mixing those concerns into mutation
+correctness.

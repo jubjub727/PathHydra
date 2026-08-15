@@ -133,11 +133,11 @@ Equal shortest-path candidates are equally correct for selection. A deterministi
 
 RocksDB is the durable engine. This is an early choice because the graph needs an embedded store with ordered byte keys, range iteration, atomic multi-key updates, snapshots, recovery, and checkpoints. RocksDB supplies those facilities and is available under Apache 2.0 or GPLv2; the project should use it under the selected compatible license.
 
-RocksDB is not expected to understand the graph. PathHydra owns record encoding, identifiers, adjacency, graph invariants, and versioning.
+RocksDB is not expected to understand the graph. PathHydra owns record encoding, identifiers, adjacency, and graph invariants.
 
 The durable layout needs logical key spaces for:
 
-- format and schema metadata;
+- next-ID metadata;
 - vertex records;
 - relation ID-to-name records;
 - canonical edges;
@@ -162,7 +162,7 @@ One logical mutation may touch a canonical edge and multiple indexes. Those writ
 
 Deletion is part of the graph contract. Removing one directed relation deletes its canonical record and every adjacency/index entry for that relation. Removing a vertex atomically deletes the vertex, its lookup records, and every relation whose source or destination is that vertex. An incoming adjacency or equivalent incident-edge index is therefore required so the engine can find all affected relations without a graph-wide scan. Tombstones or deferred cleanup may support the implementation, but they do not satisfy deletion while incident relations remain part of the confirmed graph.
 
-Record encodings require a magic value, schema version, fixed byte order, length checks, and migration policy. Corrupt or unknown records must fail visibly.
+Record encodings require fixed byte order and length checks. Malformed records must fail visibly.
 
 ## Name resolution
 
@@ -190,7 +190,7 @@ Its output contains only what expansion and reconstruction require:
 - edge handles needed to reconstruct and hydrate requested paths precisely;
 - maps between external and dense vertex IDs.
 
-The compiler checks every confirmed endpoint, relation ID, weight, array bound, and count. These are structural checks, not factual validation. It emits a manifest containing the graph version, record-format version, relation-dictionary version, numeric policy, element widths, counts, byte ranges, and checksums.
+The compiler checks every confirmed endpoint, relation ID, weight, array bound, and count. These are structural checks, not factual validation. It emits a manifest containing the numeric policy, element widths, counts, byte ranges, and checksums.
 
 The image is a rebuildable index, never a second source of truth. A serialized copy is useful because loading a validated contiguous file is different from rebuilding the image through a full database scan.
 
@@ -220,21 +220,18 @@ offset bytes
 
 Search state, frontiers, request profiles, outputs, and allocator headroom are separate from topology size.
 
-## Published graph versions
+## Routing image publication
 
-Durable writes and device arrays cannot change atomically together. Routing therefore uses immutable published epochs:
+Durable writes and device arrays cannot change atomically together. A routing image is built completely before it becomes active:
 
-1. A durable graph version is selected.
-2. A routing image is built and checked against that version.
-3. The completed image is published in one operation.
-4. New requests pin it.
-5. Existing requests keep their previous image until they finish.
+1. Read the confirmed graph needed to build the image.
+2. Build and check the routing image.
+3. Publish the completed image in one operation.
+4. Requests already using the previous image may finish before it is released.
 
-The implementation may rebuild whole images or apply verified deltas, but a request cannot observe a mixture of versions.
+The implementation may rebuild whole images or apply verified deltas, but a request uses one complete image.
 
-Hydration must read records compatible with the pinned routing version. A RocksDB runtime snapshot provides a consistent view inside a running database process; a RocksDB checkpoint provides a standalone point-in-time database. Long-lived epochs and restart recovery therefore require either retained checkpoints, application-versioned records, or another explicit retention scheme. This choice cannot be left implicit.
-
-The active manifest and enough prior state to recover safely must be durable. Loss of the GPU image should cause a reload or rebuild, not graph loss.
+Loss of the GPU image should cause a rebuild, not graph loss.
 
 ## Request contract
 
@@ -244,7 +241,6 @@ An inference request contains:
 origin external ID
 destination external IDs[]
 relation multiplier vector
-requested graph version or "current"
 return paths? boolean
 resource budget
 ```
@@ -263,13 +259,13 @@ Per-destination selection state distinguishes:
 - incomplete because a budget or cancellation stopped the search;
 - invalid request.
 
-Every response identifies the graph version and numeric policy used. A returned path contains stable vertex and edge handles plus enough weight information to reproduce its distance.
+Every response identifies the numeric policy used. A returned path contains stable vertex and edge handles plus enough weight information to reproduce its distance.
 
 ## Rust query runtime
 
 The Rust query runtime owns work around the search algorithm:
 
-- resolve external IDs against the selected epoch;
+- resolve external IDs against the active graph;
 - validate and pack the context profile;
 - canonicalize destinations;
 - select CPU or GPU execution according to capability and admission rules;
@@ -373,32 +369,32 @@ Hydration accepts caller-specified vertex and edge handles and resolves them int
 - directed edges with relation IDs and labels;
 - stored and effective weights for each edge;
 - stored and effective path distances when applicable;
-- graph version and context-profile identity.
+- context-profile identity.
 
-Reads are deduplicated and batched. Relation labels may be cached because they are small and versioned. Only requested records are fetched.
+Reads are deduplicated and batched. Relation labels may be cached because they are small. Only requested records are fetched.
 
 Hydration returns records; it does not decide how the caller composes them.
 
 ## Subgraph construction
 
-The Rust API provides a graph-shaped result container without imposing a policy for what belongs in it. A subgraph is pinned to one confirmed graph version and stores sets of vertex and edge handles from that version.
+The Rust API provides a graph-shaped result container without imposing a policy for what belongs in it. A subgraph stores sets of vertex and edge handles.
 
 The construction surface needs operations equivalent to:
 
-- create an empty subgraph for a graph version;
+- create an empty subgraph;
 - add a vertex handle;
 - add an edge handle together with its endpoints;
 - add every handle from a reconstructed path;
-- union another subgraph from the same graph version;
+- union another subgraph;
 - remove an edge;
 - remove a vertex and every incident edge currently in the subgraph;
 - test membership and enumerate vertices and edges;
 - hydrate the current contents;
 - encode the result for return across the Rust API boundary.
 
-Insertion is idempotent by identity, so shared vertices and edges are stored once. Adding an edge guarantees that both endpoints are present. Combining different graph versions must fail rather than silently bind stale handles to current records.
+Insertion is idempotent by identity, so shared vertices and edges are stored once. Adding an edge guarantees that both endpoints are present.
 
-Subgraph operations change only the caller-owned result container. They do not mutate confirmed or provisional database state. The caller decides which construction operations to apply; the Rust layer only enforces structural and version invariants.
+Subgraph operations change only the caller-owned result container. They do not mutate confirmed or provisional database state. The caller decides which construction operations to apply; the Rust layer only enforces structural invariants.
 
 ## Provisional candidates
 
@@ -410,7 +406,7 @@ How candidates are produced, validated, grouped, revised, rejected, or reviewed 
 
 The Rust API supports direct removal of a confirmed directed relation and removal of a confirmed node. Node removal cascades across every confirmed incoming and outgoing relation in the same atomic mutation. It also removes the node's exact-name lookup entry and other confirmed indexes owned by that node.
 
-Deletion advances the durable graph version and is reflected in the next published routing epoch. A request already pinned to an older immutable epoch may finish against that version; no newly admitted request may select a deleted node or relation after the deletion epoch is published.
+Deletion must be reflected when the routing image is rebuilt. The routing layer must not admit new work against an image known to contain deleted graph material.
 
 A provisional candidate that refers to an endpoint removed before promotion cannot be confirmed without a new valid endpoint state.
 
@@ -426,8 +422,8 @@ The stable boundary is a narrow typed graph API rather than a general graph quer
 - submit one-origin/many-destination routing requests;
 - reconstruct requested paths;
 - hydrate caller-specified node and relation handles;
-- construct, combine, edit, and hydrate version-pinned subgraphs;
-- inspect available graph versions and capabilities;
+- construct, combine, edit, and hydrate subgraphs;
+- inspect routing capabilities;
 - cancel work and read health information.
 
 The binding or local transport, streaming shape, process model, and remote-access policy remain open. The Rust request and response types should not depend on any one transport.
@@ -441,14 +437,14 @@ Expected failure classes include:
 - invalid provisional-to-confirmed transitions;
 - incomplete or inconsistent deletion cascades;
 - database write or recovery errors;
-- routing image checksum or version mismatch;
+- routing image checksum mismatch;
 - accelerator allocation, launch, or device loss;
 - cancellation and resource exhaustion;
-- hydration data unavailable for a pinned epoch.
+- requested hydration data unavailable.
 
-Each failure has a typed outcome. Device failure must not damage durable graph state. A corrupt routing image is discarded and rebuilt. A routing image is published only after its technical checks pass. Startup either exposes a fully valid epoch or reports that routing is unavailable.
+Each failure has a typed outcome. Device failure must not damage durable graph state. A corrupt routing image is discarded and rebuilt. A routing image is published only after its technical checks pass. Startup either exposes a fully valid routing image or reports that routing is unavailable.
 
-Backups use a documented RocksDB checkpoint or backup procedure and include the application metadata needed to interpret record formats. Rebuildable device images may be omitted from backups if startup can regenerate them.
+Backups use a documented RocksDB checkpoint or backup procedure. Rebuildable device images may be omitted from backups if startup can regenerate them.
 
 ## Verification surface
 
@@ -472,11 +468,8 @@ Correctness fixtures cover:
 - atomic promotion after external validation;
 - relation deletion removing every durable and routing representation;
 - node deletion removing every incoming and outgoing relation;
-- old and new routing epochs active together;
-- hydration against the correct version.
 - idempotent subgraph insertion and union;
 - subgraph node removal cascading through its incident edges;
-- rejection of handles or subgraphs from a different graph version;
 
 Property tests generate graphs and profiles, compare CPU and GPU outcomes, and verify every returned path has the reported minimum distance. Adversarial tests concentrate high degree, long chains, dense components, repeated relaxations, and unreachable regions.
 
@@ -500,7 +493,7 @@ Benchmarks report correctness failures before timing results. Performance target
 
 Every request should expose enough structured diagnostics to explain its execution without logging payload contents:
 
-- request and graph-version IDs;
+- request IDs;
 - profile identity or hash;
 - executor used;
 - queue and execution duration;
@@ -511,7 +504,7 @@ Every request should expose enough structured diagnostics to explain its executi
 - device-memory reservation and peak use;
 - reconstruction and hydration duration.
 
-Store-level metrics cover write failures, compaction pressure, cache behaviour, snapshot age, image build failures, and active epoch references.
+Store-level metrics cover write failures, compaction pressure, cache behaviour, image age, image build failures, and active image references.
 
 ## Software and licensing boundary
 
@@ -531,7 +524,7 @@ PathHydra-owned engine code is Rust. RocksDB itself is implemented in C++ and wi
 | Rust owns the graph library/API. | The graph engine needs deterministic systems code, explicit resource control, and a stable typed caller boundary. This is a fixed project constraint. |
 | Candidate data is provisional until promoted. | Unvalidated proposals must not affect the confirmed graph or any inference result. The validation method remains outside the engine. |
 | Exact-name lookup uses a hash index. | Case-sensitive string hashing followed by full equality provides the required exact-key behaviour, while the resulting numeric IDs support direct array indexing. |
-| Rust exposes subgraph construction primitives. | Callers need graph-shaped composition without forcing one composition strategy into the engine. Version pinning prevents stale handles from being mixed silently. |
+| Rust exposes subgraph construction primitives. | Callers need graph-shaped composition without forcing one composition strategy into the engine. |
 | RocksDB is the durable source of truth. | It is embedded, ordered, persistent, supports atomic batches and consistent views, and has a no-fee open-source licence. |
 | Routing uses a separate compact snapshot. | Durable payload storage and accelerator traversal have different access patterns; device memory is finite and distinct from host storage. |
 | The reference result is exact. | Every reachable destination has an exact minimum context-adjusted distance, so approximation would change the routing contract. |

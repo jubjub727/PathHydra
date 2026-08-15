@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for storage format version 2.
+Accepted.
 
 ## Context
 
@@ -40,4 +40,4 @@ This decision covers only the stored base weight. It does not select the type
 or policy for request multipliers, effective-weight multiplication, path
 accumulation, rounding, overflow, disabled relation kinds, unreachable
 distances, or deterministic tie handling. Those choices belong to the routing
-slice and must not be inferred from storage format version 2.
+slice and must not be inferred from this stored base-weight decision.

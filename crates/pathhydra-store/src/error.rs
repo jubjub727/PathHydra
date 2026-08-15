@@ -58,12 +58,6 @@ pub enum CatalogError {
         record_id: String,
         reason: String,
     },
-    IncompatibleFormat {
-        key_space: &'static str,
-        record_id: String,
-        found: u8,
-        supported: u8,
-    },
     CounterOverflow {
         counter: &'static str,
     },
@@ -104,15 +98,6 @@ impl fmt::Display for CatalogError {
             } => write!(
                 formatter,
                 "corrupt {key_space} record {record_id}: {reason}"
-            ),
-            Self::IncompatibleFormat {
-                key_space,
-                record_id,
-                found,
-                supported,
-            } => write!(
-                formatter,
-                "incompatible format version {found} in {key_space} record {record_id}; supported version is {supported}"
             ),
             Self::CounterOverflow { counter } => write!(formatter, "{counter} counter overflow"),
             Self::NameTooLong { byte_length } => write!(

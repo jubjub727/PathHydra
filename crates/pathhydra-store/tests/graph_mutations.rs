@@ -22,6 +22,38 @@ const COLUMN_FAMILIES: [&str; 8] = [
 ];
 
 #[test]
+fn metadata_and_records_contain_only_current_fields() {
+    let directory = TempDir::new().unwrap();
+    let catalog = Catalog::open(directory.path()).unwrap();
+    let node = confirm_node(&catalog, "node", NodePayload::default());
+    drop(catalog);
+
+    let db = open_raw(directory.path());
+    let metadata_keys: Vec<_> = db
+        .iterator(rocksdb::IteratorMode::Start)
+        .map(|entry| entry.unwrap().0.into_vec())
+        .collect();
+    assert_eq!(
+        metadata_keys,
+        [
+            b"next-candidate-id".to_vec(),
+            b"next-edge-id".to_vec(),
+            b"next-node-id".to_vec(),
+            b"next-relation-id".to_vec(),
+        ]
+    );
+    assert_eq!(db.get(b"next-node-id").unwrap().unwrap().len(), 8);
+    let node_record = db
+        .get_cf(
+            db.cf_handle("nodes").unwrap(),
+            node.id().as_u64().to_be_bytes(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(&node_record[..8], &node.id().as_u64().to_be_bytes());
+}
+
+#[test]
 fn node_payloads_preserve_empty_non_utf8_and_large_bytes_across_restart() {
     let directory = TempDir::new().unwrap();
     let catalog = Catalog::open(directory.path()).unwrap();
@@ -66,7 +98,6 @@ fn payload_larger_than_the_documented_limit_is_rejected_before_a_write() {
     ));
     let first = catalog.insert_node_candidate("first").unwrap();
     assert_eq!(first.as_u64(), 1);
-    assert_eq!(catalog.graph_version().unwrap(), 0);
 }
 
 #[test]
@@ -76,12 +107,9 @@ fn provisional_edges_are_invisible_and_confirmed_edges_are_directed_and_distinct
     let source = confirm_node(&catalog, "source", NodePayload::default());
     let destination = confirm_node(&catalog, "destination", NodePayload::default());
     let kind = confirm_relation(&catalog, "kind");
-    let version = catalog.graph_version().unwrap();
-
     let first_candidate = catalog
         .insert_edge_candidate(source.id(), destination.id(), kind.id(), 0.0)
         .unwrap();
-    assert_eq!(catalog.graph_version().unwrap(), version);
     assert!(catalog.outgoing_edges(source.id()).unwrap().is_empty());
     assert!(catalog.incoming_edges(destination.id()).unwrap().is_empty());
 
@@ -114,9 +142,7 @@ fn self_edges_are_distinct_and_removed_once_in_a_node_cascade() {
     let kind = confirm_relation(&catalog, "kind");
     let first = insert_and_confirm_edge(&catalog, node.id(), node.id(), kind.id(), 0.5);
     let second = insert_and_confirm_edge(&catalog, node.id(), node.id(), kind.id(), 1.0);
-    let version = catalog.graph_version().unwrap();
-
-    assert_eq!(catalog.remove_node(node.id()).unwrap(), version + 1);
+    catalog.remove_node(node.id()).unwrap();
     for edge in [first, second] {
         assert!(matches!(
             catalog.get_edge(edge.id()),
@@ -161,11 +187,10 @@ fn base_weight_boundaries_are_canonical_and_invalid_values_write_nothing() {
         panic!("expected an edge candidate");
     };
     assert_eq!(base_weight.to_bits(), 0);
-    assert_eq!(catalog.graph_version().unwrap(), 0);
 }
 
 #[test]
-fn failed_edge_promotion_preserves_candidate_counters_indexes_and_version() {
+fn failed_edge_promotion_preserves_candidate_counters_and_indexes() {
     let directory = TempDir::new().unwrap();
     let catalog = Catalog::open(directory.path()).unwrap();
     let source = confirm_node(&catalog, "source", NodePayload::default());
@@ -190,25 +215,21 @@ fn failed_edge_promotion_preserves_candidate_counters_indexes_and_version() {
         let candidate = catalog
             .insert_edge_candidate(candidate_source, candidate_destination, candidate_kind, 0.5)
             .unwrap();
-        let version = catalog.graph_version().unwrap();
         assert!(matches!(
             catalog.confirm_validated_candidate(candidate),
             Err(CatalogError::MissingEdgeEndpoint { endpoint: found, .. }) if found == endpoint
         ));
-        assert_eq!(catalog.graph_version().unwrap(), version);
         assert_eq!(catalog.get_candidate(candidate).unwrap().id(), candidate);
     }
 
     let candidate = catalog
         .insert_edge_candidate(source.id(), destination.id(), RelationId::from_u64(99), 0.5)
         .unwrap();
-    let version = catalog.graph_version().unwrap();
     assert!(matches!(
         catalog.confirm_validated_candidate(candidate),
         Err(CatalogError::MissingEdgeRelationKind { relation_kind_id })
             if relation_kind_id == RelationId::from_u64(99)
     ));
-    assert_eq!(catalog.graph_version().unwrap(), version);
     assert_eq!(catalog.get_candidate(candidate).unwrap().id(), candidate);
 
     let valid = insert_and_confirm_edge(&catalog, source.id(), destination.id(), kind.id(), 0.5);
@@ -226,12 +247,9 @@ fn edge_and_node_deletion_remove_all_durable_representations() {
     let ab = insert_and_confirm_edge(&catalog, a.id(), b.id(), kind.id(), 0.25);
     let ba = insert_and_confirm_edge(&catalog, b.id(), a.id(), kind.id(), 0.5);
     let bc = insert_and_confirm_edge(&catalog, b.id(), c.id(), kind.id(), 0.75);
-    let version = catalog.graph_version().unwrap();
-
-    assert_eq!(catalog.remove_edge(ab.id()).unwrap(), version + 1);
+    catalog.remove_edge(ab.id()).unwrap();
     assert!(catalog.outgoing_edges(a.id()).unwrap().is_empty());
     assert!(catalog.incoming_edges(b.id()).unwrap().is_empty());
-    let version = catalog.graph_version().unwrap();
     assert!(matches!(
         catalog.remove_edge(ab.id()),
         Err(CatalogError::NotFound {
@@ -239,9 +257,7 @@ fn edge_and_node_deletion_remove_all_durable_representations() {
             ..
         })
     ));
-    assert_eq!(catalog.graph_version().unwrap(), version);
-
-    assert_eq!(catalog.remove_node(b.id()).unwrap(), version + 1);
+    catalog.remove_node(b.id()).unwrap();
     for edge in [ba, bc] {
         assert!(matches!(
             catalog.get_edge(edge.id()),
@@ -281,7 +297,10 @@ fn high_degree_cascade_preserves_unrelated_graph_material() {
 
     catalog.remove_node(hub.id()).unwrap();
     assert_eq!(catalog.get_edge(unrelated.id()).unwrap(), unrelated);
-    assert_eq!(catalog.confirmed_graph().unwrap().edges().len(), 1);
+    assert_eq!(
+        catalog.outgoing_edges(leaves[0].id()).unwrap(),
+        vec![unrelated]
+    );
 }
 
 #[test]
@@ -389,7 +408,7 @@ fn open_rejects_missing_malformed_and_mismatched_adjacency() {
         let key = adjacency_key(source.id(), edge.id());
         match corruption {
             Corruption::Missing => db.delete_cf(outgoing, key).unwrap(),
-            Corruption::Malformed => db.put_cf(outgoing, key, [2, 0]).unwrap(),
+            Corruption::Malformed => db.put_cf(outgoing, key, [0]).unwrap(),
             Corruption::Mismatched => db
                 .put_cf(
                     outgoing,
@@ -425,7 +444,7 @@ fn open_rejects_invalid_edge_weight_and_missing_canonical_edge() {
                 .get_cf(edges, edge.id().as_u64().to_be_bytes())
                 .unwrap()
                 .unwrap();
-            value[33..37].copy_from_slice(&1.5_f32.to_bits().to_be_bytes());
+            value[32..36].copy_from_slice(&1.5_f32.to_bits().to_be_bytes());
             db.put_cf(edges, edge.id().as_u64().to_be_bytes(), value)
                 .unwrap();
         } else {
@@ -439,53 +458,6 @@ fn open_rejects_invalid_edge_weight_and_missing_canonical_edge() {
             Err(CatalogError::CorruptRecord { .. })
         ));
     }
-}
-
-#[test]
-fn real_v1_fixture_migrates_without_changing_ids_names_or_version() {
-    let directory = TempDir::new().unwrap();
-    create_v1_fixture(directory.path());
-
-    let catalog = Catalog::open(directory.path()).unwrap();
-    assert_eq!(catalog.graph_version().unwrap(), 7);
-    assert_eq!(
-        catalog.lookup_node_exact("Exact Node").unwrap(),
-        Some(NodeId::from_u64(4))
-    );
-    assert_eq!(
-        catalog.lookup_relation_exact("Exact Kind").unwrap(),
-        Some(RelationId::from_u64(6))
-    );
-    assert!(
-        catalog
-            .get_node(NodeId::from_u64(4))
-            .unwrap()
-            .payload()
-            .as_bytes()
-            .is_empty()
-    );
-    assert_eq!(
-        catalog
-            .get_candidate(pathhydra_store::CandidateId::from_u64(9))
-            .unwrap(),
-        Candidate::Node {
-            id: pathhydra_store::CandidateId::from_u64(9),
-            name: "Pending".into(),
-            payload: NodePayload::default(),
-        }
-    );
-    let edge = insert_and_confirm_edge(
-        &catalog,
-        NodeId::from_u64(4),
-        NodeId::from_u64(4),
-        RelationId::from_u64(6),
-        1.0,
-    );
-    assert_eq!(edge.id(), EdgeId::from_u64(1));
-    drop(catalog);
-
-    let reopened = Catalog::open(directory.path()).unwrap();
-    assert_eq!(reopened.get_edge(edge.id()).unwrap(), edge);
 }
 
 enum Corruption {
@@ -551,79 +523,6 @@ fn adjacency_key(node: NodeId, edge: EdgeId) -> [u8; 16] {
     key
 }
 
-fn index_value(edge: EdgeId) -> [u8; 9] {
-    let mut value = [0; 9];
-    value[0] = 2;
-    value[1..].copy_from_slice(&edge.as_u64().to_be_bytes());
-    value
-}
-
-fn create_v1_fixture(path: &std::path::Path) {
-    let mut options = Options::default();
-    options.create_if_missing(true);
-    options.create_missing_column_families(true);
-    let db = DB::open_cf(&options, path, &COLUMN_FAMILIES[..5]).unwrap();
-    db.put(b"storage-format", [1]).unwrap();
-    for (key, value) in [
-        (b"graph-version".as_slice(), 7),
-        (b"next-candidate-id".as_slice(), 10),
-        (b"next-node-id".as_slice(), 5),
-        (b"next-relation-id".as_slice(), 7),
-    ] {
-        db.put(key, legacy_u64(value)).unwrap();
-    }
-    db.put_cf(
-        db.cf_handle("nodes").unwrap(),
-        4_u64.to_be_bytes(),
-        legacy_named_record(4, "Exact Node"),
-    )
-    .unwrap();
-    db.put_cf(
-        db.cf_handle("node_names").unwrap(),
-        name_key("Exact Node"),
-        legacy_u64(4),
-    )
-    .unwrap();
-    db.put_cf(
-        db.cf_handle("relation_kinds").unwrap(),
-        6_u64.to_be_bytes(),
-        legacy_named_record(6, "Exact Kind"),
-    )
-    .unwrap();
-    db.put_cf(
-        db.cf_handle("relation_names").unwrap(),
-        name_key("Exact Kind"),
-        legacy_u64(6),
-    )
-    .unwrap();
-    let mut candidate = vec![1, 1];
-    candidate.extend_from_slice(&9_u64.to_be_bytes());
-    candidate.extend_from_slice(&name_key("Pending"));
-    db.put_cf(
-        db.cf_handle("candidates").unwrap(),
-        9_u64.to_be_bytes(),
-        candidate,
-    )
-    .unwrap();
-}
-
-fn legacy_u64(value: u64) -> [u8; 9] {
-    let mut bytes = [0; 9];
-    bytes[0] = 1;
-    bytes[1..].copy_from_slice(&value.to_be_bytes());
-    bytes
-}
-
-fn name_key(name: &str) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&u32::try_from(name.len()).unwrap().to_be_bytes());
-    bytes.extend_from_slice(name.as_bytes());
-    bytes
-}
-
-fn legacy_named_record(id: u64, name: &str) -> Vec<u8> {
-    let mut bytes = vec![1];
-    bytes.extend_from_slice(&id.to_be_bytes());
-    bytes.extend_from_slice(&name_key(name));
-    bytes
+fn index_value(edge: EdgeId) -> [u8; 8] {
+    edge.as_u64().to_be_bytes()
 }
