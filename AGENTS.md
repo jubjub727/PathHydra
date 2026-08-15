@@ -42,6 +42,7 @@ Use these terms consistently in code and documentation.
 - Prefer small fixtures that make expected paths obvious.
 - Document new formats and public interfaces when they are introduced.
 - Do not add dependencies or abstractions without a current use for them.
+- Do not add GitHub Actions workflows.
 
 ## Definition of done
 
