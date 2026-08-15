@@ -2,7 +2,7 @@
 
 This document describes the parts the system needs and the contracts between them. It is not an implementation sequence. A choice is fixed only where the required behaviour or available evidence already narrows it sufficiently.
 
-Two implementation choices are fixed. BAML is the application layer and owns the higher-level control flow. Rust is the systems layer and exposes the graph engine as a library/API used by BAML.
+Two implementation choices are fixed. The graph engine is written in Rust and exposed as a library/API consumed by BAML. The design and eventual use of the BAML side are not defined here.
 
 ## Fixed behaviour
 
@@ -25,20 +25,17 @@ The main query shape is one origin and any number of destinations. Work can be s
 
 ## System boundary
 
-BAML runs the application. It owns model calls, higher-level decisions, workflow state, and the flow that builds and queries the factual graph. It decides which Rust operations to call and how their results affect the next application action.
+BAML sits above the graph engine as its consumer. Its prompts, models, workflows, application structure, and use of graph results are outside this document.
 
-The Rust layer is a deterministic graph engine. It accepts concrete records and inference requests, validates them, persists them, runs graph selection, and returns structured results. It does not call models or control the application.
+The Rust layer is a deterministic graph engine. It accepts concrete records and graph-selection requests, validates them, persists them, runs selection, and returns structured results. It does not depend on how the caller produced those inputs or how the caller will use the output.
 
 ```text
 input and application state
             |
             v
 +-----------------------------+
-| BAML application            |
-| - model-driven workflows    |
-| - application decisions     |
-| - graph-building flow       |
-| - inference orchestration   |
+| BAML consumer               |
+| details not yet specified   |
 +-----------------------------+
             |
       typed Rust calls
@@ -61,12 +58,12 @@ input and application state
      structured results
             |
             v
-      BAML continues flow
+    structured result returned
 ```
 
-The BAML application does not read or write RocksDB directly and does not manipulate routing images. The Rust API is the sole owner of those resources and their invariants. Conversely, Rust does not decide which facts the application should store, which model to call, or what the next workflow step should be.
+The BAML side does not read or write RocksDB directly and does not manipulate routing images. The Rust API is the sole owner of those resources and their invariants. No other responsibility is assigned to BAML here.
 
-The exact call mechanism between BAML and Rust remains open. It may be an in-process library bridge or a narrow local API, but the ownership boundary and typed request/response contracts remain the same.
+No binding, transport, or process-model decision is made for the BAML side here.
 
 ## Identity and records
 
@@ -237,7 +234,7 @@ include selection diagnostics? boolean
 resource budget
 ```
 
-Selection diagnostics are optional and do not shape the normal inference response. The normal response returns a selected graph. The request contract still needs a precise graph-inclusion rule: BAML must supply, or the Rust API must define, the boundary that turns shortest-distance results into selected vertices and edges. That rule cannot be inferred from one predecessor chain.
+Selection diagnostics are optional and do not shape the normal inference response. The normal response returns a selected graph. The Rust request contract still needs a precise graph-inclusion rule that turns shortest-distance results into selected vertices and edges. That rule cannot be inferred from one predecessor chain.
 
 The multiplier vector is immutable for the request. It is validated and converted to a dense array indexed by relation ID. A missing relation entry must have one documented meaning; silently inheriting process state is not acceptable.
 
@@ -370,7 +367,7 @@ Hydration adds records to the selected graph; it does not reconsider graph membe
 
 ## Mutation and ingestion surfaces
 
-BAML owns the application flow that produces graph changes, including any model work used to decide which records should exist. It submits concrete mutation commands to Rust. Rust validates and applies them without needing to know how BAML arrived at them.
+The caller submits concrete mutation commands to Rust. Rust validates and applies them without needing to know how they were produced.
 
 The graph layer needs operations for:
 
@@ -388,9 +385,9 @@ Imports must use the same validation and record formats as online writes. A fast
 
 Renaming a relation does not alter routing. Reassigning its numeric ID or changing edge weights does and therefore requires a new routing epoch.
 
-## Rust API presented to BAML
+## Rust public API
 
-The stable boundary is a narrow typed graph API rather than a general graph query language. BAML uses it to perform calls equivalent to:
+The stable boundary is a narrow typed graph API rather than a general graph query language. It needs calls equivalent to:
 
 - resolve a name or alias;
 - mutate graph records;
@@ -486,8 +483,8 @@ PathHydra-owned engine code is Rust. RocksDB itself is implemented in C++ and wi
 
 | Decision | Reason |
 |---|---|
-| BAML owns the application layer. | Model-driven behaviour, application decisions, graph-building flow, and inference orchestration belong to the controlling application rather than the storage engine. |
-| Rust owns the graph library/API. | The graph engine needs deterministic systems code, explicit resource control, and a stable typed boundary for BAML. This is a fixed project constraint. |
+| BAML consumes the Rust graph API. | This boundary is fixed; BAML's internal design and use of the API are not. |
+| Rust owns the graph library/API. | The graph engine needs deterministic systems code, explicit resource control, and a stable typed caller boundary. This is a fixed project constraint. |
 | RocksDB is the durable source of truth. | It is embedded, ordered, persistent, supports atomic batches and consistent views, and has a no-fee open-source licence. |
 | Routing uses a separate compact snapshot. | Durable payload storage and accelerator traversal have different access patterns; device memory is finite and distinct from host storage. |
 | The reference result is exact. | Graph membership is driven by minimum context-adjusted distance, so approximation could change the selected graph. |
@@ -499,9 +496,6 @@ PathHydra-owned engine code is Rust. RocksDB itself is implemented in C++ and wi
 ## Decisions deliberately left open
 
 - Rust workspace and crate boundaries;
-- BAML application module boundaries;
-- the BAML-to-Rust binding or local transport;
-- build orchestration across the BAML and Cargo toolchains;
 - GPU vendor and programming API;
 - exact accelerator algorithm and tuning parameters;
 - stored and accumulated numeric types;
@@ -523,7 +517,7 @@ Each becomes fixed only after its required workload, correctness constraint, tar
 ## Evidence for the early choices
 
 - [The Rust project](https://github.com/rust-lang/rust) provides the compiler, standard library, Cargo tooling, and records its MIT and Apache 2.0 licensing.
-- [BAML's repository](https://github.com/BoundaryML/baml) describes typed model functions and agent workflows, local operation, language interoperability, and its Apache 2.0 licence.
+- [BAML's repository](https://github.com/BoundaryML/baml) records its Apache 2.0 licence.
 - [RocksDB overview](https://rocksdb.org/) describes an embedded persistent store using arbitrary byte keys and values and optimized for fast storage.
 - [RocksDB column families](https://github.com/facebook/rocksdb/wiki/Column-Families) documents logical partitioning, consistent cross-family views, and atomic writes across column families.
 - [RocksDB basic operations](https://github.com/facebook/rocksdb/wiki/Basic-Operations) documents `WriteBatch` atomicity and reads pinned to a snapshot.
