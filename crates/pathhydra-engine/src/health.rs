@@ -3,7 +3,8 @@ use std::time::Duration;
 use pathhydra_routing::{NUMERIC_POLICY_ID, RoutingImageManifest, TIE_POLICY_ID};
 
 use crate::{
-    CpuTopologyMode, CudaAvailability, EngineConfig, ImageBuildReport, RoutingUnavailableReason,
+    CpuTopologyMode, CudaAvailability, EngineConfig, ImageBuildReport, RetirementSnapshot,
+    RoutingUnavailableReason,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,7 +60,7 @@ impl EngineCapabilities {
             cuda_distance_only: true,
             cuda_paths: false,
             cuda_finite_edge_budgets: false,
-            cuda_full_residency_required: true,
+            cuda_full_residency_required: false,
             paths: true,
             edge_budgets: true,
             cancellation: true,
@@ -80,6 +81,8 @@ pub struct CudaHealth {
     pub resident_node_count: usize,
     pub resident_adjacency_count: usize,
     pub resident_topology_bytes: usize,
+    pub partitioned_topology: bool,
+    pub device_topology_cache: Option<DeviceTopologyCacheHealth>,
     pub queued_lanes: usize,
     pub active_lanes: usize,
     pub peak_active_lanes: usize,
@@ -96,10 +99,33 @@ pub struct CudaHealth {
     pub cumulative_context_reinitializations: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DeviceTopologyCacheHealth {
+    pub capacity_bytes: usize,
+    pub capacity_slots: usize,
+    pub current_bytes: usize,
+    pub high_water_bytes: usize,
+    pub entries: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub copies: u64,
+    pub evictions: u64,
+    pub slot_waits: u64,
+    pub in_use_slots: usize,
+    pub transfer_bytes: u64,
+}
+
 #[derive(Clone, Debug)]
 pub enum RoutingHealth {
     Available,
     Unavailable(RoutingUnavailableReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupImageOutcome {
+    ValidatedBundle,
+    RebuiltFromCatalog,
+    RebuildFailed,
 }
 
 #[derive(Clone, Debug)]
@@ -108,9 +134,15 @@ pub struct EngineHealth {
     pub routing: RoutingHealth,
     pub current_image_manifest: Option<RoutingImageManifest>,
     pub current_image_age: Option<Duration>,
+    pub current_bundle: Option<pathhydra_routing::BundleSnapshot>,
+    pub startup_image_outcome: StartupImageOutcome,
+    pub startup_image_duration: Duration,
     pub cpu_topology_mode: Option<CpuTopologyMode>,
     pub host_partition_cache: Option<pathhydra_routing::HostCacheSnapshot>,
     pub last_image_build: ImageBuildReport,
+    pub last_image_corruption: Option<String>,
+    pub last_cuda_degradation: Option<String>,
+    pub last_cuda_recovery: Option<String>,
     pub active_routes: usize,
     pub peak_active_routes: usize,
     pub reserved_route_bytes: usize,
@@ -119,5 +151,6 @@ pub struct EngineHealth {
     pub cumulative_admission_rejections: u64,
     pub cumulative_cancellations: u64,
     pub cumulative_image_build_failures: u64,
+    pub retired_bundles: RetirementSnapshot,
     pub cuda: CudaHealth,
 }

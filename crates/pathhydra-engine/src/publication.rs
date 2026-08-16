@@ -1,10 +1,55 @@
 use std::{
     fmt,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     time::{Duration, Instant},
 };
 
-use pathhydra_routing::{ChunkedRoutingImage, RoutingImage, RoutingImageManifest};
+use pathhydra_routing::{ChunkedRoutingImage, RoutingBundle, RoutingImage, RoutingImageManifest};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum PublicationStage {
+    TemporaryDirectoryCreated = 1,
+    BundleFilesSynchronized = 2,
+    TemporaryBundleValidated = 3,
+    FinalDirectoryRenamed = 4,
+    DurablePointerCommitted = 5,
+    RuntimeRepresentationConstructed = 6,
+    BeforeEngineSwap = 7,
+}
+
+#[doc(hidden)]
+#[derive(Default)]
+pub struct PublicationFaultInjection {
+    stage: AtomicU8,
+}
+
+impl PublicationFaultInjection {
+    pub fn reset(&self) {
+        self.stage.store(0, Ordering::Release);
+    }
+
+    pub fn fail_at(&self, stage: PublicationStage) {
+        self.stage.store(stage as u8, Ordering::Release);
+    }
+
+    pub(crate) fn trip(&self, stage: PublicationStage) -> Result<(), RoutingUnavailableReason> {
+        if self
+            .stage
+            .compare_exchange(stage as u8, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            Err(RoutingUnavailableReason::Bundle(format!(
+                "injected publication failure at {stage:?}"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CpuTopologyMode {
@@ -12,15 +57,19 @@ pub enum CpuTopologyMode {
     Partitioned,
 }
 
+#[derive(Clone)]
 pub(crate) enum CpuTopology {
-    Resident(Arc<RoutingImage>),
+    Resident {
+        image: Arc<RoutingImage>,
+        bundle: Arc<RoutingBundle>,
+    },
     Partitioned(Arc<ChunkedRoutingImage>),
 }
 
 impl CpuTopology {
     pub fn manifest(&self) -> RoutingImageManifest {
         match self {
-            Self::Resident(image) => image.manifest().clone(),
+            Self::Resident { image, .. } => image.manifest().clone(),
             Self::Partitioned(image) => image
                 .routing_manifest()
                 .expect("validated bundle counts remain representable"),
@@ -28,20 +77,26 @@ impl CpuTopology {
     }
     pub fn resident(&self) -> Option<Arc<RoutingImage>> {
         match self {
-            Self::Resident(image) => Some(Arc::clone(image)),
+            Self::Resident { image, .. } => Some(Arc::clone(image)),
             Self::Partitioned(_) => None,
         }
     }
     pub const fn mode(&self) -> CpuTopologyMode {
         match self {
-            Self::Resident(_) => CpuTopologyMode::Resident,
+            Self::Resident { .. } => CpuTopologyMode::Resident,
             Self::Partitioned(_) => CpuTopologyMode::Partitioned,
         }
     }
     pub fn host_cache(&self) -> Option<pathhydra_routing::HostCacheSnapshot> {
         match self {
-            Self::Resident(_) => None,
+            Self::Resident { .. } => None,
             Self::Partitioned(image) => Some(image.cache_snapshot()),
+        }
+    }
+    pub fn bundle(&self) -> Arc<RoutingBundle> {
+        match self {
+            Self::Resident { bundle, .. } => Arc::clone(bundle),
+            Self::Partitioned(image) => Arc::clone(image.bundle()),
         }
     }
 }
@@ -49,8 +104,46 @@ impl CpuTopology {
 pub(crate) struct PublishedExecutionImage {
     pub cpu: CpuTopology,
     #[cfg(feature = "cuda")]
-    pub cuda: Option<Arc<pathhydra_cuda::CudaResidentImage>>,
+    pub cuda: Option<CudaTopology>,
     pub cuda_unavailable_reason: Option<crate::CudaAvailability>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone)]
+pub(crate) enum CudaTopology {
+    Resident(Arc<pathhydra_cuda::CudaResidentImage>),
+    Partitioned(Arc<pathhydra_cuda::CudaPartitionedImage>),
+}
+
+#[cfg(feature = "cuda")]
+impl CudaTopology {
+    pub fn node_count(&self) -> usize {
+        match self {
+            Self::Resident(image) => image.node_count(),
+            Self::Partitioned(image) => image.node_count(),
+        }
+    }
+    pub fn adjacency_count(&self) -> usize {
+        match self {
+            Self::Resident(image) => image.adjacency_count(),
+            Self::Partitioned(image) => image.adjacency_count(),
+        }
+    }
+    pub fn allocated_bytes(&self) -> usize {
+        match self {
+            Self::Resident(image) => image.allocated_bytes(),
+            Self::Partitioned(image) => image.allocated_bytes(),
+        }
+    }
+    pub const fn partitioned(&self) -> bool {
+        matches!(self, Self::Partitioned(_))
+    }
+    pub fn device_cache(&self) -> Option<pathhydra_cuda::DeviceTopologyCacheSnapshot> {
+        match self {
+            Self::Resident(_) => None,
+            Self::Partitioned(image) => Some(image.topology_cache_snapshot()),
+        }
+    }
 }
 
 impl PublishedExecutionImage {
@@ -64,12 +157,9 @@ impl PublishedExecutionImage {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn with_cuda(
-        image: Arc<RoutingImage>,
-        cuda: Arc<pathhydra_cuda::CudaResidentImage>,
-    ) -> Self {
+    pub fn with_cuda(cpu: CpuTopology, cuda: CudaTopology) -> Self {
         Self {
-            cpu: CpuTopology::Resident(image),
+            cpu,
             cuda: Some(cuda),
             cuda_unavailable_reason: None,
         }
@@ -114,6 +204,7 @@ pub struct ImageBuildReport {
     node_count: usize,
     relation_kind_count: usize,
     adjacency_count: usize,
+    bundle_metrics: Option<pathhydra_routing::BundleBuildMetrics>,
 }
 
 impl ImageBuildReport {
@@ -121,6 +212,7 @@ impl ImageBuildReport {
         duration: Duration,
         outcome: ImageBuildOutcome,
         counts: (usize, usize, usize),
+        bundle_metrics: Option<pathhydra_routing::BundleBuildMetrics>,
     ) -> Self {
         Self {
             duration,
@@ -128,6 +220,7 @@ impl ImageBuildReport {
             node_count: counts.0,
             relation_kind_count: counts.1,
             adjacency_count: counts.2,
+            bundle_metrics,
         }
     }
     #[must_use]
@@ -149,6 +242,10 @@ impl ImageBuildReport {
     #[must_use]
     pub const fn adjacency_count(&self) -> usize {
         self.adjacency_count
+    }
+    #[must_use]
+    pub const fn bundle_metrics(&self) -> Option<&pathhydra_routing::BundleBuildMetrics> {
+        self.bundle_metrics.as_ref()
     }
 }
 

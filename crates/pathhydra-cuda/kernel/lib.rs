@@ -6,6 +6,9 @@
 mod arithmetic;
 mod delta;
 mod frontier;
+mod frontier_compaction;
+mod partition_delta;
+mod partition_frontier;
 
 use core::panic::PanicInfo;
 

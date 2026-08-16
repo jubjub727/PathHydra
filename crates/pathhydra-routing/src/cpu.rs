@@ -24,7 +24,11 @@ pub(crate) trait RoutingTopology {
     fn external_node_id(&self, dense: DenseNodeId) -> Option<pathhydra_core::NodeId>;
     fn relation_ids(&self) -> &[pathhydra_core::RelationId];
     fn outgoing_range(&self, source: DenseNodeId) -> Result<std::ops::Range<usize>, RoutingError>;
-    fn edge_at(&self, index: usize) -> Result<crate::OutgoingEdge, RoutingError>;
+    fn edge_at(
+        &self,
+        index: usize,
+        cancellation: &dyn CancellationSignal,
+    ) -> Result<Option<crate::OutgoingEdge>, RoutingError>;
 }
 
 impl RoutingTopology for RoutingImage {
@@ -51,8 +55,12 @@ impl RoutingTopology for RoutingImage {
             reason: "node has no bounded outgoing range",
         })
     }
-    fn edge_at(&self, index: usize) -> Result<crate::OutgoingEdge, RoutingError> {
-        Ok(RoutingImage::edge_at(self, index))
+    fn edge_at(
+        &self,
+        index: usize,
+        _cancellation: &dyn CancellationSignal,
+    ) -> Result<Option<crate::OutgoingEdge>, RoutingError> {
+        Ok(Some(RoutingImage::edge_at(self, index)))
     }
 }
 
@@ -382,7 +390,10 @@ pub(crate) fn route_topology_controlled(
                         .ok_or(RoutingError::InternalInvariant {
                             reason: "examined-edge counter overflow",
                         })?;
-                let edge = image.edge_at(adjacency)?;
+                let Some(edge) = image.edge_at(adjacency, cancellation)? else {
+                    completion_reason = CompletionReason::Cancelled;
+                    break 'search;
+                };
                 let relation_use = profile.relation_use_index(edge.relation_index()).ok_or(
                     RoutingError::InternalInvariant {
                         reason: "edge relation is absent from packed profile",
@@ -624,7 +635,9 @@ fn reconstruct_path(
                 reason: "predecessor edge is outside its source range",
             });
         }
-        let edge = image.edge_at(predecessor.adjacency)?;
+        let Some(edge) = image.edge_at(predecessor.adjacency, cancellation)? else {
+            return Ok(None);
+        };
         if edge.edge_id() != predecessor.edge || edge.destination() != current {
             return Err(RoutingError::InternalInvariant {
                 reason: "predecessor edge endpoints or identity disagree",

@@ -1,9 +1,10 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use pathhydra_core::ConfirmedRecord;
 use pathhydra_routing::{
-    RelationMultiplier, RelationProfile, RelationUse, RoutingImage, RoutingRequest, SearchBudget,
-    TiePolicy,
+    BundleConfig, ChunkedRoutingImage, HostCacheConfig, RelationMultiplier, RelationProfile,
+    RelationUse, RoutingImage, RoutingRequest, SearchBudget, TiePolicy, compile_bundle,
+    open_bundle,
 };
 use pathhydra_store::Catalog;
 
@@ -13,6 +14,8 @@ pub enum Shape {
     Star,
     Dense,
     ZeroClosure,
+    Disconnected,
+    Mixed,
 }
 
 #[derive(Clone, Copy)]
@@ -43,12 +46,25 @@ pub const BASELINE: &[Workload] = &[
         nodes: 128,
         shape: Shape::ZeroClosure,
     },
+    Workload {
+        name: "disconnected-regions",
+        nodes: 256,
+        shape: Shape::Disconnected,
+    },
+    Workload {
+        name: "mixed-locality",
+        nodes: 256,
+        shape: Shape::Mixed,
+    },
 ];
 
 pub struct Fixture {
     _directory: tempfile::TempDir,
     pub image: Arc<RoutingImage>,
     pub request: RoutingRequest,
+    pub chunked: Arc<ChunkedRoutingImage>,
+    pub build_metrics: pathhydra_routing::BundleBuildMetrics,
+    pub bundle_path: PathBuf,
 }
 
 pub fn build(workload: Workload) -> Fixture {
@@ -98,6 +114,22 @@ pub fn build(workload: Workload) -> Fixture {
                 }
             }
         }
+        Shape::Disconnected => {
+            for index in 0..nodes.len() / 2 - 1 {
+                edges.push((index, index + 1));
+            }
+            for index in nodes.len() / 2..nodes.len() - 1 {
+                edges.push((index, index + 1));
+            }
+        }
+        Shape::Mixed => {
+            for index in 0..nodes.len() - 1 {
+                edges.push((index, index + 1));
+                if index + 16 < nodes.len() {
+                    edges.push((index, index + 16));
+                }
+            }
+        }
     }
     let weight = if matches!(workload.shape, Shape::ZeroClosure) {
         0.0
@@ -120,6 +152,32 @@ pub fn build(workload: Workload) -> Fixture {
         )
         .expect("routing image"),
     );
+    let bundle_path = directory.path().join("routing-bundle");
+    let scan = catalog.confirmed_graph_scan().expect("confirmed scan");
+    let (_, build_metrics) = compile_bundle(
+        &scan,
+        &bundle_path,
+        BundleConfig {
+            target_partition_topology_bytes: 4 * 1024,
+            hard_maximum_partition_topology_bytes: 4 * 1024,
+            maximum_total_bundle_bytes: 1024 * 1024 * 1024,
+        },
+    )
+    .expect("benchmark bundle");
+    drop(scan);
+    let chunked = Arc::new(
+        ChunkedRoutingImage::open(
+            open_bundle(&bundle_path).expect("validated benchmark bundle"),
+            HostCacheConfig {
+                maximum_bytes: 128 * 1024,
+                maximum_staging_bytes: 8 * 1024,
+                maximum_entries: 8,
+                io_worker_count: 2,
+                maximum_queued_reads: 8,
+            },
+        )
+        .expect("benchmark partition cache"),
+    );
     let destinations = [nodes[nodes.len() - 1], nodes[nodes.len() / 2], nodes[0]];
     let request = RoutingRequest::new(
         nodes[0],
@@ -136,5 +194,8 @@ pub fn build(workload: Workload) -> Fixture {
         _directory: directory,
         image,
         request,
+        chunked,
+        build_metrics,
+        bundle_path,
     }
 }

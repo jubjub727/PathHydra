@@ -58,9 +58,12 @@ mod profile;
 mod request;
 
 pub use bundle::{
-    BundleBuildMetrics, BundleConfig, BundleError, BundleManifest, ChunkedRoutingImage,
-    HostCacheConfig, HostCacheSnapshot, PartitionedCpuDiagnostics, RoutingBundle, compile_bundle,
-    open_bundle, route_partitioned, route_partitioned_controlled,
+    AnalyticParallelBundleConfig, BundleBuildMetrics, BundleConfig, BundleError,
+    BundleFaultInjection, BundleManifest, BundleSnapshot, ChunkedRoutingImage, HostCacheConfig,
+    HostCacheSnapshot, PartitionDescriptor, PartitionLease, PartitionSourceSegment,
+    PartitionedCpuDiagnostics, RoutingBundle, SegmentDescriptor, compile_bundle,
+    generate_analytic_parallel_bundle, open_bundle, route_partitioned,
+    route_partitioned_controlled,
 };
 pub use compile::{compile_routing_image, compile_routing_image_with_limit};
 pub use cpu::{

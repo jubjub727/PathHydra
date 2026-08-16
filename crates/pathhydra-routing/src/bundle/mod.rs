@@ -4,12 +4,16 @@ mod layout;
 mod manifest;
 mod reader;
 
-pub use compiler::{BundleBuildMetrics, BundleConfig, compile_bundle};
+pub use compiler::{
+    AnalyticParallelBundleConfig, BundleBuildMetrics, BundleConfig, compile_bundle,
+    generate_analytic_parallel_bundle,
+};
 pub use layout::{PartitionDescriptor, SegmentDescriptor};
 pub use manifest::BundleManifest;
 pub use reader::{
-    ChunkedRoutingImage, HostCacheConfig, HostCacheSnapshot, PartitionedCpuDiagnostics,
-    RoutingBundle, open_bundle, route_partitioned, route_partitioned_controlled,
+    BundleFaultInjection, BundleSnapshot, ChunkedRoutingImage, HostCacheConfig, HostCacheSnapshot,
+    PartitionLease, PartitionSourceSegment, PartitionedCpuDiagnostics, RoutingBundle, open_bundle,
+    route_partitioned, route_partitioned_controlled,
 };
 
 use std::{error::Error, fmt, io};

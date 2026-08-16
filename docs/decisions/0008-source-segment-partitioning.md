@@ -9,3 +9,20 @@ Partitions are immutable and independently checksummed. The configured target cl
 CPU state remains in host memory while topology moves through a byte- and entry-bounded shared cache. Presence, eviction, and request interleaving affect only performance. Expansion still counts each relation immediately before profile evaluation and uses the same separate binary64 multiplication/addition and stable predecessor tuple. Pending reads are unfinished work; pinned entries cannot be evicted. Discarded bytes remain reloadable from the exact bundle owned by the request.
 
 Conventional checked file reads and explicit accelerator copies are the transport baseline. A future transport can be compared only after measurements show file transport dominates; it cannot change partition selection or exact semantics.
+
+CUDA uses the same directory. The resident mode remains preferred when the
+complete topology fits. Otherwise global identity, profile, distance, bucket,
+and frontier state remain resident while topology partitions pass through
+byte- and slot-bounded device storage. Frontier completion includes every
+source segment and all pending reads, copies, launches, and synchronization.
+Delta-stepping repeats light-partition work through same-bucket closure, then
+processes every heavy partition for the completed removed set. Reversing the
+partition schedule is required to preserve exact CPU distance bits.
+
+Device entries are immutable and reference-counted while used by launches. A
+slot is reusable only after its stream has synchronized; allocation, copy,
+launch, event, synchronization, and context-loss failures release host and
+device reservations through that boundary. Context loss poisons the CUDA
+runtime but not the acquired bundle. Permissive policy reruns the complete
+request on the matching CPU representation, while explicit CUDA
+reinitialization creates a fresh context and cache.

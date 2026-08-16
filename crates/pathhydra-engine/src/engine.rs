@@ -28,9 +28,13 @@ use crate::{
     CudaAlgorithmSelection, CudaAvailability, CudaConfig, CudaDeviceSummary, CudaExecutorPolicy,
     CudaHealth, CudaIneligibility, CudaRequestDiagnostics, EngineCapabilities, EngineConfigError,
     EngineError, EngineHealth, ExecutorSelectionReason, ImageBuildOutcome, ImageBuildReport,
-    PublicationOutcome, PublishedExecutionImage, RequestId, RequestRegistry, RoutingHealth,
-    RoutingState, RoutingUnavailableReason,
+    PublicationFaultInjection, PublicationOutcome, PublicationStage, PublishedExecutionImage,
+    RequestId, RequestRegistry, RetirementManager, RoutingHealth, RoutingState,
+    RoutingUnavailableReason, StartupImageOutcome,
 };
+
+#[cfg(feature = "cuda")]
+use crate::CudaTopology;
 
 #[cfg(feature = "cuda")]
 struct CudaRuntime {
@@ -75,6 +79,34 @@ impl CudaRuntime {
             self.config.maximum_topology_bytes,
             self.config.minimum_free_memory_headroom,
         )
+    }
+
+    fn upload_topology(
+        &self,
+        cpu: &CpuTopology,
+    ) -> Result<CudaTopology, pathhydra_cuda::CudaError> {
+        match cpu {
+            CpuTopology::Resident { image, .. } => {
+                self.upload(Arc::clone(image)).map(CudaTopology::Resident)
+            }
+            CpuTopology::Partitioned(image) => pathhydra_cuda::CudaPartitionedImage::upload(
+                Arc::clone(&self.context),
+                Arc::clone(image),
+                pathhydra_cuda::CudaPartitionedConfig {
+                    maximum_topology_cache_bytes: self
+                        .config
+                        .maximum_partitioned_topology_cache_bytes,
+                    maximum_topology_cache_slots: self
+                        .config
+                        .maximum_partitioned_topology_cache_slots,
+                    maximum_host_staging_bytes: self.config.maximum_partitioned_host_staging_bytes,
+                    minimum_free_memory_headroom: self.config.minimum_free_memory_headroom,
+                    reserved_concurrent_search_bytes: self.config.maximum_reserved_search_bytes,
+                    reverse_partition_order: false,
+                },
+            )
+            .map(CudaTopology::Partitioned),
+        }
     }
 
     fn algorithm(&self) -> pathhydra_cuda::CudaAlgorithm {
@@ -122,6 +154,15 @@ pub const DEFAULT_MAX_DESTINATIONS_PER_REQUEST: usize = 16_384;
 pub const DEFAULT_MAX_HYDRATION_HANDLES_PER_REQUEST: usize = 65_536;
 pub const DEFAULT_MAX_RESIDENT_IMAGE_METADATA_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_HOST_PARTITION_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_MAX_RETIRED_BUNDLE_BYTES: u64 = 128 * 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_RETIRED_BUNDLE_COUNT: usize = 32;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StartupBundlePolicy {
+    #[default]
+    ValidateOrRebuild,
+    RequireValidBundle,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineConfig {
@@ -139,6 +180,10 @@ pub struct EngineConfig {
     pub host_partition_cache_entries: usize,
     pub routing_io_worker_count: usize,
     pub maximum_queued_partition_reads: usize,
+    pub routing_io_staging_bytes: u64,
+    pub maximum_retired_bundle_bytes: u64,
+    pub maximum_retired_bundle_count: usize,
+    pub startup_bundle_policy: StartupBundlePolicy,
     pub cuda: CudaConfig,
 }
 
@@ -159,6 +204,10 @@ impl Default for EngineConfig {
             host_partition_cache_entries: 64,
             routing_io_worker_count: 2,
             maximum_queued_partition_reads: 64,
+            routing_io_staging_bytes: 32 * 1024 * 1024,
+            maximum_retired_bundle_bytes: DEFAULT_MAX_RETIRED_BUNDLE_BYTES,
+            maximum_retired_bundle_count: DEFAULT_MAX_RETIRED_BUNDLE_COUNT,
+            startup_bundle_policy: StartupBundlePolicy::ValidateOrRebuild,
             cuda: CudaConfig::default(),
         }
     }
@@ -186,6 +235,10 @@ impl EngineConfig {
                 "maximum_queued_partition_reads",
                 self.maximum_queued_partition_reads,
             ),
+            (
+                "maximum_retired_bundle_count",
+                self.maximum_retired_bundle_count,
+            ),
         ] {
             if value == 0 {
                 return Err(EngineConfigError::ZeroLimit { limit: name });
@@ -209,6 +262,11 @@ impl EngineConfig {
                 "host_partition_cache_bytes",
                 self.host_partition_cache_bytes,
             ),
+            (
+                "maximum_retired_bundle_bytes",
+                self.maximum_retired_bundle_bytes,
+            ),
+            ("routing_io_staging_bytes", self.routing_io_staging_bytes),
         ] {
             if value == 0 {
                 return Err(EngineConfigError::ZeroLimit { limit: name });
@@ -224,6 +282,24 @@ impl EngineConfig {
             return Err(EngineConfigError::ZeroLimit {
                 limit: "cuda.maximum_topology_bytes",
             });
+        }
+        for (name, value) in [
+            (
+                "cuda.maximum_partitioned_topology_cache_bytes",
+                self.cuda.maximum_partitioned_topology_cache_bytes,
+            ),
+            (
+                "cuda.maximum_partitioned_topology_cache_slots",
+                self.cuda.maximum_partitioned_topology_cache_slots,
+            ),
+            (
+                "cuda.maximum_partitioned_host_staging_bytes",
+                self.cuda.maximum_partitioned_host_staging_bytes,
+            ),
+        ] {
+            if value == 0 {
+                return Err(EngineConfigError::ZeroLimit { limit: name });
+            }
         }
         for (name, value) in [
             (
@@ -456,9 +532,16 @@ pub struct GraphEngine {
     routing_image_root: PathBuf,
     admission: AdmissionController,
     requests: RequestRegistry,
+    retirement: RetirementManager,
+    publication_faults: PublicationFaultInjection,
+    startup_image_outcome: StartupImageOutcome,
+    startup_image_duration: Duration,
     cancellations: AtomicU64,
     image_build_failures: AtomicU64,
     cuda_availability: RwLock<CudaAvailability>,
+    last_image_corruption: RwLock<Option<String>>,
+    last_cuda_degradation: RwLock<Option<String>>,
+    last_cuda_recovery: RwLock<Option<String>>,
     cuda_uploads: AtomicU64,
     cuda_upload_failures: AtomicU64,
     cuda_fallbacks: AtomicU64,
@@ -487,7 +570,10 @@ impl GraphEngine {
         fs::create_dir_all(&routing_image_root).map_err(|error| {
             EngineError::RoutingUnavailable(RoutingUnavailableReason::Bundle(error.to_string()))
         })?;
-        cleanup_temporary_children(&routing_image_root)?;
+        let current_bundle_name = catalog
+            .active_routing_image()?
+            .map(|pointer| pointer.relative_bundle().to_owned());
+        cleanup_startup_children(&routing_image_root, current_bundle_name.as_deref())?;
         if fs::canonicalize(&database_path).ok() == fs::canonicalize(&routing_image_root).ok() {
             return Err(EngineError::Configuration(
                 EngineConfigError::InvalidRoutingImageValue {
@@ -496,8 +582,13 @@ impl GraphEngine {
                 },
             ));
         }
-        let (routing, failed) =
+        let (routing, failed, startup_image_outcome, startup_image_corruption) =
             Self::initial_routing_state(&catalog, &routing_image_root, &config)?;
+        let startup_image_duration = routing.last_build().duration();
+        let current_bundle_name = catalog
+            .active_routing_image()?
+            .map(|pointer| pointer.relative_bundle().to_owned());
+        cleanup_startup_children(&routing_image_root, current_bundle_name.as_deref())?;
         let initial_cuda_availability = if !config.cuda.enabled {
             CudaAvailability::Disabled
         } else if cfg!(feature = "cuda") {
@@ -509,15 +600,26 @@ impl GraphEngine {
             catalog,
             config: config.clone(),
             routing: RwLock::new(routing),
-            routing_image_root,
+            routing_image_root: routing_image_root.clone(),
             admission: AdmissionController::new(
                 config.max_concurrent_routes,
                 config.max_reserved_route_bytes,
             ),
             requests: RequestRegistry::new(),
+            retirement: RetirementManager::new(
+                routing_image_root.clone(),
+                config.maximum_retired_bundle_count,
+                config.maximum_retired_bundle_bytes,
+            ),
+            publication_faults: PublicationFaultInjection::default(),
+            startup_image_outcome,
+            startup_image_duration,
             cancellations: AtomicU64::new(0),
             image_build_failures: AtomicU64::new(u64::from(failed)),
             cuda_availability: RwLock::new(initial_cuda_availability),
+            last_image_corruption: RwLock::new(startup_image_corruption),
+            last_cuda_degradation: RwLock::new(None),
+            last_cuda_recovery: RwLock::new(None),
             cuda_uploads: AtomicU64::new(0),
             cuda_upload_failures: AtomicU64::new(0),
             cuda_fallbacks: AtomicU64::new(0),
@@ -545,6 +647,7 @@ impl GraphEngine {
     }
 
     pub fn health(&self) -> Result<EngineHealth, EngineError> {
+        self.retirement.reap();
         let routing = self.routing.read().map_err(|_| EngineError::LockPoisoned {
             lock: "published routing state",
         })?;
@@ -558,12 +661,39 @@ impl GraphEngine {
                 .map_or(RoutingHealth::Available, RoutingHealth::Unavailable),
             current_image_manifest: routing.manifest(),
             current_image_age: routing.age(),
+            current_bundle: routing
+                .execution()
+                .ok()
+                .map(|execution| execution.cpu.bundle().snapshot()),
+            startup_image_outcome: self.startup_image_outcome,
+            startup_image_duration: self.startup_image_duration,
             cpu_topology_mode: routing.execution().ok().map(|image| image.cpu.mode()),
             host_partition_cache: routing
                 .execution()
                 .ok()
                 .and_then(|image| image.cpu.host_cache()),
             last_image_build: routing.last_build().clone(),
+            last_image_corruption: self
+                .last_image_corruption
+                .read()
+                .map_err(|_| EngineError::LockPoisoned {
+                    lock: "last image corruption",
+                })?
+                .clone(),
+            last_cuda_degradation: self
+                .last_cuda_degradation
+                .read()
+                .map_err(|_| EngineError::LockPoisoned {
+                    lock: "last CUDA degradation",
+                })?
+                .clone(),
+            last_cuda_recovery: self
+                .last_cuda_recovery
+                .read()
+                .map_err(|_| EngineError::LockPoisoned {
+                    lock: "last CUDA recovery",
+                })?
+                .clone(),
             active_routes: admission.active,
             peak_active_routes: admission.peak_active,
             reserved_route_bytes: admission.reserved,
@@ -572,6 +702,7 @@ impl GraphEngine {
             cumulative_admission_rejections: admission.rejections,
             cumulative_cancellations: self.cancellations.load(Ordering::Relaxed),
             cumulative_image_build_failures: self.image_build_failures.load(Ordering::Relaxed),
+            retired_bundles: self.retirement.snapshot(),
             cuda,
         })
     }
@@ -587,6 +718,7 @@ impl GraphEngine {
         match result {
             Ok(image) => {
                 let execution = self.execution_image(image);
+                retire_available_state(&self.retirement, &state, execution.cpu.bundle());
                 *state = RoutingState::Available {
                     image: Arc::new(execution),
                     published_at: Instant::now(),
@@ -610,6 +742,53 @@ impl GraphEngine {
         Ok(report)
     }
 
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn publication_fault_injection(&self) -> &PublicationFaultInjection {
+        &self.publication_faults
+    }
+
+    #[doc(hidden)]
+    pub fn routing_bundle_fault_injection(
+        &self,
+    ) -> Result<Arc<pathhydra_routing::BundleFaultInjection>, EngineError> {
+        let execution = self
+            .routing
+            .read()
+            .map_err(|_| EngineError::LockPoisoned {
+                lock: "published routing state",
+            })?
+            .execution()
+            .map_err(EngineError::RoutingUnavailable)?;
+        Ok(execution.cpu.bundle().fault_injection())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[doc(hidden)]
+    pub fn cuda_fault_injection(
+        &self,
+    ) -> Result<Arc<pathhydra_cuda::CudaFaultInjection>, EngineError> {
+        let execution = self
+            .routing
+            .read()
+            .map_err(|_| EngineError::LockPoisoned {
+                lock: "published routing state",
+            })?
+            .execution()
+            .map_err(EngineError::RoutingUnavailable)?;
+        match execution.cuda.as_ref() {
+            Some(CudaTopology::Partitioned(image)) => Ok(image.fault_injection()),
+            Some(CudaTopology::Resident(_)) => Err(EngineError::CudaIneligible(
+                CudaIneligibility::NoResidentImage(
+                    "current CUDA topology is resident, not partitioned".to_owned(),
+                ),
+            )),
+            None => Err(EngineError::CudaIneligible(
+                CudaIneligibility::NoResidentImage("CUDA image is unavailable".to_owned()),
+            )),
+        }
+    }
+
     /// Re-uploads only the current CPU image to the existing healthy CUDA context.
     pub fn rebuild_cuda_residency(&self) -> Result<(), EngineError> {
         if !self.config.cuda.enabled {
@@ -623,7 +802,11 @@ impl GraphEngine {
                 .map_err(|_| EngineError::LockPoisoned {
                     lock: "published routing state",
                 })?;
-            let image = state.image().map_err(EngineError::RoutingUnavailable)?;
+            let cpu = state
+                .execution()
+                .map_err(EngineError::RoutingUnavailable)?
+                .cpu
+                .clone();
             let runtime = self
                 .cuda_runtime
                 .read()
@@ -637,15 +820,12 @@ impl GraphEngine {
                     ))
                 })?;
             let last_build = state.last_build().clone();
-            let resident = match runtime.upload(Arc::clone(&image)) {
-                Ok(resident) => resident,
+            let cuda = match runtime.upload_topology(&cpu) {
+                Ok(cuda) => cuda,
                 Err(error) => {
                     let reason = CudaAvailability::Degraded(error.to_string());
                     *state = RoutingState::Available {
-                        image: Arc::new(PublishedExecutionImage::cpu_only(
-                            CpuTopology::Resident(image),
-                            reason.clone(),
-                        )),
+                        image: Arc::new(PublishedExecutionImage::cpu_only(cpu, reason.clone())),
                         published_at: Instant::now(),
                         last_build,
                     };
@@ -655,7 +835,7 @@ impl GraphEngine {
                 }
             };
             *state = RoutingState::Available {
-                image: Arc::new(PublishedExecutionImage::with_cuda(image, resident)),
+                image: Arc::new(PublishedExecutionImage::with_cuda(cpu, cuda)),
                 published_at: Instant::now(),
                 last_build,
             };
@@ -688,17 +868,18 @@ impl GraphEngine {
                 .map_err(|_| EngineError::LockPoisoned {
                     lock: "published routing state",
                 })?;
-            let image = state.image().map_err(EngineError::RoutingUnavailable)?;
+            let cpu = state
+                .execution()
+                .map_err(EngineError::RoutingUnavailable)?
+                .cpu
+                .clone();
             let last_build = state.last_build().clone();
-            let resident = match runtime.upload(Arc::clone(&image)) {
-                Ok(resident) => resident,
+            let cuda = match runtime.upload_topology(&cpu) {
+                Ok(cuda) => cuda,
                 Err(error) => {
                     let reason = CudaAvailability::Degraded(error.to_string());
                     *state = RoutingState::Available {
-                        image: Arc::new(PublishedExecutionImage::cpu_only(
-                            CpuTopology::Resident(image),
-                            reason.clone(),
-                        )),
+                        image: Arc::new(PublishedExecutionImage::cpu_only(cpu, reason.clone())),
                         published_at: Instant::now(),
                         last_build,
                     };
@@ -717,7 +898,7 @@ impl GraphEngine {
                 *slot = Some(runtime);
             }
             *state = RoutingState::Available {
-                image: Arc::new(PublishedExecutionImage::with_cuda(image, resident)),
+                image: Arc::new(PublishedExecutionImage::with_cuda(cpu, cuda)),
                 published_at: Instant::now(),
                 last_build,
             };
@@ -755,9 +936,6 @@ impl GraphEngine {
             state.execution().map_err(EngineError::RoutingUnavailable)?
         };
         let manifest = execution.cpu.manifest();
-        #[cfg(feature = "cuda")]
-        let resident_cpu = execution.cpu.resident();
-
         let policy = self.config.cuda.executor_policy;
         let cuda_shape_refusal = if !self.config.cuda.enabled {
             Some(CudaIneligibility::Disabled)
@@ -783,7 +961,7 @@ impl GraphEngine {
         if try_cuda {
             #[cfg(feature = "cuda")]
             'cuda_attempt: {
-                let resident = execution.cuda.clone().ok_or_else(|| {
+                let cuda_topology = execution.cuda.clone().ok_or_else(|| {
                     CudaIneligibility::NoResidentImage(format!(
                         "{:?}",
                         execution.cuda_unavailable_reason
@@ -799,15 +977,10 @@ impl GraphEngine {
                     .ok_or_else(|| {
                         CudaIneligibility::NoResidentImage("runtime is absent".to_owned())
                     });
-                let cpu_image = resident_cpu.clone().ok_or_else(|| {
-                    CudaIneligibility::NoResidentImage("CPU topology is partitioned".to_owned())
-                });
-                match resident
-                    .and_then(|resident| runtime.map(|runtime| (resident, runtime)))
-                    .and_then(|(resident, runtime)| {
-                        cpu_image.map(|image| (resident, runtime, image))
-                    }) {
-                    Ok((resident, runtime, image)) => {
+                match cuda_topology
+                    .and_then(|cuda_topology| runtime.map(|runtime| (cuda_topology, runtime)))
+                {
+                    Ok((cuda_topology, runtime)) => {
                         if let Err(reason) = runtime.healthy() {
                             if policy == CudaExecutorPolicy::RequireCuda {
                                 return Err(EngineError::CudaIneligible(reason));
@@ -817,8 +990,8 @@ impl GraphEngine {
                         }
                         let algorithm = runtime.algorithm();
                         let search_bytes = pathhydra_cuda::estimate_search_bytes(
-                            image.node_count(),
-                            image.relation_kind_count(),
+                            manifest.node_count(),
+                            manifest.relation_kind_count(),
                             request.destinations().len(),
                             algorithm,
                         )
@@ -832,13 +1005,25 @@ impl GraphEngine {
                             Ok(reservation) => {
                                 let admission_duration = admission_started.elapsed();
                                 let execution_started = Instant::now();
-                                match runtime.worker.submit(
-                                    resident.clone(),
-                                    request,
-                                    algorithm,
-                                    registration.flag_arc(),
-                                    reservation.bytes(),
-                                ) {
+                                let routed = match &cuda_topology {
+                                    CudaTopology::Resident(image) => runtime.worker.submit(
+                                        Arc::clone(image),
+                                        request,
+                                        algorithm,
+                                        registration.flag_arc(),
+                                        reservation.bytes(),
+                                    ),
+                                    CudaTopology::Partitioned(image) => {
+                                        runtime.worker.submit_partitioned(
+                                            Arc::clone(image),
+                                            request,
+                                            algorithm,
+                                            registration.flag_arc(),
+                                            reservation.bytes(),
+                                        )
+                                    }
+                                };
+                                match routed {
                                     Ok(output) => {
                                         let execution_duration = execution_started.elapsed();
                                         let device = runtime.context.capabilities();
@@ -889,7 +1074,7 @@ impl GraphEngine {
                                                     .batch_collection_duration,
                                                 batch_width: cuda.batch_width,
                                                 lane_index: cuda.lane_index,
-                                                topology_bytes: resident.allocated_bytes(),
+                                                topology_bytes: cuda_topology.allocated_bytes(),
                                                 search_bytes: cuda.reserved_search_bytes,
                                                 host_to_device_bytes: cuda.host_to_device_bytes,
                                                 device_to_host_bytes: cuda.device_to_host_bytes,
@@ -901,6 +1086,12 @@ impl GraphEngine {
                                                 relaxation_updates: cuda.relaxation_updates,
                                                 phases: cuda.phases,
                                                 frontier_high_water: cuda.frontier_high_water,
+                                                partitions_required: cuda.partitions_required,
+                                                host_cache_hits: cuda.host_cache_hits,
+                                                device_cache_hits: cuda.device_cache_hits,
+                                                file_bytes: cuda.file_bytes,
+                                                staged_bytes: cuda.staged_bytes,
+                                                transfer_bytes: cuda.transfer_bytes,
                                             }),
                                         };
                                         return Ok(EngineRoutingResponse {
@@ -910,6 +1101,20 @@ impl GraphEngine {
                                     }
                                     Err(error) => {
                                         runtime.failure(&error);
+                                        if error.poisons_context() {
+                                            self.set_cuda_availability(CudaAvailability::Degraded(
+                                                error.to_string(),
+                                            ));
+                                        }
+                                        if error.kind()
+                                            == pathhydra_cuda::CudaFailureKind::ImageAccess
+                                        {
+                                            self.record_image_corruption(error.to_string());
+                                            let _ = self.rebuild_routing_image();
+                                            return Err(EngineError::RoutingUnavailable(
+                                                RoutingUnavailableReason::Bundle(error.to_string()),
+                                            ));
+                                        }
                                         if policy == CudaExecutorPolicy::RequireCuda {
                                             return Err(EngineError::CudaFailure(
                                                 error.to_string(),
@@ -958,15 +1163,17 @@ impl GraphEngine {
             saturating_increment(&self.cuda_fallbacks);
         }
         let estimate = match &execution.cpu {
-            CpuTopology::Resident(image) => estimate_cpu_working_set(image, request)?,
+            CpuTopology::Resident { image, .. } => estimate_cpu_working_set(image, request)?,
             CpuTopology::Partitioned(image) => image.estimate_working_set(request)?,
         };
         permit.reserve(estimate.bytes())?;
         let admission_duration = admission_started.elapsed();
         let execution_started = Instant::now();
         let routed = match &execution.cpu {
-            CpuTopology::Resident(image) => route_controlled(image, request, registration.flag())
-                .map(|(response, search)| (response, search, None)),
+            CpuTopology::Resident { image, .. } => {
+                route_controlled(image, request, registration.flag())
+                    .map(|(response, search)| (response, search, None))
+            }
             CpuTopology::Partitioned(image) => {
                 route_partitioned_controlled(image, request, registration.flag())
                     .map(|(response, search, diagnostics)| (response, search, Some(diagnostics)))
@@ -975,6 +1182,7 @@ impl GraphEngine {
         let (response, search, partitioned_cpu) = match routed {
             Ok(result) => result,
             Err(pathhydra_routing::RoutingError::ImageAccess(reason)) => {
+                self.record_image_corruption(reason.clone());
                 let _ = self.rebuild_routing_image();
                 return Err(EngineError::RoutingUnavailable(
                     RoutingUnavailableReason::Bundle(reason),
@@ -1115,6 +1323,7 @@ impl GraphEngine {
         let publication = match compiled {
             Ok(image) => {
                 let execution = self.execution_image(image);
+                retire_available_state(&self.retirement, &state, execution.cpu.bundle());
                 *state = RoutingState::Available {
                     image: Arc::new(execution),
                     published_at: Instant::now(),
@@ -1131,6 +1340,8 @@ impl GraphEngine {
                 PublicationOutcome::RoutingUnavailable(reason, report)
             }
         };
+        drop(state);
+        self.retirement.reap();
         Ok(ConfirmedMutation::new(durable_result, publication))
     }
 
@@ -1138,8 +1349,9 @@ impl GraphEngine {
         catalog: &Catalog,
         root: &Path,
         config: &EngineConfig,
-    ) -> Result<(RoutingState, bool), EngineError> {
+    ) -> Result<(RoutingState, bool, StartupImageOutcome, Option<String>), EngineError> {
         let started = Instant::now();
+        let mut startup_image_corruption = None;
         let reopened = {
             let scan = catalog.confirmed_graph_scan()?;
             match scan.active_routing_image() {
@@ -1154,13 +1366,16 @@ impl GraphEngine {
                             }
                             select_cpu_topology(bundle, config)
                         });
-                    if result.is_err() {
+                    if let Err(reason) = &result {
+                        startup_image_corruption = Some(reason.to_string());
                         scan.clear_active_routing_image()?;
                     }
                     result.ok()
                 }
                 Ok(None) => None,
                 Err(_) => {
+                    startup_image_corruption =
+                        Some("durable routing-image pointer is corrupt".to_owned());
                     scan.clear_active_routing_image()?;
                     None
                 }
@@ -1173,8 +1388,12 @@ impl GraphEngine {
                 manifest.relation_kind_count(),
                 manifest.adjacency_count(),
             );
-            let report =
-                ImageBuildReport::new(started.elapsed(), ImageBuildOutcome::Published, counts);
+            let report = ImageBuildReport::new(
+                started.elapsed(),
+                ImageBuildOutcome::Published,
+                counts,
+                None,
+            );
             return Ok((
                 RoutingState::Available {
                     image: Arc::new(PublishedExecutionImage::cpu_only(
@@ -1185,13 +1404,39 @@ impl GraphEngine {
                     last_build: report,
                 },
                 false,
+                StartupImageOutcome::ValidatedBundle,
+                startup_image_corruption,
             ));
         }
-        let (result, counts) = build_current_bundle(catalog, root, config);
+        if config.startup_bundle_policy == StartupBundlePolicy::RequireValidBundle {
+            let reason = RoutingUnavailableReason::Bundle(
+                "startup requires a valid durable routing bundle; none could be opened".into(),
+            );
+            let report = ImageBuildReport::new(
+                started.elapsed(),
+                ImageBuildOutcome::Failed(reason.clone()),
+                (0, 0, 0),
+                None,
+            );
+            return Ok((
+                RoutingState::Unavailable {
+                    reason,
+                    last_build: report,
+                },
+                true,
+                StartupImageOutcome::RebuildFailed,
+                startup_image_corruption,
+            ));
+        }
+        let (result, counts, bundle_metrics) = build_current_bundle(catalog, root, config, None);
         match result {
             Ok(cpu) => {
-                let report =
-                    ImageBuildReport::new(started.elapsed(), ImageBuildOutcome::Published, counts);
+                let report = ImageBuildReport::new(
+                    started.elapsed(),
+                    ImageBuildOutcome::Published,
+                    counts,
+                    bundle_metrics,
+                );
                 Ok((
                     RoutingState::Available {
                         image: Arc::new(PublishedExecutionImage::cpu_only(
@@ -1202,6 +1447,8 @@ impl GraphEngine {
                         last_build: report,
                     },
                     false,
+                    StartupImageOutcome::RebuiltFromCatalog,
+                    startup_image_corruption,
                 ))
             }
             Err(reason) => {
@@ -1209,6 +1456,7 @@ impl GraphEngine {
                     started.elapsed(),
                     ImageBuildOutcome::Failed(reason.clone()),
                     counts,
+                    bundle_metrics,
                 );
                 Ok((
                     RoutingState::Unavailable {
@@ -1216,6 +1464,8 @@ impl GraphEngine {
                         last_build: report,
                     },
                     true,
+                    StartupImageOutcome::RebuildFailed,
+                    startup_image_corruption,
                 ))
             }
         }
@@ -1228,13 +1478,24 @@ impl GraphEngine {
         ImageBuildReport,
     ) {
         let started = Instant::now();
-        let (result, counts) =
-            build_current_bundle(&self.catalog, &self.routing_image_root, &self.config);
+        let (mut result, counts, bundle_metrics) = build_current_bundle(
+            &self.catalog,
+            &self.routing_image_root,
+            &self.config,
+            Some(&self.publication_faults),
+        );
+        if result.is_ok()
+            && let Err(error) = self
+                .publication_faults
+                .trip(PublicationStage::BeforeEngineSwap)
+        {
+            result = Err(error);
+        }
         let outcome = result
             .as_ref()
             .map(|_| ImageBuildOutcome::Published)
             .unwrap_or_else(|reason| ImageBuildOutcome::Failed(reason.clone()));
-        let report = ImageBuildReport::new(started.elapsed(), outcome, counts);
+        let report = ImageBuildReport::new(started.elapsed(), outcome, counts, bundle_metrics);
         (result, report)
     }
 
@@ -1268,14 +1529,6 @@ impl GraphEngine {
         if !self.config.cuda.enabled {
             return PublishedExecutionImage::cpu_only(cpu, CudaAvailability::Disabled);
         }
-        let Some(image) = cpu.resident() else {
-            return PublishedExecutionImage::cpu_only(
-                cpu,
-                CudaAvailability::Degraded(
-                    "partitioned CUDA topology cache is unavailable for this build".into(),
-                ),
-            );
-        };
         #[cfg(feature = "cuda")]
         {
             let runtime = self
@@ -1285,36 +1538,52 @@ impl GraphEngine {
                 .and_then(|runtime| runtime.clone());
             let Some(runtime) = runtime else {
                 return PublishedExecutionImage::cpu_only(
-                    CpuTopology::Resident(image),
+                    cpu,
                     CudaAvailability::Unavailable("CUDA runtime is absent".to_owned()),
                 );
             };
-            match runtime.upload(Arc::clone(&image)) {
-                Ok(resident) => {
+            match runtime.upload_topology(&cpu) {
+                Ok(cuda) => {
                     saturating_increment(&self.cuda_uploads);
                     self.set_cuda_availability(CudaAvailability::Available);
-                    PublishedExecutionImage::with_cuda(image, resident)
+                    PublishedExecutionImage::with_cuda(cpu, cuda)
                 }
                 Err(error) => {
                     saturating_increment(&self.cuda_upload_failures);
                     let availability = CudaAvailability::Degraded(error.to_string());
                     self.set_cuda_availability(availability.clone());
-                    PublishedExecutionImage::cpu_only(CpuTopology::Resident(image), availability)
+                    PublishedExecutionImage::cpu_only(cpu, availability)
                 }
             }
         }
         #[cfg(not(feature = "cuda"))]
         {
-            PublishedExecutionImage::cpu_only(
-                CpuTopology::Resident(image),
-                CudaAvailability::SupportNotCompiled,
-            )
+            PublishedExecutionImage::cpu_only(cpu, CudaAvailability::SupportNotCompiled)
         }
     }
 
     fn set_cuda_availability(&self, availability: CudaAvailability) {
+        match &availability {
+            CudaAvailability::Available => {
+                if let Ok(mut recovery) = self.last_cuda_recovery.write() {
+                    *recovery = Some("CUDA context and matching topology are available".to_owned());
+                }
+            }
+            CudaAvailability::Degraded(reason) | CudaAvailability::Unavailable(reason) => {
+                if let Ok(mut degradation) = self.last_cuda_degradation.write() {
+                    *degradation = Some(reason.clone());
+                }
+            }
+            CudaAvailability::Disabled | CudaAvailability::SupportNotCompiled => {}
+        }
         if let Ok(mut current) = self.cuda_availability.write() {
             *current = availability;
+        }
+    }
+
+    fn record_image_corruption(&self, reason: String) {
+        if let Ok(mut corruption) = self.last_image_corruption.write() {
+            *corruption = Some(reason);
         }
     }
 
@@ -1378,6 +1647,23 @@ impl GraphEngine {
                 resident_node_count: resident.map_or(0, |resident| resident.node_count()),
                 resident_adjacency_count: resident.map_or(0, |resident| resident.adjacency_count()),
                 resident_topology_bytes: resident.map_or(0, |resident| resident.allocated_bytes()),
+                partitioned_topology: resident.is_some_and(CudaTopology::partitioned),
+                device_topology_cache: resident.and_then(CudaTopology::device_cache).map(|cache| {
+                    crate::DeviceTopologyCacheHealth {
+                        capacity_bytes: cache.capacity_bytes,
+                        capacity_slots: cache.capacity_slots,
+                        current_bytes: cache.current_bytes,
+                        high_water_bytes: cache.high_water_bytes,
+                        entries: cache.entries,
+                        hits: cache.hits,
+                        misses: cache.misses,
+                        copies: cache.copies,
+                        evictions: cache.evictions,
+                        slot_waits: cache.slot_waits,
+                        in_use_slots: cache.in_use_slots,
+                        transfer_bytes: cache.transfer_bytes,
+                    }
+                }),
                 queued_lanes: worker.queued_lanes,
                 active_lanes: worker.active_lanes,
                 peak_active_lanes: worker.peak_active_lanes,
@@ -1404,6 +1690,8 @@ impl GraphEngine {
                 resident_node_count: 0,
                 resident_adjacency_count: 0,
                 resident_topology_bytes: 0,
+                partitioned_topology: false,
+                device_topology_cache: None,
                 queued_lanes: 0,
                 active_lanes: 0,
                 peak_active_lanes: 0,
@@ -1461,7 +1749,7 @@ fn resolve_routing_image_root(
     Ok(root)
 }
 
-fn cleanup_temporary_children(root: &Path) -> Result<(), EngineError> {
+fn cleanup_startup_children(root: &Path, current: Option<&str>) -> Result<(), EngineError> {
     for entry in fs::read_dir(root).map_err(|error| {
         EngineError::RoutingUnavailable(RoutingUnavailableReason::Bundle(error.to_string()))
     })? {
@@ -1470,7 +1758,9 @@ fn cleanup_temporary_children(root: &Path) -> Result<(), EngineError> {
         })?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.starts_with(".tmp-")
+        let positively_identified =
+            name.starts_with(".tmp-") || (name.starts_with("bundle-") && Some(name) != current);
+        if positively_identified
             && entry
                 .file_type()
                 .map_err(|error| {
@@ -1486,6 +1776,20 @@ fn cleanup_temporary_children(root: &Path) -> Result<(), EngineError> {
         }
     }
     Ok(())
+}
+
+fn retire_available_state(
+    retirement: &RetirementManager,
+    state: &RoutingState,
+    replacement: Arc<pathhydra_routing::RoutingBundle>,
+) {
+    let Ok(execution) = state.execution() else {
+        return;
+    };
+    let current = execution.cpu.bundle();
+    if !Arc::ptr_eq(&current, &replacement) && current.root() != replacement.root() {
+        retirement.retire(&current);
+    }
 }
 
 fn validate_bundle_child(root: &Path, name: &str) -> Result<PathBuf, RoutingUnavailableReason> {
@@ -1524,19 +1828,24 @@ fn select_cpu_topology(
         .ok_or_else(|| {
             RoutingUnavailableReason::Bundle("resident image byte count overflow".into())
         })?;
+    let bundle = Arc::new(bundle);
     if logical <= config.max_active_image_bytes {
         return bundle
             .to_resident_image()
-            .map(|image| CpuTopology::Resident(Arc::new(image)))
+            .map(|image| CpuTopology::Resident {
+                image: Arc::new(image),
+                bundle: Arc::clone(&bundle),
+            })
             .map_err(bundle_reason);
     }
     let cache = HostCacheConfig {
         maximum_bytes: config.host_partition_cache_bytes,
+        maximum_staging_bytes: config.routing_io_staging_bytes,
         maximum_entries: config.host_partition_cache_entries,
         io_worker_count: config.routing_io_worker_count,
         maximum_queued_reads: config.maximum_queued_partition_reads,
     };
-    ChunkedRoutingImage::open(bundle, cache)
+    ChunkedRoutingImage::open_shared(bundle, cache)
         .map(|image| CpuTopology::Partitioned(Arc::new(image)))
         .map_err(bundle_reason)
 }
@@ -1545,9 +1854,11 @@ fn build_current_bundle(
     catalog: &Catalog,
     root: &Path,
     config: &EngineConfig,
+    faults: Option<&PublicationFaultInjection>,
 ) -> (
     Result<CpuTopology, RoutingUnavailableReason>,
     (usize, usize, usize),
+    Option<pathhydra_routing::BundleBuildMetrics>,
 ) {
     let scan = match catalog.confirmed_graph_scan() {
         Ok(scan) => scan,
@@ -1555,6 +1866,7 @@ fn build_current_bundle(
             return (
                 Err(RoutingUnavailableReason::Bundle(error.to_string())),
                 (0, 0, 0),
+                None,
             );
         }
     };
@@ -1567,14 +1879,19 @@ fn build_current_bundle(
         maximum_total_bundle_bytes: config.max_total_bundle_bytes,
     };
     let result = (|| {
-        let (written, _) =
+        fs::create_dir(&temporary)
+            .map_err(|error| RoutingUnavailableReason::Bundle(error.to_string()))?;
+        trip_publication(faults, PublicationStage::TemporaryDirectoryCreated)?;
+        let (written, metrics) =
             compile_bundle(&scan, &temporary, bundle_config).map_err(bundle_reason)?;
+        trip_publication(faults, PublicationStage::BundleFilesSynchronized)?;
         let checked = open_bundle(&temporary).map_err(bundle_reason)?;
         if checked.manifest() != &written {
             return Err(RoutingUnavailableReason::Bundle(
                 "reopened manifest disagrees with the streaming compiler".into(),
             ));
         }
+        trip_publication(faults, PublicationStage::TemporaryBundleValidated)?;
         let checksum = *checked.manifest_checksum();
         let checksum_name = checksum
             .iter()
@@ -1591,6 +1908,7 @@ fn build_current_bundle(
         let final_path = root.join(&final_name);
         fs::rename(&temporary, &final_path)
             .map_err(|error| RoutingUnavailableReason::Bundle(error.to_string()))?;
+        trip_publication(faults, PublicationStage::FinalDirectoryRenamed)?;
         let final_bundle = open_bundle(&final_path).map_err(bundle_reason)?;
         let counts = (
             final_bundle.manifest().node_count as usize,
@@ -1599,8 +1917,12 @@ fn build_current_bundle(
         );
         scan.set_active_routing_image(&ActiveRoutingImage::new(final_name, checksum))
             .map_err(|error| RoutingUnavailableReason::Bundle(error.to_string()))?;
+        trip_publication(faults, PublicationStage::DurablePointerCommitted)?;
         match select_cpu_topology(final_bundle, config) {
-            Ok(cpu) => Ok((cpu, counts)),
+            Ok(cpu) => {
+                trip_publication(faults, PublicationStage::RuntimeRepresentationConstructed)?;
+                Ok((cpu, counts, metrics))
+            }
             Err(error) => {
                 let _ = scan.clear_active_routing_image();
                 Err(error)
@@ -1608,9 +1930,16 @@ fn build_current_bundle(
         }
     })();
     match result {
-        Ok((cpu, counts)) => (Ok(cpu), counts),
-        Err(error) => (Err(error), (0, 0, 0)),
+        Ok((cpu, counts, metrics)) => (Ok(cpu), counts, Some(metrics)),
+        Err(error) => (Err(error), (0, 0, 0), None),
     }
+}
+
+fn trip_publication(
+    faults: Option<&PublicationFaultInjection>,
+    stage: PublicationStage,
+) -> Result<(), RoutingUnavailableReason> {
+    faults.map_or(Ok(()), |faults| faults.trip(stage))
 }
 
 fn saturating_increment(counter: &AtomicU64) {
@@ -1749,5 +2078,73 @@ mod tests {
         drop(registration);
         assert_eq!(engine.cancel(id).unwrap(), CancellationOutcome::NotActive);
         assert!(engine.route(id, &request).is_ok());
+    }
+
+    #[test]
+    fn partitioned_bundle_retirement_waits_for_lease_and_retries_delete_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            max_active_image_bytes: 8,
+            target_partition_topology_bytes: 48,
+            hard_maximum_partition_topology_bytes: 48,
+            host_partition_cache_bytes: 112,
+            host_partition_cache_entries: 1,
+            ..EngineConfig::default()
+        };
+        let engine = GraphEngine::open(directory.path().join("graph"), config).unwrap();
+        let source = confirm_node(&engine, "source");
+        let destination = confirm_node(&engine, "destination");
+        let relation_candidate = engine.insert_relation_candidate("kind").unwrap();
+        let ConfirmedRecord::Relation(relation) = engine
+            .confirm_validated_candidate(relation_candidate)
+            .unwrap()
+            .into_parts()
+            .0
+        else {
+            panic!()
+        };
+        let edge = engine
+            .insert_edge_candidate(source.id(), destination.id(), relation.id(), 1.0)
+            .unwrap();
+        engine.confirm_validated_candidate(edge).unwrap();
+        let old = engine.routing.read().unwrap().execution().unwrap();
+        let old_bundle = old.cpu.bundle();
+        let old_path = old_bundle.root().to_path_buf();
+        let old_partitioned = match &old.cpu {
+            CpuTopology::Partitioned(image) => Arc::clone(image),
+            CpuTopology::Resident { .. } => panic!("fixture must force partitioned CPU"),
+        };
+        drop(old_bundle);
+        let request = RoutingRequest::new(
+            source.id(),
+            [destination.id()],
+            RelationProfile::new([(
+                relation.id(),
+                RelationUse::Enabled(RelationMultiplier::new(1.0).unwrap()),
+            )]),
+            false,
+            SearchBudget::Unlimited,
+            TiePolicy::StablePredecessor,
+        );
+        engine.remove_node(destination.id()).unwrap();
+        assert!(old_path.exists());
+        assert!(matches!(
+            pathhydra_routing::route_partitioned(&old_partitioned, &request)
+                .unwrap()
+                .results()[0]
+                .state(),
+            DestinationState::Exact(_)
+        ));
+        assert!(engine.health().unwrap().retired_bundles.bundle_count >= 1);
+        drop(old_partitioned);
+        drop(old);
+
+        engine.retirement.fail_next_delete();
+        let failed = engine.health().unwrap().retired_bundles;
+        assert!(old_path.exists());
+        assert!(failed.last_cleanup_failure.is_some());
+        let recovered = engine.health().unwrap().retired_bundles;
+        assert!(!old_path.exists());
+        assert!(recovered.last_cleanup_failure.is_none());
     }
 }

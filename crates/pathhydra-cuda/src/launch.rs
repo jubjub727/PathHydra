@@ -10,6 +10,7 @@ use pathhydra_routing::{
     RoutingResponse, SearchBudget,
 };
 
+use crate::topology_cache::DevicePartition;
 use crate::{
     CudaAlgorithm, CudaContextOwner, CudaError, CudaFailureKind, CudaResidentImage,
     CudaRouteDiagnostics, CudaRouteOutput,
@@ -390,6 +391,12 @@ pub(crate) fn route(
             relaxation_updates: counters[2],
             phases: counters[3],
             frontier_high_water: u32::try_from(counters[4]).unwrap_or(u32::MAX),
+            partitions_required: 0,
+            host_cache_hits: 0,
+            device_cache_hits: 0,
+            file_bytes: 0,
+            staged_bytes: 0,
+            transfer_bytes: 0,
         },
     })
 }
@@ -424,4 +431,120 @@ fn synchronization_error(error: cudarc::driver::DriverError) -> CudaError {
         CudaFailureKind::Synchronization,
         format!("CUDA synchronization or download failed: {error}"),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_partition_frontier(
+    owner: &CudaContextOwner,
+    partition: &DevicePartition,
+    enabled: &CudaSlice<u32>,
+    multipliers: &CudaSlice<u32>,
+    node_count: u32,
+    relation_count: u32,
+    active_sources: &CudaSlice<u32>,
+    next_active_sources: &mut CudaSlice<u32>,
+    distances: &mut CudaSlice<u64>,
+    changed: &mut CudaSlice<u32>,
+    status: &mut CudaSlice<u32>,
+    counters: &mut CudaSlice<u64>,
+) -> Result<(), CudaError> {
+    let mut builder = owner
+        .stream
+        .launch_builder(&owner.partition_frontier_function);
+    builder.arg(&partition.segment_sources);
+    builder.arg(&partition.segment_starts);
+    builder.arg(&partition.segment_counts);
+    builder.arg(&partition.segment_count);
+    builder.arg(&partition.destinations);
+    builder.arg(&partition.relation_indexes);
+    builder.arg(&partition.base_weight_bits);
+    builder.arg(&partition.edge_count);
+    builder.arg(&node_count);
+    builder.arg(enabled);
+    builder.arg(multipliers);
+    builder.arg(&relation_count);
+    builder.arg(active_sources);
+    builder.arg(next_active_sources);
+    builder.arg(distances);
+    builder.arg(changed);
+    builder.arg(status);
+    builder.arg(counters);
+    // SAFETY: the partition cache uploads and validates all six immutable
+    // arrays together; its fixed counts exactly match the kernel ABI. Search
+    // buffers are initialized, uniquely mutable, and retained until the caller
+    // synchronizes the stream before releasing the partition cache pin.
+    unsafe { builder.launch(single_thread()) }
+        .map(|_| ())
+        .map_err(launch_error)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_partition_delta(
+    owner: &CudaContextOwner,
+    partition: &DevicePartition,
+    enabled: &CudaSlice<u32>,
+    multipliers: &CudaSlice<u32>,
+    node_count: u32,
+    relation_count: u32,
+    delta_bits: u64,
+    bucket: u64,
+    edge_class: u32,
+    distances: &mut CudaSlice<u64>,
+    changed: &mut CudaSlice<u32>,
+    status: &mut CudaSlice<u32>,
+    counters: &mut CudaSlice<u64>,
+) -> Result<(), CudaError> {
+    let mut builder = owner.stream.launch_builder(&owner.partition_delta_function);
+    builder.arg(&partition.segment_sources);
+    builder.arg(&partition.segment_starts);
+    builder.arg(&partition.segment_counts);
+    builder.arg(&partition.segment_count);
+    builder.arg(&partition.destinations);
+    builder.arg(&partition.relation_indexes);
+    builder.arg(&partition.base_weight_bits);
+    builder.arg(&partition.edge_count);
+    builder.arg(&node_count);
+    builder.arg(enabled);
+    builder.arg(multipliers);
+    builder.arg(&relation_count);
+    builder.arg(&delta_bits);
+    builder.arg(&bucket);
+    builder.arg(&edge_class);
+    builder.arg(distances);
+    builder.arg(changed);
+    builder.arg(status);
+    builder.arg(counters);
+    // SAFETY: the frontier partition obligations apply, and validated host
+    // configuration supplies a positive finite delta, canonical class, and
+    // bucket index. Stream synchronization precedes every slot release/reuse.
+    unsafe { builder.launch(single_thread()) }
+        .map(|_| ())
+        .map_err(launch_error)
+}
+
+pub(crate) fn launch_frontier_compaction(
+    owner: &CudaContextOwner,
+    distances: &CudaSlice<u64>,
+    node_count: u32,
+    finite: &mut CudaSlice<u32>,
+) -> Result<(), CudaError> {
+    let mut builder = owner
+        .stream
+        .launch_builder(&owner.frontier_compaction_function);
+    builder.arg(distances);
+    builder.arg(&node_count);
+    builder.arg(finite);
+    // SAFETY: distances contains node_count initialized words, finite owns one
+    // writable word, and the synchronous caller retains both through completion.
+    unsafe { builder.launch(single_thread()) }
+        .map(|_| ())
+        .map_err(launch_error)
+}
+
+const fn single_thread() -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    }
 }

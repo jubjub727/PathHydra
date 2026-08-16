@@ -18,6 +18,9 @@ fn main() {
         "kernel/arithmetic.rs",
         "kernel/frontier.rs",
         "kernel/delta.rs",
+        "kernel/partition_frontier.rs",
+        "kernel/partition_delta.rs",
+        "kernel/frontier_compaction.rs",
         "../../cuda-toolchain.toml",
     ] {
         println!("cargo:rerun-if-changed={source}");

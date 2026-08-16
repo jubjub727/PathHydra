@@ -9,6 +9,7 @@ pub enum CudaFailureKind {
     Module,
     Allocation,
     Upload,
+    ImageAccess,
     Admission,
     Launch,
     Synchronization,

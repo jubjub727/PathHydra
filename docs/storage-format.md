@@ -4,6 +4,51 @@ The default-column-family record `active-routing-image` is rebuildable index met
 
 Routing bundles may be omitted from backup. On restore, a missing referenced child or any checksum/semantic failure clears the pointer and rebuilds from confirmed records. There are intentionally no schema markers, compatibility layouts, graph revisions, or migrations before the first release.
 
+## Routing-image bundle
+
+The configured routing-image root contains immutable children named by the
+publisher. A completed child contains exactly:
+
+```text
+manifest.bin
+identities.bin
+source-directory.bin
+topology.bin
+evidence.bin
+```
+
+`identities.bin` stores ascending stable node and relation IDs.
+`source-directory.bin` stores the dense-source segment ranges and fixed segment
+descriptors. `topology.bin` stores independently checksummed structure-of-arrays
+partitions (destinations, relation indexes, and canonical base-weight bits).
+`evidence.bin` stores the corresponding stable edge IDs. `manifest.bin` declares
+the routing policies, field widths, counts, exact file lengths and checksums,
+partition ranges, and partition checksums. Every field is decoded from an
+explicit little-endian integer or floating-point bit pattern; Rust layout and
+platform `usize` values are never persisted.
+
+The streaming compiler holds the catalog's confirmed-scan guard, resident ID
+tables and source directory, and one bounded partition buffer. It never builds
+`ConfirmedGraphRecords` or all adjacency arrays in the production path. It
+synchronizes the files and temporary directory, validates the bundle through
+the production reader, renames the child within the image root, and only then
+commits `active-routing-image`. Startup validates that exact child and pointer
+checksum without rescanning RocksDB.
+
+Confirmed mutation, bundle compilation, and pointer publication are serialized.
+Every confirmed graph-changing batch removes the pointer. Therefore a crash can
+leave an unreferenced temporary or final child, but cannot make incomplete or
+pre-mutation bytes current. Startup removes only recognized unreferenced child
+directories; it never applies a broad recursive cleanup path.
+
+Each admitted request owns an immutable bundle lease. Replaced children enter a
+count- and byte-bounded retirement queue and are removed only after all leases
+expire. A Windows sharing violation remains a visible, retryable retirement
+failure. Operators may omit the entire routing-image root from backup. Restore
+the RocksDB directory, then allow the default startup policy to rebuild, or use
+`StartupBundlePolicy::RequireValidBundle` to keep routing unavailable until an
+operator calls `GraphEngine::rebuild_routing_image`.
+
 ## Batched confirmed-record reads
 
 `Catalog::confirmed_records_by_id` adds no durable key space. It holds the existing catalog write mutex for one batch, deduplicates requested physical node and edge reads, and fetches the exact confirmed relation-kind record for every found edge. Missing requested IDs are ordinary missing results. A found edge with a missing endpoint or relation kind is corruption. Provisional candidates are never consulted.

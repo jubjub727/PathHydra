@@ -17,6 +17,9 @@ pub struct CudaContextOwner {
     pub(crate) validate_topology_function: CudaFunction,
     pub(crate) frontier_function: CudaFunction,
     pub(crate) delta_function: CudaFunction,
+    pub(crate) partition_frontier_function: CudaFunction,
+    pub(crate) partition_delta_function: CudaFunction,
+    pub(crate) frontier_compaction_function: CudaFunction,
     capabilities: CudaDeviceCapabilities,
     module_load_duration: Duration,
 }
@@ -84,6 +87,31 @@ impl CudaContextOwner {
                     format!("embedded PTX lacks delta kernel: {error}"),
                 )
             })?;
+        let partition_frontier_function = module
+            .load_function("pathhydra_partition_frontier")
+            .map_err(|error| {
+                CudaError::new(
+                    CudaFailureKind::Module,
+                    format!("embedded PTX lacks partition-frontier kernel: {error}"),
+                )
+            })?;
+        let partition_delta_function =
+            module
+                .load_function("pathhydra_partition_delta")
+                .map_err(|error| {
+                    CudaError::new(
+                        CudaFailureKind::Module,
+                        format!("embedded PTX lacks partition-delta kernel: {error}"),
+                    )
+                })?;
+        let frontier_compaction_function = module
+            .load_function("pathhydra_frontier_compaction")
+            .map_err(|error| {
+                CudaError::new(
+                    CudaFailureKind::Module,
+                    format!("embedded PTX lacks frontier-compaction kernel: {error}"),
+                )
+            })?;
         Ok(Arc::new(Self {
             context,
             stream,
@@ -91,6 +119,9 @@ impl CudaContextOwner {
             validate_topology_function,
             frontier_function,
             delta_function,
+            partition_frontier_function,
+            partition_delta_function,
+            frontier_compaction_function,
             capabilities,
             module_load_duration: started.elapsed(),
         }))

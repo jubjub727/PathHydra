@@ -20,7 +20,7 @@ use pathhydra_routing::RoutingRequest;
 use crate::CudaAlgorithm;
 
 #[cfg(feature = "cuda")]
-use crate::{CudaError, CudaFailureKind, CudaResidentImage};
+use crate::{CudaError, CudaFailureKind, CudaPartitionedImage, CudaResidentImage};
 
 #[derive(Clone, Debug)]
 pub struct CudaRouteDiagnostics {
@@ -39,6 +39,12 @@ pub struct CudaRouteDiagnostics {
     pub relaxation_updates: u64,
     pub phases: u64,
     pub frontier_high_water: u32,
+    pub partitions_required: u64,
+    pub host_cache_hits: u64,
+    pub device_cache_hits: u64,
+    pub file_bytes: u64,
+    pub staged_bytes: u64,
+    pub transfer_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -49,13 +55,47 @@ pub struct CudaRouteOutput {
 
 #[cfg(feature = "cuda")]
 struct RouteJob {
-    resident: Arc<CudaResidentImage>,
+    image: RouteImage,
     request: RoutingRequest,
     algorithm: CudaAlgorithm,
     cancellation: Arc<AtomicBool>,
     reserved_search_bytes: usize,
     enqueued_at: Instant,
     reply: Sender<Result<CudaRouteOutput, CudaError>>,
+}
+
+#[cfg(feature = "cuda")]
+enum RouteImage {
+    Resident(Arc<CudaResidentImage>),
+    Partitioned(Arc<CudaPartitionedImage>),
+}
+
+#[cfg(feature = "cuda")]
+impl RouteImage {
+    fn ptr_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Resident(left), Self::Resident(right)) => Arc::ptr_eq(left, right),
+            (Self::Partitioned(left), Self::Partitioned(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+
+    fn route(
+        &self,
+        request: &RoutingRequest,
+        algorithm: CudaAlgorithm,
+        cancellation: &AtomicBool,
+        reserved_search_bytes: usize,
+    ) -> Result<CudaRouteOutput, CudaError> {
+        match self {
+            Self::Resident(image) => {
+                image.route(request, algorithm, cancellation, reserved_search_bytes)
+            }
+            Self::Partitioned(image) => {
+                image.route(request, algorithm, cancellation, reserved_search_bytes)
+            }
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -134,7 +174,38 @@ impl CudaWorker {
         if self
             .sender
             .send(Command::Route(RouteJob {
-                resident,
+                image: RouteImage::Resident(resident),
+                request: request.clone(),
+                algorithm,
+                cancellation,
+                reserved_search_bytes,
+                enqueued_at: Instant::now(),
+                reply,
+            }))
+            .is_err()
+        {
+            self.counters.queued.fetch_sub(1, Ordering::Relaxed);
+            return Err(worker_error("CUDA worker channel is closed"));
+        }
+        result
+            .recv()
+            .map_err(|_| worker_error("CUDA worker stopped before returning a route"))?
+    }
+
+    pub fn submit_partitioned(
+        &self,
+        image: Arc<CudaPartitionedImage>,
+        request: &RoutingRequest,
+        algorithm: CudaAlgorithm,
+        cancellation: Arc<AtomicBool>,
+        reserved_search_bytes: usize,
+    ) -> Result<CudaRouteOutput, CudaError> {
+        let (reply, result) = mpsc::channel();
+        self.counters.queued.fetch_add(1, Ordering::Relaxed);
+        if self
+            .sender
+            .send(Command::Route(RouteJob {
+                image: RouteImage::Partitioned(image),
                 request: request.clone(),
                 algorithm,
                 cancellation,
@@ -213,8 +284,7 @@ fn worker_loop(
             }
             match receiver.recv_timeout(remaining) {
                 Ok(Command::Route(job))
-                    if Arc::ptr_eq(&job.resident, &batch[0].resident)
-                        && job.algorithm == batch[0].algorithm =>
+                    if job.image.ptr_eq(&batch[0].image) && job.algorithm == batch[0].algorithm =>
                 {
                     batch.push(job);
                 }
@@ -234,7 +304,7 @@ fn worker_loop(
         for (lane_index, job) in batch.into_iter().enumerate() {
             counters.queued.fetch_sub(1, Ordering::Relaxed);
             let queue_duration = job.enqueued_at.elapsed();
-            let mut output = job.resident.route(
+            let mut output = job.image.route(
                 &job.request,
                 job.algorithm,
                 &job.cancellation,

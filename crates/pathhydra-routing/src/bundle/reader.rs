@@ -2,9 +2,15 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex, OnceLock, Weak,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
+    thread::{self, JoinHandle},
     time::Duration,
 };
+
+use crossbeam_channel::{Receiver, SendTimeoutError, Sender, bounded};
 
 use pathhydra_core::{BaseWeight, EdgeId, NodeId, RelationId};
 
@@ -23,6 +29,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostCacheConfig {
     pub maximum_bytes: u64,
+    pub maximum_staging_bytes: u64,
     pub maximum_entries: usize,
     pub io_worker_count: usize,
     pub maximum_queued_reads: usize,
@@ -31,6 +38,7 @@ impl Default for HostCacheConfig {
     fn default() -> Self {
         Self {
             maximum_bytes: 256 * 1024 * 1024,
+            maximum_staging_bytes: 32 * 1024 * 1024,
             maximum_entries: 64,
             io_worker_count: 2,
             maximum_queued_reads: 64,
@@ -49,6 +57,14 @@ pub struct HostCacheSnapshot {
     pub read_bytes: u64,
     pub checksum_failures: u64,
     pub entries: usize,
+    pub pinned_entries: usize,
+    pub queue_depth: usize,
+    pub queue_high_water: usize,
+    pub failed_loads: u64,
+    pub staging_capacity_bytes: u64,
+    pub staging_current_bytes: u64,
+    pub staging_high_water_bytes: u64,
+    pub short_reads: u64,
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PartitionedCpuDiagnostics {
@@ -56,6 +72,21 @@ pub struct PartitionedCpuDiagnostics {
     pub partitions: u64,
     pub file_bytes: u64,
     pub io_wait: Duration,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BundleSnapshot {
+    pub relative_name: String,
+    pub manifest_checksum_hex: String,
+    pub total_bytes: u64,
+    pub identity_bytes: u64,
+    pub source_directory_bytes: u64,
+    pub topology_bytes: u64,
+    pub evidence_bytes: u64,
+    pub partition_count: usize,
+    pub segment_count: usize,
+    pub largest_partition_bytes: u64,
+    pub split_source_count: usize,
 }
 
 #[derive(Debug)]
@@ -69,6 +100,51 @@ pub struct RoutingBundle {
     segments: Box<[SegmentDescriptor]>,
     source_edge_offsets: Box<[u64]>,
     partition_edge_offsets: Box<[u64]>,
+    faults: Arc<BundleFaultInjection>,
+}
+
+/// Deterministic low-level fault controls used by recovery and cache tests.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct BundleFaultInjection {
+    short_read_partition: AtomicU32,
+    read_error_partition: AtomicU32,
+    delay_milliseconds: AtomicU64,
+}
+
+impl Default for BundleFaultInjection {
+    fn default() -> Self {
+        Self {
+            short_read_partition: AtomicU32::new(Self::NONE),
+            read_error_partition: AtomicU32::new(Self::NONE),
+            delay_milliseconds: AtomicU64::new(0),
+        }
+    }
+}
+
+impl BundleFaultInjection {
+    const NONE: u32 = u32::MAX;
+    pub fn reset(&self) {
+        self.short_read_partition
+            .store(Self::NONE, Ordering::Release);
+        self.read_error_partition
+            .store(Self::NONE, Ordering::Release);
+        self.delay_milliseconds.store(0, Ordering::Release);
+    }
+    pub fn short_read_at(&self, partition: u32) {
+        self.short_read_partition
+            .store(partition, Ordering::Release);
+    }
+    pub fn read_error_at(&self, partition: u32) {
+        self.read_error_partition
+            .store(partition, Ordering::Release);
+    }
+    pub fn delay_reads(&self, duration: Duration) {
+        self.delay_milliseconds.store(
+            duration.as_millis().min(u128::from(u64::MAX)) as u64,
+            Ordering::Release,
+        );
+    }
 }
 impl RoutingBundle {
     pub fn manifest(&self) -> &BundleManifest {
@@ -83,11 +159,62 @@ impl RoutingBundle {
     pub fn identity_directory_bytes(&self) -> u64 {
         self.manifest.identities.length + self.manifest.source_directory.length
     }
+    pub fn total_bytes(&self) -> u64 {
+        self.manifest
+            .identities
+            .length
+            .saturating_add(self.manifest.source_directory.length)
+            .saturating_add(self.manifest.topology.length)
+            .saturating_add(self.manifest.evidence.length)
+            .saturating_add(
+                fs::metadata(self.root.join("manifest.bin")).map_or(0, |metadata| metadata.len()),
+            )
+    }
+    pub fn snapshot(&self) -> BundleSnapshot {
+        BundleSnapshot {
+            relative_name: self
+                .root
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+            manifest_checksum_hex: self
+                .manifest_checksum
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            total_bytes: self.total_bytes(),
+            identity_bytes: self.manifest.identities.length,
+            source_directory_bytes: self.manifest.source_directory.length,
+            topology_bytes: self.manifest.topology.length,
+            evidence_bytes: self.manifest.evidence.length,
+            partition_count: self.manifest.partitions.len(),
+            segment_count: self.segments.len(),
+            largest_partition_bytes: self
+                .manifest
+                .partitions
+                .iter()
+                .map(|partition| {
+                    partition
+                        .topology_length
+                        .saturating_add(partition.evidence_length)
+                })
+                .max()
+                .unwrap_or(0),
+            split_source_count: self
+                .source_segment_offsets
+                .windows(2)
+                .filter(|offsets| offsets[1].saturating_sub(offsets[0]) > 1)
+                .count(),
+        }
+    }
     pub fn segment_count(&self) -> usize {
         self.segments.len()
     }
     pub fn source_segment_offsets(&self) -> &[u64] {
         &self.source_segment_offsets
+    }
+    #[doc(hidden)]
+    pub fn fault_injection(&self) -> Arc<BundleFaultInjection> {
+        Arc::clone(&self.faults)
     }
     pub fn routing_manifest(&self) -> Result<crate::RoutingImageManifest, BundleError> {
         crate::image::manifest(
@@ -141,6 +268,15 @@ impl RoutingBundle {
         })
     }
     fn load_partition(&self, p: &PartitionDescriptor) -> Result<DecodedPartition, BundleError> {
+        let delay = self.faults.delay_milliseconds.load(Ordering::Acquire);
+        if delay != 0 {
+            thread::sleep(Duration::from_millis(delay));
+        }
+        if self.faults.read_error_partition.load(Ordering::Acquire) == p.id {
+            return Err(BundleError::Io(std::io::Error::other(
+                "injected partition read error",
+            )));
+        }
         let top = read_range(
             &self.root.join("topology.bin"),
             p.topology_offset,
@@ -151,6 +287,12 @@ impl RoutingBundle {
             p.evidence_offset,
             p.evidence_length,
         )?;
+        if self.faults.short_read_partition.load(Ordering::Acquire) == p.id {
+            return Err(BundleError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "injected short partition read",
+            )));
+        }
         if checksum(&top) != p.topology_checksum || checksum(&evidence) != p.evidence_checksum {
             return Err(invalid("partition checksum mismatch"));
         }
@@ -322,6 +464,7 @@ pub fn open_bundle(root: &Path) -> Result<RoutingBundle, BundleError> {
         segments: segments.into_boxed_slice(),
         source_edge_offsets: source_edge_offsets.into_boxed_slice(),
         partition_edge_offsets: partition_edge_offsets.into_boxed_slice(),
+        faults: Arc::new(BundleFaultInjection::default()),
     })
 }
 
@@ -548,15 +691,115 @@ struct CacheState {
     evictions: u64,
     read_bytes: u64,
     checksum_failures: u64,
+    queue_depth: usize,
+    queue_high_water: usize,
+    failed_loads: u64,
+    staging_bytes: u64,
+    staging_high: u64,
+    short_reads: u64,
+    poison: Option<String>,
 }
 struct HostCache {
     bundle: Arc<RoutingBundle>,
     config: HostCacheConfig,
     state: Mutex<CacheState>,
     changed: Condvar,
+    coordinator: OnceLock<IoCoordinator>,
+}
+
+#[derive(Clone, Copy)]
+enum IoJob {
+    Load(u32),
+    Shutdown,
+}
+
+struct IoCoordinator {
+    sender: Sender<IoJob>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl IoCoordinator {
+    fn start(cache: Weak<HostCache>, workers: usize, queued: usize) -> Result<Self, BundleError> {
+        let (sender, receiver) = bounded(queued);
+        let mut handles = Vec::new();
+        handles
+            .try_reserve_exact(workers)
+            .map_err(|_| invalid("I/O worker allocation failed"))?;
+        for index in 0..workers {
+            let cache = Weak::clone(&cache);
+            let receiver = receiver.clone();
+            handles.push(
+                thread::Builder::new()
+                    .name(format!("pathhydra-routing-io-{index}"))
+                    .spawn(move || io_worker(cache, receiver))?,
+            );
+        }
+        Ok(Self {
+            sender,
+            workers: Mutex::new(handles),
+        })
+    }
+
+    fn enqueue(
+        &self,
+        id: u32,
+        cancellation: &dyn CancellationSignal,
+    ) -> Result<bool, RoutingError> {
+        let mut job = IoJob::Load(id);
+        loop {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            match self.sender.send_timeout(job, Duration::from_millis(5)) {
+                Ok(()) => return Ok(true),
+                Err(SendTimeoutError::Timeout(returned)) => job = returned,
+                Err(SendTimeoutError::Disconnected(_)) => {
+                    return Err(RoutingError::ImageAccess(
+                        "routing I/O workers have shut down".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn shutdown(&self) {
+        let count = self.workers.lock().map_or(0, |workers| workers.len());
+        for _ in 0..count {
+            let _ = self.sender.send(IoJob::Shutdown);
+        }
+        if let Ok(mut workers) = self.workers.lock() {
+            for worker in workers.drain(..) {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
+impl Drop for IoCoordinator {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn io_worker(cache: Weak<HostCache>, receiver: Receiver<IoJob>) {
+    while let Ok(job) = receiver.recv() {
+        match job {
+            IoJob::Load(id) => {
+                let Some(cache) = cache.upgrade() else {
+                    break;
+                };
+                cache.load(id);
+            }
+            IoJob::Shutdown => break,
+        }
+    }
 }
 impl HostCache {
-    fn acquire(&self, id: u32) -> Result<Arc<DecodedPartition>, RoutingError> {
+    fn acquire(
+        &self,
+        id: u32,
+        cancellation: &dyn CancellationSignal,
+    ) -> Result<Option<Arc<DecodedPartition>>, RoutingError> {
         let p = self
             .bundle
             .manifest
@@ -575,10 +818,18 @@ impl HostCache {
             )));
         }
         loop {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
             let mut s = self
                 .state
                 .lock()
                 .map_err(|_| RoutingError::ImageAccess("host cache lock is poisoned".into()))?;
+            if let Some(reason) = &s.poison {
+                return Err(RoutingError::ImageAccess(format!(
+                    "routing bundle is poisoned: {reason}"
+                )));
+            }
             s.tick = s.tick.saturating_add(1);
             let tick = s.tick;
             match s.entries.get_mut(&id) {
@@ -586,19 +837,48 @@ impl HostCache {
                     *last = tick;
                     let data = Arc::clone(data);
                     s.hits = s.hits.saturating_add(1);
-                    return Ok(data);
+                    return Ok(Some(data));
                 }
                 Some(CacheEntry::Loading) => {
                     s.waits = s.waits.saturating_add(1);
-                    drop(self.changed.wait(s).map_err(|_| {
-                        RoutingError::ImageAccess("host cache wait is poisoned".into())
-                    })?);
+                    drop(
+                        self.changed
+                            .wait_timeout(s, Duration::from_millis(5))
+                            .map_err(|_| {
+                                RoutingError::ImageAccess("host cache wait is poisoned".into())
+                            })?,
+                    );
                     continue;
                 }
                 Some(CacheEntry::Failed(reason)) => {
                     return Err(RoutingError::ImageAccess(reason.clone()));
                 }
                 None => {
+                    let staging = p
+                        .topology_length
+                        .checked_add(p.evidence_length)
+                        .ok_or_else(|| {
+                            RoutingError::ImageAccess("staging admission overflow".into())
+                        })?;
+                    if s.staging_bytes.saturating_add(staging) > self.config.maximum_staging_bytes
+                        || s.queue_depth
+                            >= self
+                                .config
+                                .maximum_queued_reads
+                                .saturating_add(self.config.io_worker_count)
+                    {
+                        s.waits = s.waits.saturating_add(1);
+                        drop(
+                            self.changed
+                                .wait_timeout(s, Duration::from_millis(5))
+                                .map_err(|_| {
+                                    RoutingError::ImageAccess(
+                                        "host staging wait is poisoned".into(),
+                                    )
+                                })?,
+                        );
+                        continue;
+                    }
                     while s.bytes + required > self.config.maximum_bytes
                         || s.entries.len() >= self.config.maximum_entries
                     {
@@ -626,46 +906,113 @@ impl HostCache {
                     }
                     s.entries.insert(id, CacheEntry::Loading);
                     s.bytes += required;
+                    s.staging_bytes += staging;
+                    s.staging_high = s.staging_high.max(s.staging_bytes);
                     s.high = s.high.max(s.bytes);
                     s.misses = s.misses.saturating_add(1);
+                    s.queue_depth = s.queue_depth.saturating_add(1);
+                    s.queue_high_water = s.queue_high_water.max(s.queue_depth);
                     drop(s);
-                    let loaded = self.bundle.load_partition(p);
-                    let mut s = self.state.lock().map_err(|_| {
-                        RoutingError::ImageAccess("host cache lock is poisoned".into())
+                    let coordinator = self.coordinator.get().ok_or_else(|| {
+                        RoutingError::ImageAccess("routing I/O coordinator is absent".into())
                     })?;
-                    match loaded {
-                        Ok(data) => {
-                            s.read_bytes = s
-                                .read_bytes
-                                .saturating_add(p.topology_length + p.evidence_length);
-                            let data = Arc::new(data);
-                            s.entries.insert(
-                                id,
-                                CacheEntry::Ready {
-                                    data: Arc::clone(&data),
-                                    bytes: required,
-                                    last: tick,
-                                },
-                            );
-                            self.changed.notify_all();
-                            return Ok(data);
-                        }
-                        Err(e) => {
-                            s.bytes = s.bytes.saturating_sub(required);
-                            if e.to_string().contains("checksum") {
-                                s.checksum_failures = s.checksum_failures.saturating_add(1);
+                    match coordinator.enqueue(id, cancellation) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let mut s = self.state.lock().map_err(|_| {
+                                RoutingError::ImageAccess("host cache lock is poisoned".into())
+                            })?;
+                            s.queue_depth = s.queue_depth.saturating_sub(1);
+                            if matches!(s.entries.remove(&id), Some(CacheEntry::Loading)) {
+                                s.bytes = s.bytes.saturating_sub(required);
+                                s.staging_bytes = s.staging_bytes.saturating_sub(staging);
                             }
-                            s.entries.insert(id, CacheEntry::Failed(e.to_string()));
                             self.changed.notify_all();
-                            return Err(RoutingError::ImageAccess(e.to_string()));
+                            return Ok(None);
+                        }
+                        Err(error) => {
+                            let mut s = self.state.lock().map_err(|_| {
+                                RoutingError::ImageAccess("host cache lock is poisoned".into())
+                            })?;
+                            s.queue_depth = s.queue_depth.saturating_sub(1);
+                            s.bytes = s.bytes.saturating_sub(required);
+                            s.staging_bytes = s.staging_bytes.saturating_sub(staging);
+                            s.entries.insert(id, CacheEntry::Failed(error.to_string()));
+                            self.changed.notify_all();
+                            return Err(error);
                         }
                     }
                 }
             }
         }
     }
+
+    fn load(&self, id: u32) {
+        let Some(partition) = self.bundle.manifest.partitions.get(id as usize) else {
+            return;
+        };
+        if let Ok(mut state) = self.state.lock() {
+            state.queue_depth = state.queue_depth.saturating_sub(1);
+        }
+        let loaded = self.bundle.load_partition(partition);
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let required = partition
+            .topology_length
+            .saturating_add(partition.evidence_length)
+            .saturating_mul(2);
+        let staging = partition
+            .topology_length
+            .saturating_add(partition.evidence_length);
+        state.staging_bytes = state.staging_bytes.saturating_sub(staging);
+        match loaded {
+            Ok(data) => {
+                state.read_bytes = state.read_bytes.saturating_add(
+                    partition
+                        .topology_length
+                        .saturating_add(partition.evidence_length),
+                );
+                let data = Arc::new(data);
+                let last = state.tick;
+                state.entries.insert(
+                    id,
+                    CacheEntry::Ready {
+                        data,
+                        bytes: required,
+                        last,
+                    },
+                );
+            }
+            Err(error) => {
+                state.bytes = state.bytes.saturating_sub(required);
+                state.failed_loads = state.failed_loads.saturating_add(1);
+                if error.to_string().contains("checksum") {
+                    state.checksum_failures = state.checksum_failures.saturating_add(1);
+                }
+                if matches!(&error, BundleError::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof)
+                {
+                    state.short_reads = state.short_reads.saturating_add(1);
+                }
+                state.poison = Some(error.to_string());
+                state
+                    .entries
+                    .insert(id, CacheEntry::Failed(error.to_string()));
+            }
+        }
+        self.changed.notify_all();
+    }
     fn snapshot(&self) -> HostCacheSnapshot {
         let s = self.state.lock().expect("cache snapshot lock");
+        let pinned_entries = s
+            .entries
+            .values()
+            .filter(|entry| match entry {
+                CacheEntry::Loading => true,
+                CacheEntry::Ready { data, .. } => Arc::strong_count(data) > 1,
+                CacheEntry::Failed(_) => false,
+            })
+            .count();
         HostCacheSnapshot {
             capacity_bytes: self.config.maximum_bytes,
             current_bytes: s.bytes,
@@ -677,6 +1024,14 @@ impl HostCache {
             read_bytes: s.read_bytes,
             checksum_failures: s.checksum_failures,
             entries: s.entries.len(),
+            pinned_entries,
+            queue_depth: s.queue_depth,
+            queue_high_water: s.queue_high_water,
+            failed_loads: s.failed_loads,
+            staging_capacity_bytes: self.config.maximum_staging_bytes,
+            staging_current_bytes: s.staging_bytes,
+            staging_high_water_bytes: s.staging_high,
+            short_reads: s.short_reads,
         }
     }
 }
@@ -685,9 +1040,68 @@ pub struct ChunkedRoutingImage {
     bundle: Arc<RoutingBundle>,
     cache: Arc<HostCache>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PartitionSourceSegment {
+    pub source: u32,
+    pub first_edge_ordinal: u64,
+    pub start: u32,
+    pub edge_count: u32,
+}
+
+pub struct PartitionLease {
+    id: u32,
+    data: Arc<DecodedPartition>,
+}
+impl PartitionLease {
+    pub const fn id(&self) -> u32 {
+        self.id
+    }
+    pub fn source_segments(&self) -> impl ExactSizeIterator<Item = PartitionSourceSegment> + '_ {
+        self.data.segments.iter().map(|s| PartitionSourceSegment {
+            source: s.source,
+            first_edge_ordinal: s.first_ordinal,
+            start: s.start,
+            edge_count: s.count,
+        })
+    }
+    pub fn destinations(&self) -> &[u32] {
+        &self.data.destinations
+    }
+    pub fn relation_indexes(&self) -> &[u32] {
+        &self.data.relations
+    }
+    pub fn base_weight_bits(&self) -> &[u32] {
+        &self.data.weights
+    }
+    pub fn edge_ids(&self) -> &[u64] {
+        &self.data.edges
+    }
+    pub fn decoded_bytes(&self) -> usize {
+        self.data
+            .destinations
+            .len()
+            .saturating_mul(20)
+            .saturating_add(
+                self.data
+                    .segments
+                    .len()
+                    .saturating_mul(std::mem::size_of::<DecodedSegment>()),
+            )
+    }
+}
+
 impl ChunkedRoutingImage {
     pub fn open(bundle: RoutingBundle, config: HostCacheConfig) -> Result<Self, BundleError> {
+        Self::open_shared(Arc::new(bundle), config)
+    }
+
+    pub fn open_shared(
+        bundle: Arc<RoutingBundle>,
+        config: HostCacheConfig,
+    ) -> Result<Self, BundleError> {
         if config.maximum_bytes == 0
+            || config.maximum_staging_bytes == 0
             || config.maximum_entries == 0
             || config.io_worker_count == 0
             || config.maximum_queued_reads == 0
@@ -705,8 +1119,18 @@ impl ChunkedRoutingImage {
                     limit: config.maximum_bytes,
                 });
             }
+            let staging = p
+                .topology_length
+                .checked_add(p.evidence_length)
+                .ok_or_else(|| invalid("staging admission overflow"))?;
+            if staging > config.maximum_staging_bytes {
+                return Err(BundleError::Limit {
+                    resource: "host partition staging",
+                    required: staging,
+                    limit: config.maximum_staging_bytes,
+                });
+            }
         }
-        let bundle = Arc::new(bundle);
         let cache = Arc::new(HostCache {
             bundle: Arc::clone(&bundle),
             config,
@@ -721,9 +1145,26 @@ impl ChunkedRoutingImage {
                 evictions: 0,
                 read_bytes: 0,
                 checksum_failures: 0,
+                queue_depth: 0,
+                queue_high_water: 0,
+                failed_loads: 0,
+                staging_bytes: 0,
+                staging_high: 0,
+                short_reads: 0,
+                poison: None,
             }),
             changed: Condvar::new(),
+            coordinator: OnceLock::new(),
         });
+        let coordinator = IoCoordinator::start(
+            Arc::downgrade(&cache),
+            config.io_worker_count,
+            config.maximum_queued_reads,
+        )?;
+        cache
+            .coordinator
+            .set(coordinator)
+            .map_err(|_| invalid("I/O coordinator initialized twice"))?;
         Ok(Self { bundle, cache })
     }
     pub fn bundle(&self) -> &Arc<RoutingBundle> {
@@ -740,6 +1181,68 @@ impl ChunkedRoutingImage {
         request: &RoutingRequest,
     ) -> Result<CpuWorkingSetEstimate, RoutingError> {
         estimate_topology_working_set(self, request)
+    }
+    pub fn node_count(&self) -> usize {
+        self.bundle.nodes.len()
+    }
+    pub fn relation_kind_count(&self) -> usize {
+        self.bundle.relations.len()
+    }
+    pub fn adjacency_count(&self) -> usize {
+        self.bundle.manifest.adjacency_count as usize
+    }
+    pub fn partition_count(&self) -> usize {
+        self.bundle.manifest.partitions.len()
+    }
+    pub fn dense_node_id(&self, id: NodeId) -> Option<DenseNodeId> {
+        self.bundle
+            .nodes
+            .binary_search(&id)
+            .ok()
+            .map(|value| DenseNodeId::from_u32(value as u32))
+    }
+    pub fn external_node_id(&self, id: DenseNodeId) -> Option<NodeId> {
+        self.bundle.nodes.get(id.as_usize()).copied()
+    }
+    pub fn confirmed_relation_ids(&self) -> &[RelationId] {
+        &self.bundle.relations
+    }
+    pub fn source_partition_ids(&self, source: u32) -> impl Iterator<Item = u32> + '_ {
+        let source = source as usize;
+        let range = self
+            .bundle
+            .source_segment_offsets
+            .get(source..=source.saturating_add(1))
+            .and_then(|offsets| {
+                let begin = usize::try_from(offsets[0]).ok()?;
+                let end = usize::try_from(offsets[1]).ok()?;
+                Some(begin..end)
+            })
+            .unwrap_or(0..0);
+        self.bundle.segments[range]
+            .iter()
+            .map(|segment| segment.partition)
+    }
+    pub fn pack_profile(
+        &self,
+        profile: &crate::RelationProfile,
+    ) -> Result<crate::PackedRelationProfile, crate::ProfileError> {
+        profile.pack_relation_ids(&self.bundle.relations)
+    }
+    pub fn acquire_partition(
+        &self,
+        id: u32,
+        cancellation: &dyn CancellationSignal,
+    ) -> Result<Option<PartitionLease>, RoutingError> {
+        self.cache
+            .acquire(id, cancellation)
+            .map(|value| value.map(|data| PartitionLease { id, data }))
+    }
+    #[doc(hidden)]
+    pub fn shutdown_io_workers(&self) {
+        if let Some(coordinator) = self.cache.coordinator.get() {
+            coordinator.shutdown();
+        }
     }
 }
 impl RoutingTopology for ChunkedRoutingImage {
@@ -770,7 +1273,11 @@ impl RoutingTopology for ChunkedRoutingImage {
         Ok(self.bundle.source_edge_offsets[i] as usize
             ..self.bundle.source_edge_offsets[i + 1] as usize)
     }
-    fn edge_at(&self, index: usize) -> Result<OutgoingEdge, RoutingError> {
+    fn edge_at(
+        &self,
+        index: usize,
+        cancellation: &dyn CancellationSignal,
+    ) -> Result<Option<OutgoingEdge>, RoutingError> {
         let global = index as u64;
         let partition = self
             .bundle
@@ -778,17 +1285,19 @@ impl RoutingTopology for ChunkedRoutingImage {
             .partition_point(|&v| v <= global)
             .saturating_sub(1);
         let local = global - self.bundle.partition_edge_offsets[partition];
-        let data = self.cache.acquire(partition as u32)?;
+        let Some(data) = self.cache.acquire(partition as u32, cancellation)? else {
+            return Ok(None);
+        };
         let i = local as usize;
         let relation_index = data.relations[i];
-        Ok(OutgoingEdge::from_bundle(
+        Ok(Some(OutgoingEdge::from_bundle(
             EdgeId::from_u64(data.edges[i]),
             DenseNodeId::from_u32(data.destinations[i]),
             self.bundle.relations[relation_index as usize],
             BaseWeight::from_bits(data.weights[i])
                 .map_err(|_| RoutingError::ImageAccess("cached weight became invalid".into()))?,
             relation_index,
-        ))
+        )))
     }
 }
 pub fn route_partitioned(

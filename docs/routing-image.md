@@ -6,17 +6,35 @@ Fields are explicitly little-endian; the manifest has semantic policy IDs but no
 
 The low-level `RoutingImage` remains a caller-owned point-in-time value for deterministic tests and backend comparison. `GraphEngine` separately owns and publishes the one current CPU image used by its admitted routes; callers cannot replace that image or mutate its catalog outside publication coordination.
 
-PathHydra compiles a self-contained read of the confirmed durable graph into
-an immutable, in-memory routing image. The catalog holds its mutation mutex
-across the complete node, relation-kind, and canonical-edge scan. The returned
-records are sorted by stable numeric ID and contain no provisional candidates.
-Once copied, that aggregate and every image compiled from it remain unchanged
-when the catalog is mutated.
+Production compilation holds the catalog mutation mutex across ordered node,
+relation-kind, and canonical outgoing passes. It retains only identity tables,
+the source directory, and one bounded partition buffer; it does not construct
+`ConfirmedGraphRecords` or complete adjacency arrays. Provisional candidates
+are excluded by construction. The completed temporary bundle is synchronized,
+reopened through the production reader, renamed, referenced by RocksDB, and
+published once.
 
-This image is not a durable file format. Its arrays have no serialized byte
-order, schema marker, checksum, migration path, or compatibility promise.
-There is also no active-image publisher: callers explicitly own or borrow an
-image, and a catalog mutation does not rebuild or invalidate it.
+`RoutingImage` itself remains an in-memory test/resident representation with no
+serialized compatibility promise. The durable bundle is the only serialized
+representation. Confirmed mutation atomically invalidates its pointer and the
+engine republishes a complete replacement.
+
+## Partitioned CPU execution
+
+`ChunkedRoutingImage` keeps identities and the source-segment directory
+resident. A fixed worker pool serves a bounded read queue; the shared cache has
+byte, entry, and staging limits and coalesces concurrent loads. Loading, ready,
+failed, pinned, and least-recently-released eviction states are explicit.
+Every load checks exact lengths and checksums. A failure poisons that bundle for
+new routes and triggers a controlled rebuild rather than producing an
+`Unreachable` result.
+
+Partitioned search uses the same CPU queue, arithmetic, tie, budget,
+cancellation, and path reconstruction code as resident search. Stable path
+evidence is copied at relaxation time, so cache eviction cannot alter a result.
+An execution image owns an immutable bundle lease; old requests can finish
+after publication, and the reaper deletes an exact retired child only after all
+request, cache, I/O, and CUDA references release it.
 
 ## Topology
 
@@ -85,8 +103,9 @@ The explicit search budget is either unlimited or a maximum examined-edge
 count. An edge is counted immediately before checking its relation state, so a
 disabled edge consumes budget. When no budget remains, search stops before the
 next edge. Depth and fan-out are explicitly unlimited; cycles are bounded by
-node finalization. Deadlines and cancellation are not part of this reference
-engine because they would introduce nondeterministic stopping points.
+node finalization. Cancellation is cooperatively checked at admission, cache
+waits, between segments, and during reconstruction; its precedence relative to
+finite budgets is part of the tested result contract.
 
 Search ends when all unique present destinations finalize, the frontier is
 exhausted, or the budget stops edge examination. Search state is local to one

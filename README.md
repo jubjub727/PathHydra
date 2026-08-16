@@ -20,9 +20,9 @@ flowchart LR
     d -->|relation| g["node"]
 ```
 
-The Rust engine can perform the supported distance-only selection on a fully
-resident NVIDIA CUDA device. Hydration and caller-owned subgraph composition
-remain host operations.
+The Rust engine can perform supported distance-only selection on NVIDIA CUDA
+with either complete topology residency or bounded source-segment partitions.
+Hydration and caller-owned subgraph composition remain host operations.
 
 ## Core model
 
@@ -69,17 +69,34 @@ post-commit image-build failure. The current boundaries are documented in
 [the CPU-engine reference](docs/cpu-engine.md).
 
 The optional `cuda` feature adds Rust-authored `sm_86` PTX loaded through the
-CUDA Driver API, immutable full-topology residency, exact frontier and
-delta-stepping distance routing, independent queued lanes, memory admission,
-CPU fallback, health, and explicit recovery. CUDA does not support returned
-paths or finite examined-edge budgets; permissive policies use the CPU oracle.
+CUDA Driver API, immutable resident and partition-cached topology, exact
+frontier and delta-stepping distance routing, independent queued lanes, memory
+admission, CPU fallback, health, and explicit recovery. CUDA does not support
+returned paths or finite examined-edge budgets; permissive policies rerun the
+complete request on the CPU representation from the same bundle lease.
 The local RTX 3080 baseline does not justify automatic acceleration, so `Auto`
 remains conservative and no universal speedup is claimed. See [the CUDA build
 guide](docs/cuda-build.md), [routing contract](docs/cuda-routing.md), and
 [operations guide](docs/cuda-operations.md).
 
 BAML/bindings and a transport are not implemented yet. Durable routing bundles
-and exact partitioned CPU execution are active engine paths.
+and exact partitioned CPU/CUDA execution are active engine paths.
+
+Operational selection uses independent limits. `max_active_image_bytes`
+selects resident versus partitioned CPU topology; host metadata,
+partition-cache, I/O queue/staging, retirement, CUDA device-cache, CUDA staging,
+and per-search reservations each have their own fields. `PreferCuda` reruns a
+complete eligible request on the matching CPU bundle after a device failure.
+`RequireCuda` returns the typed CUDA refusal instead. `Auto` remains
+conservative and does not infer a speedup from topology size alone.
+
+On startup, the default policy validates and reuses the durable pointer or
+rebuilds an absent/corrupt bundle from confirmed RocksDB records. Set
+`StartupBundlePolicy::RequireValidBundle` to refuse that automatic rebuild.
+Operators can call `rebuild_routing_image`, `rebuild_cuda_residency`, or
+`reinitialize_cuda` explicitly. Routing bundles are rebuildable indexes and
+may be omitted from backups; confirmed RocksDB records remain the sole durable
+graph source of truth.
 
 ## Development
 
