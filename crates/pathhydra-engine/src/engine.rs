@@ -1357,6 +1357,26 @@ impl GraphEngine {
         request_id: RequestId,
         request: &RoutingRequest,
     ) -> Result<EngineRoutingResponse, EngineError> {
+        self.route_with_cancellation(
+            request_id,
+            request,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    /// Executes a route using a caller-owned cancellation flag.
+    ///
+    /// This is the narrow bridge used by the consumer facade to make
+    /// cancellation before engine admission race-free. The flag is registered
+    /// under `request_id` for the duration of the call, so [`Self::cancel`]
+    /// and direct flag signalling affect the same request and no other.
+    #[doc(hidden)]
+    pub fn route_with_cancellation(
+        &self,
+        request_id: RequestId,
+        request: &RoutingRequest,
+        cancellation: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<EngineRoutingResponse, EngineError> {
         let _operation = self.lifecycle.begin_route()?;
         if request.destinations().len() > self.config.max_destinations_per_request {
             return Err(self.admission.reject_destinations(
@@ -1364,7 +1384,7 @@ impl GraphEngine {
                 self.config.max_destinations_per_request,
             )?);
         }
-        let registration = self.requests.register(request_id)?;
+        let registration = self.requests.register_flag(request_id, cancellation)?;
         let admission_started = Instant::now();
         let mut permit = self.admission.acquire_slot()?;
         let execution = {
@@ -2758,7 +2778,10 @@ mod tests {
         let engine = GraphEngine::open(directory.path(), EngineConfig::default()).unwrap();
         let origin = confirm_node(&engine, "origin");
         let id = RequestId::new(44);
-        let registration = engine.requests.register(id).unwrap();
+        let registration = engine
+            .requests
+            .register_flag(id, Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .unwrap();
         let request = RoutingRequest::new(
             origin.id(),
             [origin.id()],
@@ -2780,6 +2803,15 @@ mod tests {
         drop(registration);
         assert_eq!(engine.cancel(id).unwrap(), CancellationOutcome::NotActive);
         assert!(engine.route(id, &request).is_ok());
+        let pre_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let output = engine
+            .route_with_cancellation(id, &request, pre_cancelled)
+            .unwrap();
+        assert_eq!(
+            output.response.completion_reason(),
+            pathhydra_routing::CompletionReason::Cancelled
+        );
+        assert_eq!(engine.cancel(id).unwrap(), CancellationOutcome::NotActive);
     }
 
     #[test]

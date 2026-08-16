@@ -21,7 +21,7 @@ use crate::{
         encode_name_key, encode_node, encode_relation, encode_u64_record,
     },
     column_families,
-    error::{CatalogError, ConfirmedId, EdgeEndpoint, RecordKind, rocksdb_error},
+    error::{CatalogError, EdgeEndpoint, RecordKind, rocksdb_error},
     metrics::{StoreMetrics, WriteOperationClass},
     operations::{OperationError, require_existing_catalog_path, validate_column_families},
     options,
@@ -792,10 +792,19 @@ impl Catalog {
         if let Some(value) = self.db.get_cf(names_cf, &name_key)? {
             let existing = decode_u64_record(&value)
                 .map_err(|error| record_error(column_families::NODE_NAMES, name.as_str(), error))?;
-            return Err(CatalogError::NameAlreadyConfirmed {
-                name: name.into_boxed_str(),
-                existing_id: ConfirmedId::Node(NodeId::from_u64(existing)),
-            });
+            let record = get_node_from_db(&self.db, NodeId::from_u64(existing))?;
+            if record.name() != &name {
+                return Err(corrupt(
+                    column_families::NODE_NAMES,
+                    name.as_str(),
+                    "exact-name mapping resolves to a node with a different name",
+                ));
+            }
+            let candidates = column_family(&self.db, column_families::CANDIDATES)?;
+            let mut batch = WriteBatch::default();
+            batch.delete_cf(candidates, encode_id_key(candidate_id.as_u64()));
+            self.commit_batch(batch, WriteOperationClass::ConfirmedPromotion)?;
+            return Ok(ConfirmedRecord::Node(record));
         }
 
         let next_id = read_metadata(&self.db, META_NEXT_NODE_ID, "next-node-id")?;
@@ -831,10 +840,19 @@ impl Catalog {
             let existing = decode_u64_record(&value).map_err(|error| {
                 record_error(column_families::RELATION_NAMES, name.as_str(), error)
             })?;
-            return Err(CatalogError::NameAlreadyConfirmed {
-                name: name.into_boxed_str(),
-                existing_id: ConfirmedId::Relation(RelationId::from_u64(existing)),
-            });
+            let record = get_relation_from_db(&self.db, RelationId::from_u64(existing))?;
+            if record.name() != &name {
+                return Err(corrupt(
+                    column_families::RELATION_NAMES,
+                    name.as_str(),
+                    "exact-name mapping resolves to a relation kind with a different name",
+                ));
+            }
+            let candidates = column_family(&self.db, column_families::CANDIDATES)?;
+            let mut batch = WriteBatch::default();
+            batch.delete_cf(candidates, encode_id_key(candidate_id.as_u64()));
+            self.commit_batch(batch, WriteOperationClass::ConfirmedPromotion)?;
+            return Ok(ConfirmedRecord::Relation(record));
         }
 
         let next_id = read_metadata(&self.db, META_NEXT_RELATION_ID, "next-relation-id")?;

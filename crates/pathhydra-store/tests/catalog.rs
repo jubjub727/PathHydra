@@ -4,9 +4,7 @@ use std::{
     thread,
 };
 
-use pathhydra_store::{
-    Candidate, Catalog, CatalogError, ConfirmedId, ConfirmedRecord, RecordKind, RelationId,
-};
+use pathhydra_store::{Candidate, Catalog, CatalogError, ConfirmedRecord, RecordKind, RelationId};
 use rocksdb::{DB, Options};
 use tempfile::TempDir;
 
@@ -170,7 +168,7 @@ fn node_and_relation_namespaces_are_independent() {
 }
 
 #[test]
-fn duplicate_confirmation_returns_existing_id_without_mutation() {
+fn duplicate_confirmation_returns_existing_id_and_consumes_candidate() {
     let directory = TempDir::new().unwrap();
     let catalog = Catalog::open(directory.path()).unwrap();
     let first = catalog.insert_node_candidate("duplicate").unwrap();
@@ -178,19 +176,49 @@ fn duplicate_confirmation_returns_existing_id_without_mutation() {
     let ConfirmedRecord::Node(node) = catalog.confirm_validated_candidate(first).unwrap() else {
         panic!("expected node");
     };
-    let error = catalog.confirm_validated_candidate(duplicate).unwrap_err();
+    let ConfirmedRecord::Node(duplicate_result) =
+        catalog.confirm_validated_candidate(duplicate).unwrap()
+    else {
+        panic!("expected node");
+    };
+    assert_eq!(duplicate_result.id(), node.id());
     assert!(matches!(
-        error,
-        CatalogError::NameAlreadyConfirmed {
-            existing_id: ConfirmedId::Node(id),
+        catalog.get_candidate(duplicate),
+        Err(CatalogError::NotFound {
+            kind: RecordKind::Candidate,
             ..
-        } if id == node.id()
+        })
     ));
-    assert_eq!(catalog.get_candidate(duplicate).unwrap().id(), duplicate);
     assert_eq!(
         catalog.get_node(node.id()).unwrap().name().as_str(),
         "duplicate"
     );
+
+    let first_relation = catalog
+        .insert_relation_candidate("duplicate relation")
+        .unwrap();
+    let duplicate_relation = catalog
+        .insert_relation_candidate("duplicate relation")
+        .unwrap();
+    let ConfirmedRecord::Relation(relation) =
+        catalog.confirm_validated_candidate(first_relation).unwrap()
+    else {
+        panic!("expected relation kind");
+    };
+    let ConfirmedRecord::Relation(duplicate_result) = catalog
+        .confirm_validated_candidate(duplicate_relation)
+        .unwrap()
+    else {
+        panic!("expected relation kind");
+    };
+    assert_eq!(duplicate_result.id(), relation.id());
+    assert!(matches!(
+        catalog.get_candidate(duplicate_relation),
+        Err(CatalogError::NotFound {
+            kind: RecordKind::Candidate,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -306,15 +334,33 @@ fn simultaneous_duplicate_confirmation_creates_at_most_one_record() {
         .map(|handle| handle.join().unwrap())
         .collect();
 
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert!(results.iter().all(Result::is_ok));
+    let ids = results
+        .iter()
+        .map(|result| match result.as_ref().unwrap() {
+            ConfirmedRecord::Node(node) => node.id(),
+            _ => panic!("expected node"),
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(ids.len(), 1);
     assert_eq!(
-        results
-            .iter()
-            .filter(|result| matches!(result, Err(CatalogError::NameAlreadyConfirmed { .. })))
-            .count(),
-        1
+        catalog.lookup_node_exact("racing").unwrap(),
+        ids.iter().next().copied()
     );
-    assert!(catalog.lookup_node_exact("racing").unwrap().is_some());
+    assert!(matches!(
+        catalog.get_candidate(first),
+        Err(CatalogError::NotFound {
+            kind: RecordKind::Candidate,
+            ..
+        })
+    ));
+    assert!(matches!(
+        catalog.get_candidate(second),
+        Err(CatalogError::NotFound {
+            kind: RecordKind::Candidate,
+            ..
+        })
+    ));
 }
 
 #[test]

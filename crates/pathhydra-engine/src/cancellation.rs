@@ -48,14 +48,17 @@ impl RequestRegistry {
             active: Mutex::new(HashMap::new()),
         }
     }
-    pub fn register(&self, id: RequestId) -> Result<RequestRegistration<'_>, EngineError> {
+    pub fn register_flag(
+        &self,
+        id: RequestId,
+        flag: Arc<AtomicBool>,
+    ) -> Result<RequestRegistration<'_>, EngineError> {
         let mut active = self.active.lock().map_err(|_| EngineError::LockPoisoned {
             lock: "active request registry",
         })?;
         if active.contains_key(&id) {
             return Err(EngineError::DuplicateActiveRequest(id));
         }
-        let flag = Arc::new(AtomicBool::new(false));
         active.insert(id, Arc::clone(&flag));
         Ok(RequestRegistration {
             registry: self,
