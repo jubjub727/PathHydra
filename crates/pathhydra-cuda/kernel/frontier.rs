@@ -1,16 +1,19 @@
-use crate::arithmetic::{separate_add, separate_multiply};
+use crate::{
+    arithmetic::{global_thread_index, separate_add, separate_multiply},
+    atomic::{add, distance_min, increment, load_u32, load_u64, store_u32},
+};
 
 pub const STATUS_SUCCESS: u32 = 0;
 pub const STATUS_INVALID_INDEX: u32 = 2;
 pub const STATUS_INVALID_ARITHMETIC: u32 = 3;
 pub const STATUS_COUNTER_OVERFLOW: u32 = 4;
 
-/// # Safety
-/// The host ABI guarantees every pointer and logical length. The kernel uses a
-/// single device thread, so all writes are exclusive for the launch.
+/// Relaxes one compacted resident frontier task per CUDA thread.
 #[no_mangle]
-pub unsafe extern "ptx-kernel" fn pathhydra_frontier_route(
-    offsets: *const u64,
+pub unsafe extern "ptx-kernel" fn pathhydra_frontier_phase(
+    task_edges: *const u64,
+    task_sources: *const u32,
+    task_count: u32,
     destinations: *const u32,
     relation_indexes: *const u32,
     base_weight_bits: *const u32,
@@ -19,140 +22,128 @@ pub unsafe extern "ptx-kernel" fn pathhydra_frontier_route(
     relation_enabled: *const u32,
     multiplier_bits: *const u32,
     relation_count: u32,
-    origin: u32,
+    next_active_sources: *mut u32,
     distance_bits: *mut u64,
+    changed: *mut u32,
     status: *mut u32,
     counters: *mut u64,
 ) {
-    if crate::arithmetic::global_thread_index() != 0 {
+    let task = global_thread_index();
+    if task >= task_count as usize || unsafe { load_u32(status) } != STATUS_SUCCESS {
         return;
     }
-    // SAFETY: forwarded host ABI and single-thread ownership satisfy the
-    // implementation contract.
+    let edge = unsafe { *task_edges.add(task) };
+    if edge >= adjacency_count || unsafe { load_u32(status) } != STATUS_SUCCESS {
+        return;
+    }
+    let source = unsafe { *task_sources.add(task) };
+    if source >= node_count {
+        unsafe { store_u32(status, STATUS_INVALID_INDEX) };
+        return;
+    }
+    if unsafe { !increment(counters, 0, status) } {
+        return;
+    }
     unsafe {
-        route_impl(
-            offsets, destinations, relation_indexes, base_weight_bits, node_count,
-            adjacency_count, relation_enabled, multiplier_bits, relation_count, origin,
-            distance_bits, status, counters,
+        relax_one(
+            destinations, relation_indexes, base_weight_bits, edge as usize, node_count,
+            relation_enabled, multiplier_bits, relation_count, source, next_active_sources,
+            distance_bits, changed, status, counters,
         )
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn route_impl(
-    offsets: *const u64,
+pub unsafe fn relax_one(
     destinations: *const u32,
     relation_indexes: *const u32,
     base_weight_bits: *const u32,
+    edge: usize,
     node_count: u32,
-    adjacency_count: u64,
     relation_enabled: *const u32,
     multiplier_bits: *const u32,
     relation_count: u32,
-    origin: u32,
+    source: u32,
+    next_active_sources: *mut u32,
     distance_bits: *mut u64,
+    changed: *mut u32,
     status: *mut u32,
     counters: *mut u64,
 ) {
-    if origin >= node_count {
-        unsafe { *status = STATUS_INVALID_INDEX };
+    let relation = unsafe { *relation_indexes.add(edge) };
+    if relation >= relation_count {
+        unsafe { store_u32(status, STATUS_INVALID_INDEX) };
         return;
     }
-    unsafe { *distance_bits.add(origin as usize) = 0.0_f64.to_bits() };
-    let mut changed = true;
-    let mut phase = 0_u64;
-    while changed && phase < u64::from(node_count) {
-        changed = false;
-        let mut source = 0_u32;
-        while source < node_count {
-            let source_distance = f64::from_bits(unsafe { *distance_bits.add(source as usize) });
-            if source_distance.is_finite() {
-                let (start, end) = unsafe {
-                    (*offsets.add(source as usize), *offsets.add(source as usize + 1))
-                };
-                if start > end || end > adjacency_count {
-                    unsafe { *status = STATUS_INVALID_INDEX };
-                    return;
-                }
-                let mut adjacency = start;
-                while adjacency < end {
-                    if unsafe { !increment(counters, 0) } {
-                        unsafe { *status = STATUS_COUNTER_OVERFLOW };
-                        return;
-                    }
-                    let index = adjacency as usize;
-                    let relation_index = unsafe { *relation_indexes.add(index) };
-                    if relation_index >= relation_count {
-                        unsafe { *status = STATUS_INVALID_INDEX };
-                        return;
-                    }
-                    let enabled = unsafe { *relation_enabled.add(relation_index as usize) };
-                    if enabled > 1 {
-                        unsafe { *status = STATUS_INVALID_ARITHMETIC };
-                        return;
-                    }
-                    if enabled == 1 {
-                        if unsafe { !increment(counters, 1) } {
-                            unsafe { *status = STATUS_COUNTER_OVERFLOW };
-                            return;
-                        }
-                        let destination = unsafe { *destinations.add(index) };
-                        if destination >= node_count {
-                            unsafe { *status = STATUS_INVALID_INDEX };
-                            return;
-                        }
-                        let base = f32::from_bits(unsafe { *base_weight_bits.add(index) });
-                        let multiplier = f32::from_bits(unsafe {
-                            *multiplier_bits.add(relation_index as usize)
-                        });
-                        if !base.is_finite() || base < 0.0 || !multiplier.is_finite() || multiplier < 0.0 {
-                            unsafe { *status = STATUS_INVALID_ARITHMETIC };
-                            return;
-                        }
-                        let effective = separate_multiply(base, multiplier);
-                        let candidate = separate_add(source_distance, effective);
-                        if !candidate.is_finite() || candidate < 0.0 {
-                            unsafe { *status = STATUS_INVALID_ARITHMETIC };
-                            return;
-                        }
-                        let destination_index = destination as usize;
-                        let existing = f64::from_bits(unsafe { *distance_bits.add(destination_index) });
-                        if candidate < existing {
-                            unsafe { *distance_bits.add(destination_index) = candidate.to_bits() };
-                            if unsafe { !increment(counters, 2) } {
-                                unsafe { *status = STATUS_COUNTER_OVERFLOW };
-                                return;
-                            }
-                            changed = true;
-                        }
-                    }
-                    adjacency += 1;
-                }
-            }
-            source += 1;
-        }
-        phase += 1;
+    let enabled = unsafe { *relation_enabled.add(relation as usize) };
+    if enabled > 1 {
+        unsafe { store_u32(status, STATUS_INVALID_ARITHMETIC) };
+        return;
     }
-    unsafe { *counters.add(3) = phase };
-    let mut reached = 0_u64;
-    let mut node = 0_u32;
-    while node < node_count {
-        if f64::from_bits(unsafe { *distance_bits.add(node as usize) }).is_finite() {
-            reached += 1;
-        }
-        node += 1;
+    if enabled == 0 {
+        return;
     }
-    unsafe { *counters.add(4) = reached };
-    unsafe { *status = STATUS_SUCCESS };
+    if unsafe { !increment(counters, 1, status) } {
+        return;
+    }
+    let destination = unsafe { *destinations.add(edge) };
+    if destination >= node_count {
+        unsafe { store_u32(status, STATUS_INVALID_INDEX) };
+        return;
+    }
+    let base = f32::from_bits(unsafe { *base_weight_bits.add(edge) });
+    let multiplier = f32::from_bits(unsafe { *multiplier_bits.add(relation as usize) });
+    if !base.is_finite() || base < 0.0 || !multiplier.is_finite() || multiplier < 0.0 {
+        unsafe { store_u32(status, STATUS_INVALID_ARITHMETIC) };
+        return;
+    }
+    let source_distance = f64::from_bits(unsafe { load_u64(distance_bits.add(source as usize)) });
+    if !source_distance.is_finite() {
+        return;
+    }
+    let candidate = separate_add(source_distance, separate_multiply(base, multiplier));
+    if !candidate.is_finite() || candidate < 0.0 {
+        unsafe { store_u32(status, STATUS_INVALID_ARITHMETIC) };
+        return;
+    }
+    let (updated, retries) = unsafe { distance_min(distance_bits.add(destination as usize), candidate) };
+    if unsafe { !add(counters, 4, retries, status) } {
+        return;
+    }
+    if updated {
+        unsafe {
+            store_u32(next_active_sources.add(destination as usize), 1);
+            store_u32(changed, 1);
+        }
+        let _ = unsafe { increment(counters, 2, status) };
+    }
 }
 
-/// # Safety
-/// `counters` addresses at least five writable u64 values.
-pub unsafe fn increment(counters: *mut u64, index: usize) -> bool {
-    let value = unsafe { *counters.add(index) };
-    let Some(next) = value.checked_add(1) else {
-        return false;
-    };
-    unsafe { *counters.add(index) = next };
-    true
+pub unsafe fn csr_source(
+    offsets: *const u64,
+    node_count: u32,
+    edge: u64,
+    adjacency_count: u64,
+) -> Option<u32> {
+    if edge >= adjacency_count {
+        return None;
+    }
+    let mut low = 0_u32;
+    let mut high = node_count;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if unsafe { *offsets.add(middle as usize + 1) } <= edge {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if low < node_count
+        && unsafe { *offsets.add(low as usize) } <= edge
+        && edge < unsafe { *offsets.add(low as usize + 1) }
+    {
+        Some(low)
+    } else {
+        None
+    }
 }

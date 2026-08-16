@@ -33,6 +33,12 @@ pub enum CancellationOutcome {
     NotActive,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CancelAllOutcome {
+    pub active: usize,
+    pub newly_signalled: usize,
+}
+
 pub(crate) struct RequestRegistry {
     active: Mutex<HashMap<RequestId, Arc<AtomicBool>>>,
 }
@@ -67,6 +73,20 @@ impl RequestRegistry {
                 CancellationOutcome::AlreadySignalled
             }
             Some(_) => CancellationOutcome::Signalled,
+        })
+    }
+
+    pub fn cancel_all(&self) -> Result<CancelAllOutcome, EngineError> {
+        let active = self.active.lock().map_err(|_| EngineError::LockPoisoned {
+            lock: "active request registry",
+        })?;
+        let newly_signalled = active
+            .values()
+            .filter(|flag| !flag.swap(true, Ordering::AcqRel))
+            .count();
+        Ok(CancelAllOutcome {
+            active: active.len(),
+            newly_signalled,
         })
     }
 }

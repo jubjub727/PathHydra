@@ -4,9 +4,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod arithmetic;
+mod atomic;
+mod benchmark;
 mod delta;
 mod frontier;
-mod frontier_compaction;
 mod partition_delta;
 mod partition_frontier;
 

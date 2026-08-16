@@ -99,6 +99,18 @@ impl CpuTopology {
             Self::Partitioned(image) => Arc::clone(image.bundle()),
         }
     }
+
+    /// Stops the bounded partition I/O pool when this topology owns one.
+    /// Repeated calls are safe because the coordinator shutdown is idempotent.
+    pub fn shutdown_io(&self) -> Result<bool, pathhydra_routing::RoutingError> {
+        match self {
+            Self::Resident { .. } => Ok(false),
+            Self::Partitioned(image) => {
+                image.shutdown_io_workers()?;
+                Ok(true)
+            }
+        }
+    }
 }
 
 pub(crate) struct PublishedExecutionImage {
@@ -291,6 +303,9 @@ pub(crate) enum RoutingState {
         reason: RoutingUnavailableReason,
         last_build: ImageBuildReport,
     },
+    ShutDown {
+        last_build: ImageBuildReport,
+    },
 }
 
 impl RoutingState {
@@ -300,12 +315,16 @@ impl RoutingState {
                 RoutingUnavailableReason::Bundle("current CPU topology is partitioned".into())
             }),
             Self::Unavailable { reason, .. } => Err(reason.clone()),
+            Self::ShutDown { .. } => Err(RoutingUnavailableReason::Bundle(
+                "the graph engine is shut down".to_owned(),
+            )),
         }
     }
     pub fn manifest(&self) -> Option<RoutingImageManifest> {
         match self {
             Self::Available { image, .. } => Some(image.cpu.manifest()),
             Self::Unavailable { .. } => None,
+            Self::ShutDown { .. } => None,
         }
     }
 
@@ -313,29 +332,37 @@ impl RoutingState {
         match self {
             Self::Available { image, .. } => Ok(Arc::clone(image)),
             Self::Unavailable { reason, .. } => Err(reason.clone()),
+            Self::ShutDown { .. } => Err(RoutingUnavailableReason::Bundle(
+                "the graph engine is shut down".to_owned(),
+            )),
         }
     }
     pub fn execution_lease_count(&self) -> usize {
         match self {
             Self::Available { image, .. } => Arc::strong_count(image),
             Self::Unavailable { .. } => 0,
+            Self::ShutDown { .. } => 0,
         }
     }
     pub fn age(&self) -> Option<Duration> {
         match self {
             Self::Available { published_at, .. } => Some(published_at.elapsed()),
             Self::Unavailable { .. } => None,
+            Self::ShutDown { .. } => None,
         }
     }
     pub fn last_build(&self) -> &ImageBuildReport {
         match self {
-            Self::Available { last_build, .. } | Self::Unavailable { last_build, .. } => last_build,
+            Self::Available { last_build, .. }
+            | Self::Unavailable { last_build, .. }
+            | Self::ShutDown { last_build } => last_build,
         }
     }
     pub fn unavailable_reason(&self) -> Option<&RoutingUnavailableReason> {
         match self {
             Self::Unavailable { reason, .. } => Some(reason),
             Self::Available { .. } => None,
+            Self::ShutDown { .. } => None,
         }
     }
 }

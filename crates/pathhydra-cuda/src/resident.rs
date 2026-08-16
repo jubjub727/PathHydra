@@ -4,7 +4,10 @@ use cudarc::driver::CudaSlice;
 
 use pathhydra_routing::RoutingImage;
 
-use crate::{CudaAlgorithm, CudaContextOwner, CudaError, CudaFailureKind, CudaRouteOutput, launch};
+use crate::{
+    CudaAlgorithm, CudaContextOwner, CudaError, CudaFailureKind, CudaRouteOutput,
+    fault::CudaFaultInjection, launch,
+};
 
 #[derive(Debug)]
 pub struct CudaResidentImage {
@@ -15,6 +18,7 @@ pub struct CudaResidentImage {
     pub(crate) base_weight_bits: CudaSlice<u32>,
     cpu_image: Arc<RoutingImage>,
     allocated_bytes: usize,
+    faults: Arc<CudaFaultInjection>,
 }
 
 impl CudaResidentImage {
@@ -124,6 +128,7 @@ impl CudaResidentImage {
             base_weight_bits,
             cpu_image,
             allocated_bytes,
+            faults: Arc::new(CudaFaultInjection::default()),
         }))
     }
 
@@ -160,6 +165,11 @@ impl CudaResidentImage {
     #[must_use]
     pub const fn context(&self) -> &Arc<CudaContextOwner> {
         &self.context
+    }
+
+    #[doc(hidden)]
+    pub fn fault_injection(&self) -> Arc<CudaFaultInjection> {
+        Arc::clone(&self.faults)
     }
 
     pub fn route(

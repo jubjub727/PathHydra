@@ -1,24 +1,26 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    sync::{Arc, RwLock},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{Arc, Mutex, MutexGuard, RwLock},
     time::{Duration, Instant},
 };
-
-#[cfg(feature = "cuda")]
-use std::sync::{Mutex, atomic::AtomicBool};
 
 use pathhydra_core::{
     BaseWeight, Candidate, CandidateId, ConfirmedRecord, EdgeId, EdgeRecord, NodeId, NodeName,
     NodePayload, NodeRecord, RelationId, RelationName, RelationRecord,
 };
 use pathhydra_routing::{
-    BundleConfig, ChunkedRoutingImage, CompletionReason, CpuSearchDiagnostics, HostCacheConfig,
-    NumericPolicy, RoutingRequest, RoutingResponse, TiePolicy, compile_bundle,
+    BundleConfig, ChunkedRoutingImage, CompletionReason, CpuSearchDiagnostics, DestinationState,
+    HostCacheConfig, NumericPolicy, RelationMultiplier, RelationProfile, RelationUse,
+    RoutingRequest, RoutingResponse, SearchBudget, TiePolicy, compile_bundle,
     estimate_cpu_working_set, open_bundle, route_controlled, route_partitioned_controlled,
 };
-use pathhydra_store::{ActiveRoutingImage, Catalog};
+use pathhydra_store::{
+    ActiveRoutingImage, Catalog, CatalogConfig, CatalogSummary, CheckpointReport,
+    CheckpointRequest, CompactionReport, OperationalPathRequest, PathTarget, StoreMetricsSnapshot,
+    VerificationLimits, VerificationReport, validate_operational_paths,
+};
 
 #[cfg(feature = "cuda")]
 use pathhydra_routing::RoutingImage;
@@ -26,11 +28,13 @@ use pathhydra_routing::RoutingImage;
 use crate::{
     AdmissionController, CancellationOutcome, ConfirmedMutation, CpuTopology,
     CudaAlgorithmSelection, CudaAvailability, CudaConfig, CudaDeviceSummary, CudaExecutorPolicy,
-    CudaHealth, CudaIneligibility, CudaRequestDiagnostics, EngineCapabilities, EngineConfigError,
-    EngineError, EngineHealth, ExecutorSelectionReason, ImageBuildOutcome, ImageBuildReport,
-    PublicationFaultInjection, PublicationOutcome, PublicationStage, PublishedExecutionImage,
-    RequestId, RequestRegistry, RetirementManager, RoutingHealth, RoutingState,
-    RoutingUnavailableReason, StartupImageOutcome,
+    CudaHealth, CudaIneligibility, CudaRequestDiagnostics, CudaWorkerShutdownReport,
+    EngineCapabilities, EngineConfigError, EngineError, EngineHealth, EngineRestoreReport,
+    EngineRestoreRequest, ExecutorSelectionReason, HydratedNodeState, HydrationRequest,
+    ImageBuildOutcome, ImageBuildReport, LifecycleController, PublicationFaultInjection,
+    PublicationOutcome, PublicationStage, PublishedExecutionImage, RequestId, RequestRegistry,
+    RetirementManager, RoutingHealth, RoutingState, RoutingUnavailableReason, ShutdownFailure,
+    ShutdownFailureStage, ShutdownReport, StartupImageOutcome,
 };
 
 #[cfg(feature = "cuda")]
@@ -156,6 +160,12 @@ pub const DEFAULT_MAX_RESIDENT_IMAGE_METADATA_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_HOST_PARTITION_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_MAX_RETIRED_BUNDLE_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_RETIRED_BUNDLE_COUNT: usize = 32;
+pub const DEFAULT_MAX_CONCURRENT_CHECKPOINTS: usize = 1;
+pub const DEFAULT_MAXIMUM_MAINTENANCE_WORKERS: usize = 1;
+pub const DEFAULT_MAXIMUM_QUEUED_MAINTENANCE: usize = 0;
+pub const DEFAULT_MAX_VERIFICATION_RECORDS: u64 = 100_000_000;
+pub const DEFAULT_MAX_VERIFICATION_DURATION: Duration = Duration::from_secs(300);
+pub const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum StartupBundlePolicy {
@@ -183,6 +193,12 @@ pub struct EngineConfig {
     pub routing_io_staging_bytes: u64,
     pub maximum_retired_bundle_bytes: u64,
     pub maximum_retired_bundle_count: usize,
+    pub maximum_concurrent_checkpoints: usize,
+    pub maximum_maintenance_workers: usize,
+    pub maximum_queued_maintenance: usize,
+    pub maximum_verification_records: u64,
+    pub maximum_verification_duration: Duration,
+    pub shutdown_drain_timeout: Duration,
     pub startup_bundle_policy: StartupBundlePolicy,
     pub cuda: CudaConfig,
 }
@@ -207,6 +223,12 @@ impl Default for EngineConfig {
             routing_io_staging_bytes: 32 * 1024 * 1024,
             maximum_retired_bundle_bytes: DEFAULT_MAX_RETIRED_BUNDLE_BYTES,
             maximum_retired_bundle_count: DEFAULT_MAX_RETIRED_BUNDLE_COUNT,
+            maximum_concurrent_checkpoints: DEFAULT_MAX_CONCURRENT_CHECKPOINTS,
+            maximum_maintenance_workers: DEFAULT_MAXIMUM_MAINTENANCE_WORKERS,
+            maximum_queued_maintenance: DEFAULT_MAXIMUM_QUEUED_MAINTENANCE,
+            maximum_verification_records: DEFAULT_MAX_VERIFICATION_RECORDS,
+            maximum_verification_duration: DEFAULT_MAX_VERIFICATION_DURATION,
+            shutdown_drain_timeout: DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
             startup_bundle_policy: StartupBundlePolicy::ValidateOrRebuild,
             cuda: CudaConfig::default(),
         }
@@ -239,10 +261,39 @@ impl EngineConfig {
                 "maximum_retired_bundle_count",
                 self.maximum_retired_bundle_count,
             ),
+            (
+                "maximum_concurrent_checkpoints",
+                self.maximum_concurrent_checkpoints,
+            ),
+            (
+                "maximum_maintenance_workers",
+                self.maximum_maintenance_workers,
+            ),
         ] {
             if value == 0 {
                 return Err(EngineConfigError::ZeroLimit { limit: name });
             }
+        }
+        if self.maximum_queued_maintenance != 0 {
+            return Err(EngineConfigError::InvalidMaintenanceValue {
+                field: "maximum_queued_maintenance",
+                reason: "the current caller-executed maintenance policy has a zero-length queue",
+            });
+        }
+        if self.maximum_verification_records == 0 {
+            return Err(EngineConfigError::ZeroLimit {
+                limit: "maximum_verification_records",
+            });
+        }
+        if self.maximum_verification_duration.is_zero() {
+            return Err(EngineConfigError::ZeroLimit {
+                limit: "maximum_verification_duration",
+            });
+        }
+        if self.shutdown_drain_timeout.is_zero() {
+            return Err(EngineConfigError::ZeroLimit {
+                limit: "shutdown_drain_timeout",
+            });
         }
         for (name, value) in [
             ("max_total_bundle_bytes", self.max_total_bundle_bytes),
@@ -322,23 +373,12 @@ impl EngineConfig {
                 reason: "cannot exceed maximum_concurrent_searches",
             });
         }
-        if self.cuda.delta_candidate_count > self.cuda.delta_candidates.len() {
-            return Err(EngineConfigError::InvalidCudaValue {
-                field: "delta_candidate_count",
-                reason: "exceeds the fixed candidate array",
-            });
-        }
         let selected_delta = match self.cuda.algorithm {
             CudaAlgorithmSelection::DeltaStepping { delta } => Some(delta),
             _ => None,
         };
         if selected_delta
             .into_iter()
-            .chain(
-                self.cuda.delta_candidates[..self.cuda.delta_candidate_count]
-                    .iter()
-                    .copied(),
-            )
             .any(|delta| !delta.is_finite() || delta <= 0.0)
         {
             return Err(EngineConfigError::InvalidCudaValue {
@@ -410,7 +450,9 @@ pub struct EngineRoutingResponse {
 /// # Ok(()) }
 /// ```
 ///
-/// An eligible distance-only request preserves the common routing response:
+/// An eligible unlimited-budget request preserves the common routing response.
+/// CUDA supplies exact distances; when paths are requested, the same acquired
+/// CPU image supplies cancellation-aware, bit-verified edge evidence:
 ///
 /// ```no_run
 /// # use pathhydra_engine::{CudaConfig, CudaExecutorPolicy, EngineConfig, GraphEngine, RequestId};
@@ -526,18 +568,20 @@ pub struct EngineRoutingResponse {
 /// # Ok(()) }
 /// ```
 pub struct GraphEngine {
-    pub(crate) catalog: Catalog,
+    pub(crate) catalog: Mutex<Option<Arc<Catalog>>>,
     pub(crate) config: EngineConfig,
     pub(crate) routing: RwLock<RoutingState>,
     routing_image_root: PathBuf,
     admission: AdmissionController,
     requests: RequestRegistry,
+    pub(crate) lifecycle: LifecycleController,
     retirement: RetirementManager,
     publication_faults: PublicationFaultInjection,
     startup_image_outcome: StartupImageOutcome,
     startup_image_duration: Duration,
     cancellations: AtomicU64,
     image_build_failures: AtomicU64,
+    publication_active: AtomicBool,
     cuda_availability: RwLock<CudaAvailability>,
     last_image_corruption: RwLock<Option<String>>,
     last_cuda_degradation: RwLock<Option<String>>,
@@ -548,6 +592,14 @@ pub struct GraphEngine {
     cuda_context_reinitializations: AtomicU64,
     #[cfg(feature = "cuda")]
     cuda_runtime: RwLock<Option<Arc<CudaRuntime>>>,
+}
+
+struct PublicationActivity<'a>(&'a AtomicBool);
+
+impl Drop for PublicationActivity<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl GraphEngine {
@@ -564,9 +616,43 @@ impl GraphEngine {
                 })?
                 .join(path)
         };
-        let catalog = Catalog::open(&database_path)?;
         let routing_image_root =
             resolve_routing_image_root(&database_path, config.routing_image_root.as_deref())?;
+        let database_root = database_path.parent().ok_or(EngineError::Configuration(
+            EngineConfigError::InvalidRoutingImageValue {
+                field: "database_path",
+                reason: "database path has no parent",
+            },
+        ))?;
+        let routing_root = routing_image_root
+            .parent()
+            .ok_or(EngineError::Configuration(
+                EngineConfigError::InvalidRoutingImageValue {
+                    field: "routing_image_root",
+                    reason: "routing-image path has no parent",
+                },
+            ))?;
+        validate_operational_paths(&OperationalPathRequest {
+            database: Some(PathTarget {
+                root: database_root,
+                path: &database_path,
+                must_exist: false,
+                must_be_fresh: false,
+            }),
+            routing_images: Some(PathTarget {
+                root: routing_root,
+                path: &routing_image_root,
+                must_exist: false,
+                must_be_fresh: false,
+            }),
+            ..OperationalPathRequest::default()
+        })?;
+        let catalog = Catalog::open_with_config(
+            &database_path,
+            CatalogConfig {
+                maximum_concurrent_checkpoints: config.maximum_concurrent_checkpoints,
+            },
+        )?;
         fs::create_dir_all(&routing_image_root).map_err(|error| {
             EngineError::RoutingUnavailable(RoutingUnavailableReason::Bundle(error.to_string()))
         })?;
@@ -574,14 +660,6 @@ impl GraphEngine {
             .active_routing_image()?
             .map(|pointer| pointer.relative_bundle().to_owned());
         cleanup_startup_children(&routing_image_root, current_bundle_name.as_deref())?;
-        if fs::canonicalize(&database_path).ok() == fs::canonicalize(&routing_image_root).ok() {
-            return Err(EngineError::Configuration(
-                EngineConfigError::InvalidRoutingImageValue {
-                    field: "routing_image_root",
-                    reason: "must not be the RocksDB directory",
-                },
-            ));
-        }
         let (routing, failed, startup_image_outcome, startup_image_corruption) =
             Self::initial_routing_state(&catalog, &routing_image_root, &config)?;
         let startup_image_duration = routing.last_build().duration();
@@ -597,7 +675,7 @@ impl GraphEngine {
             CudaAvailability::SupportNotCompiled
         };
         let engine = Self {
-            catalog,
+            catalog: Mutex::new(Some(Arc::new(catalog))),
             config: config.clone(),
             routing: RwLock::new(routing),
             routing_image_root: routing_image_root.clone(),
@@ -606,6 +684,7 @@ impl GraphEngine {
                 config.max_reserved_route_bytes,
             ),
             requests: RequestRegistry::new(),
+            lifecycle: LifecycleController::new(config.maximum_maintenance_workers),
             retirement: RetirementManager::new(
                 routing_image_root.clone(),
                 config.maximum_retired_bundle_count,
@@ -616,6 +695,7 @@ impl GraphEngine {
             startup_image_duration,
             cancellations: AtomicU64::new(0),
             image_build_failures: AtomicU64::new(u64::from(failed)),
+            publication_active: AtomicBool::new(false),
             cuda_availability: RwLock::new(initial_cuda_availability),
             last_image_corruption: RwLock::new(startup_image_corruption),
             last_cuda_degradation: RwLock::new(None),
@@ -633,6 +713,24 @@ impl GraphEngine {
         Ok(engine)
     }
 
+    fn catalog_guard(&self) -> Result<MutexGuard<'_, Option<Arc<Catalog>>>, EngineError> {
+        self.catalog.lock().map_err(|_| EngineError::LockPoisoned {
+            lock: "catalog ownership",
+        })
+    }
+
+    pub(crate) fn with_catalog<T>(
+        &self,
+        operation: impl FnOnce(&Catalog) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        let catalog = self
+            .catalog_guard()?
+            .as_ref()
+            .cloned()
+            .ok_or(crate::LifecycleError::ShutDown)?;
+        operation(&catalog)
+    }
+
     #[must_use]
     pub fn capabilities(&self) -> EngineCapabilities {
         let availability = self.cuda_availability.read().map_or(
@@ -648,19 +746,34 @@ impl GraphEngine {
 
     pub fn health(&self) -> Result<EngineHealth, EngineError> {
         self.retirement.reap();
+        let lifecycle = self.lifecycle.snapshot()?;
         let routing = self.routing.read().map_err(|_| EngineError::LockPoisoned {
             lock: "published routing state",
         })?;
         let admission = self.admission.snapshot()?;
         let cuda = self.cuda_health(&routing)?;
+        let (durable_catalog_available, store) = {
+            let catalog = self.catalog_guard()?.as_ref().cloned();
+            match catalog {
+                Some(catalog) => (true, Some(catalog.metrics_snapshot()?)),
+                None => (false, None),
+            }
+        };
         Ok(EngineHealth {
-            durable_catalog_available: true,
-            routing: routing
-                .unavailable_reason()
-                .cloned()
-                .map_or(RoutingHealth::Available, RoutingHealth::Unavailable),
+            durable_catalog_available,
+            lifecycle,
+            store,
+            routing: if lifecycle.state == crate::EngineLifecycleState::ShutDown {
+                RoutingHealth::ShutDown
+            } else {
+                routing
+                    .unavailable_reason()
+                    .cloned()
+                    .map_or(RoutingHealth::Available, RoutingHealth::Unavailable)
+            },
             current_image_manifest: routing.manifest(),
             current_image_age: routing.age(),
+            active_image_references: routing.execution_lease_count(),
             current_bundle: routing
                 .execution()
                 .ok()
@@ -707,13 +820,337 @@ impl GraphEngine {
         })
     }
 
+    pub fn lifecycle_snapshot(&self) -> Result<crate::LifecycleSnapshot, EngineError> {
+        Ok(self.lifecycle.snapshot()?)
+    }
+
+    #[must_use]
+    pub fn publication_in_progress(&self) -> bool {
+        self.publication_active.load(Ordering::Acquire)
+    }
+
+    pub fn catalog_summary(&self) -> Result<CatalogSummary, EngineError> {
+        self.with_catalog(|catalog| Ok(catalog.summary()?))
+    }
+
+    pub fn verify_catalog(
+        &self,
+        limits: VerificationLimits,
+    ) -> Result<VerificationReport, EngineError> {
+        let _operation = self.lifecycle.begin_maintenance()?;
+        self.with_catalog(|catalog| Ok(catalog.verify(self.bounded_verification_limits(limits))?))
+    }
+
+    pub fn store_metrics(&self) -> Result<StoreMetricsSnapshot, EngineError> {
+        self.with_catalog(|catalog| Ok(catalog.metrics_snapshot()?))
+    }
+
+    pub fn create_checkpoint(
+        &self,
+        request: &CheckpointRequest,
+    ) -> Result<CheckpointReport, EngineError> {
+        let _operation = self.lifecycle.begin_checkpoint()?;
+        self.with_catalog(|catalog| Ok(catalog.create_checkpoint(request)?))
+    }
+
+    pub fn compact_store(&self) -> Result<CompactionReport, EngineError> {
+        let _operation = self.lifecycle.begin_maintenance()?;
+        self.with_catalog(|catalog| Ok(catalog.compact_all()?))
+    }
+
+    /// Restores a database-only checkpoint into a fresh destination, opens the
+    /// restored catalog through the production engine path, rebuilds routing,
+    /// performs aggregate smoke verification, and explicitly shuts the
+    /// temporary engine down. Caller-controlled cutover remains separate.
+    pub fn restore_checkpoint(
+        request: &EngineRestoreRequest,
+    ) -> Result<EngineRestoreReport, EngineError> {
+        let mut store_request = request.store.clone();
+        store_request.verification_limits = bounded_verification_limits(
+            store_request.verification_limits,
+            request.engine_config.maximum_verification_records,
+            request.engine_config.maximum_verification_duration,
+        );
+        let store = pathhydra_store::restore_checkpoint(&store_request)?;
+        let engine = Self::open(&request.store.destination, request.engine_config.clone())?;
+        let summary = engine.catalog_summary()?;
+        let health = engine.health()?;
+        let restored_summary = &store.restored_catalog.summary;
+        let smoke_catalog_verified = summary.candidates == restored_summary.candidates
+            && summary.confirmed_nodes == restored_summary.confirmed_nodes
+            && summary.relation_kinds == restored_summary.relation_kinds
+            && summary.confirmed_edges == restored_summary.confirmed_edges
+            && summary.node_name_entries == restored_summary.node_name_entries
+            && summary.relation_name_entries == restored_summary.relation_name_entries
+            && summary.outgoing_entries == restored_summary.outgoing_entries
+            && summary.incoming_entries == restored_summary.incoming_entries
+            && matches!(health.routing, RoutingHealth::Available);
+        let records = engine.with_catalog(|catalog| Ok(catalog.confirmed_graph_records()?))?;
+        let profile = RelationProfile::new(records.relation_kinds().iter().map(|relation| {
+            (
+                relation.id(),
+                RelationUse::Enabled(RelationMultiplier::new(1.0).expect("one is valid")),
+            )
+        }));
+        let (smoke_route_verified, smoke_hydration_verified) =
+            if let Some(node) = records.nodes().first() {
+                let routed = engine.route(
+                    RequestId::new(u64::MAX - 1),
+                    &RoutingRequest::new(
+                        node.id(),
+                        [node.id()],
+                        profile.clone(),
+                        true,
+                        SearchBudget::Unlimited,
+                        TiePolicy::StablePredecessor,
+                    ),
+                )?;
+                let route_ok = matches!(
+                    routed.response.results().first().map(|result| result.state()),
+                    Some(DestinationState::Exact(exact))
+                        if exact.logical_distance().to_bits() == 0.0_f64.to_bits()
+                );
+                let hydrated = engine.hydrate(&HydrationRequest::new(
+                    [node.id()],
+                    records.edges().first().map(EdgeRecord::id),
+                    Some(profile),
+                ))?;
+                let hydration_ok = matches!(
+                    hydrated.nodes.first().map(|result| &result.state),
+                    Some(HydratedNodeState::Found(record)) if record.id() == node.id()
+                );
+                (route_ok, hydration_ok)
+            } else {
+                (true, true)
+            };
+        let cuda_initialized = !request.engine_config.cuda.enabled
+            || matches!(health.cuda.availability, CudaAvailability::Available);
+        let routing_image = health.last_image_build;
+        let shutdown = engine.shutdown()?;
+        if !smoke_catalog_verified {
+            return Err(EngineError::RestoreSmokeFailed("catalog"));
+        }
+        if !smoke_route_verified {
+            return Err(EngineError::RestoreSmokeFailed("route"));
+        }
+        if !smoke_hydration_verified {
+            return Err(EngineError::RestoreSmokeFailed("hydration"));
+        }
+        if !cuda_initialized {
+            return Err(EngineError::RestoreSmokeFailed("CUDA initialization"));
+        }
+        if !shutdown.complete() {
+            return Err(EngineError::RestoreSmokeFailed("shutdown"));
+        }
+        Ok(EngineRestoreReport {
+            store,
+            routing_image,
+            smoke_catalog_verified,
+            smoke_route_verified,
+            smoke_hydration_verified,
+            cuda_initialized,
+            shutdown,
+        })
+    }
+
+    /// Closes admission, cancels and drains active work, joins owned workers,
+    /// flushes RocksDB, and releases the catalog handle. A timed-out or failed
+    /// call leaves the engine closing; calling `shutdown` again safely retries.
+    pub fn shutdown(&self) -> Result<ShutdownReport, EngineError> {
+        let started = Instant::now();
+        let before = self.lifecycle.snapshot()?;
+        if before.state == crate::EngineLifecycleState::ShutDown {
+            return Ok(ShutdownReport {
+                state_before: before.state,
+                state_after: before.state,
+                already_shut_down: true,
+                active_before: before.active,
+                drain: crate::DrainOutcome {
+                    drained: true,
+                    remaining: before.active,
+                    duration: Duration::ZERO,
+                },
+                drained: crate::ActiveOperationCounts::default(),
+                active_requests_signalled: 0,
+                newly_signalled_requests: 0,
+                partition_io_stopped: false,
+                cuda_worker: None,
+                store_flush_duration: None,
+                retired_bundles: self.retirement.snapshot(),
+                duration: started.elapsed(),
+                failures: Vec::new(),
+            });
+        }
+
+        self.lifecycle.close_admission()?;
+        let shutdown_active_before = self
+            .lifecycle
+            .snapshot()?
+            .shutdown_active_before
+            .unwrap_or(before.active);
+        let cancelled = self.requests.cancel_all()?;
+        let drain = self
+            .lifecycle
+            .wait_for_drain(self.config.shutdown_drain_timeout)?;
+        if !drain.drained {
+            return Ok(ShutdownReport {
+                state_before: before.state,
+                state_after: crate::EngineLifecycleState::Closing,
+                already_shut_down: false,
+                active_before: shutdown_active_before,
+                drain,
+                drained: drained_operations(shutdown_active_before, drain.remaining),
+                active_requests_signalled: cancelled.active,
+                newly_signalled_requests: cancelled.newly_signalled,
+                partition_io_stopped: false,
+                cuda_worker: None,
+                store_flush_duration: None,
+                retired_bundles: self.retirement.snapshot(),
+                duration: started.elapsed(),
+                failures: vec![ShutdownFailure {
+                    stage: ShutdownFailureStage::Drain,
+                    category: "drain-timeout",
+                }],
+            });
+        }
+
+        let partition_io_shutdown = {
+            let mut state = self
+                .routing
+                .write()
+                .map_err(|_| EngineError::LockPoisoned {
+                    lock: "published routing state",
+                })?;
+            let last_build = state.last_build().clone();
+            let previous = std::mem::replace(&mut *state, RoutingState::ShutDown { last_build });
+            let stopped = previous
+                .execution()
+                .map_or(Ok(false), |execution| execution.cpu.shutdown_io());
+            drop(previous);
+            stopped
+        };
+
+        #[cfg(feature = "cuda")]
+        let cuda_worker = {
+            let mut slot = self
+                .cuda_runtime
+                .write()
+                .map_err(|_| EngineError::LockPoisoned {
+                    lock: "CUDA runtime",
+                })?;
+            slot.take().map(|runtime| match Arc::try_unwrap(runtime) {
+                Ok(mut runtime) => {
+                    let report = runtime.worker.shutdown();
+                    CudaWorkerShutdownReport {
+                        queued_at_request: report.queued_at_request,
+                        active_at_request: report.active_at_request,
+                        queued_routes_rejected: report.queued_routes_rejected,
+                        joined: report.joined,
+                    }
+                }
+                Err(runtime) => {
+                    *slot = Some(runtime);
+                    CudaWorkerShutdownReport {
+                        joined: false,
+                        ..CudaWorkerShutdownReport::default()
+                    }
+                }
+            })
+        };
+        #[cfg(not(feature = "cuda"))]
+        let cuda_worker: Option<CudaWorkerShutdownReport> = None;
+
+        let mut failures = Vec::new();
+        let partition_io_stopped = match partition_io_shutdown {
+            Ok(stopped) => stopped,
+            Err(_) => {
+                failures.push(ShutdownFailure {
+                    stage: ShutdownFailureStage::RoutingIo,
+                    category: "worker-join-failed",
+                });
+                false
+            }
+        };
+        if cuda_worker.as_ref().is_some_and(|report| !report.joined) {
+            failures.push(ShutdownFailure {
+                stage: ShutdownFailureStage::CudaWorker,
+                category: "worker-reference-still-active",
+            });
+        }
+
+        let store_flush_duration = {
+            let mut catalog = self.catalog_guard()?;
+            match catalog.take() {
+                None => None,
+                Some(value) => match Arc::try_unwrap(value) {
+                    Err(value) => {
+                        *catalog = Some(value);
+                        failures.push(ShutdownFailure {
+                            stage: ShutdownFailureStage::StoreHandle,
+                            category: "catalog-reference-still-active",
+                        });
+                        None
+                    }
+                    Ok(value) => match value.prepare_for_close() {
+                        Ok(report) => {
+                            let duration = report.duration;
+                            drop(value);
+                            Some(duration)
+                        }
+                        Err(_) => {
+                            *catalog = Some(Arc::new(value));
+                            failures.push(ShutdownFailure {
+                                stage: ShutdownFailureStage::StoreFlush,
+                                category: "durability-flush-failed",
+                            });
+                            None
+                        }
+                    },
+                },
+            }
+        };
+
+        self.retirement.reap();
+        if failures.is_empty() {
+            self.lifecycle.mark_shut_down()?;
+        }
+        let after = self.lifecycle.snapshot()?.state;
+        Ok(ShutdownReport {
+            state_before: before.state,
+            state_after: after,
+            already_shut_down: false,
+            active_before: shutdown_active_before,
+            drain,
+            drained: drained_operations(shutdown_active_before, drain.remaining),
+            active_requests_signalled: cancelled.active,
+            newly_signalled_requests: cancelled.newly_signalled,
+            partition_io_stopped,
+            cuda_worker,
+            store_flush_duration,
+            retired_bundles: self.retirement.snapshot(),
+            duration: started.elapsed(),
+            failures,
+        })
+    }
+
+    fn bounded_verification_limits(&self, requested: VerificationLimits) -> VerificationLimits {
+        bounded_verification_limits(
+            requested,
+            self.config.maximum_verification_records,
+            self.config.maximum_verification_duration,
+        )
+    }
+
     pub fn rebuild_routing_image(&self) -> Result<ImageBuildReport, EngineError> {
+        let _operation = self.lifecycle.begin_maintenance()?;
         let mut state = self
             .routing
             .write()
             .map_err(|_| EngineError::LockPoisoned {
                 lock: "published routing state",
             })?;
+        self.publication_active.store(true, Ordering::Release);
+        let _publication_activity = PublicationActivity(&self.publication_active);
         self.await_retirement_capacity(&state);
         let (result, report) = self.compile_current_image();
         match result {
@@ -737,6 +1174,7 @@ impl GraphEngine {
                         *old_reason = reason;
                         *last_build = report.clone();
                     }
+                    RoutingState::ShutDown { last_build } => *last_build = report.clone(),
                 }
             }
         }
@@ -779,11 +1217,7 @@ impl GraphEngine {
             .map_err(EngineError::RoutingUnavailable)?;
         match execution.cuda.as_ref() {
             Some(CudaTopology::Partitioned(image)) => Ok(image.fault_injection()),
-            Some(CudaTopology::Resident(_)) => Err(EngineError::CudaIneligible(
-                CudaIneligibility::NoResidentImage(
-                    "current CUDA topology is resident, not partitioned".to_owned(),
-                ),
-            )),
+            Some(CudaTopology::Resident(image)) => Ok(image.fault_injection()),
             None => Err(EngineError::CudaIneligible(
                 CudaIneligibility::NoResidentImage("CUDA image is unavailable".to_owned()),
             )),
@@ -792,6 +1226,7 @@ impl GraphEngine {
 
     /// Re-uploads only the current CPU image to the existing healthy CUDA context.
     pub fn rebuild_cuda_residency(&self) -> Result<(), EngineError> {
+        let _operation = self.lifecycle.begin_maintenance()?;
         if !self.config.cuda.enabled {
             return Err(EngineError::CudaIneligible(CudaIneligibility::Disabled));
         }
@@ -854,6 +1289,7 @@ impl GraphEngine {
 
     /// Creates a fresh CUDA context and restores residency from the current CPU image.
     pub fn reinitialize_cuda(&self) -> Result<(), EngineError> {
+        let _operation = self.lifecycle.begin_maintenance()?;
         if !self.config.cuda.enabled {
             return Err(EngineError::CudaIneligible(CudaIneligibility::Disabled));
         }
@@ -921,6 +1357,7 @@ impl GraphEngine {
         request_id: RequestId,
         request: &RoutingRequest,
     ) -> Result<EngineRoutingResponse, EngineError> {
+        let _operation = self.lifecycle.begin_route()?;
         if request.destinations().len() > self.config.max_destinations_per_request {
             return Err(self.admission.reject_destinations(
                 request.destinations().len(),
@@ -940,8 +1377,6 @@ impl GraphEngine {
         let policy = self.config.cuda.executor_policy;
         let cuda_shape_refusal = if !self.config.cuda.enabled {
             Some(CudaIneligibility::Disabled)
-        } else if request.return_paths() {
-            Some(CudaIneligibility::PathsUnsupportedByCuda)
         } else if request.budget() != pathhydra_routing::SearchBudget::Unlimited {
             Some(CudaIneligibility::FiniteEdgeBudgetUnsupportedByCuda)
         } else {
@@ -990,11 +1425,25 @@ impl GraphEngine {
                             break 'cuda_attempt;
                         }
                         let algorithm = runtime.algorithm();
-                        let search_bytes = pathhydra_cuda::estimate_search_bytes(
+                        let cpu_evidence_working_bytes = if request.return_paths() {
+                            Some(match &execution.cpu {
+                                CpuTopology::Resident { image, .. } => {
+                                    estimate_cpu_working_set(image, request)?.bytes()
+                                }
+                                CpuTopology::Partitioned(image) => {
+                                    image.estimate_working_set(request)?.bytes()
+                                }
+                            })
+                        } else {
+                            None
+                        };
+                        let search_bytes = pathhydra_cuda::estimate_search_bytes_for_request(
                             manifest.node_count(),
                             manifest.relation_kind_count(),
+                            manifest.adjacency_count(),
                             request.destinations().len(),
                             algorithm,
+                            cpu_evidence_working_bytes,
                         )
                         .map_err(|error| {
                             EngineError::CudaIneligible(CudaIneligibility::ResourceRefusal(
@@ -1086,13 +1535,37 @@ impl GraphEngine {
                                                 relaxation_attempts: cuda.relaxation_attempts,
                                                 relaxation_updates: cuda.relaxation_updates,
                                                 phases: cuda.phases,
-                                                frontier_high_water: cuda.frontier_high_water,
                                                 partitions_required: cuda.partitions_required,
                                                 host_cache_hits: cuda.host_cache_hits,
                                                 device_cache_hits: cuda.device_cache_hits,
                                                 file_bytes: cuda.file_bytes,
                                                 staged_bytes: cuda.staged_bytes,
                                                 transfer_bytes: cuda.transfer_bytes,
+                                                parallel_strategy: "relation-threads-atomic-binary64",
+                                                reset_mode: "explicit-clear",
+                                                target_mode: "sorted-sparse-host",
+                                                profile_mode: "inline-exact",
+                                                path_evidence_mode: if request.return_paths() {
+                                                    "cpu-pass-same-image"
+                                                } else {
+                                                    "not-requested"
+                                                },
+                                                state_initialization_duration: cuda
+                                                    .state_initialization_duration,
+                                                partition_scheduling_duration: cuda
+                                                    .partition_scheduling_duration,
+                                                relation_relaxation_duration: cuda
+                                                    .relation_relaxation_duration,
+                                                response_transfer_duration: cuda
+                                                    .response_transfer_duration,
+                                                frontier_compaction_duration: cuda
+                                                    .frontier_compaction_duration,
+                                                compacted_task_count: cuda.compacted_task_count,
+                                                destination_completion_duration: cuda
+                                                    .destination_completion_duration,
+                                                destination_count_checked: cuda
+                                                    .destination_count_checked,
+                                                atomic_cas_retries: cuda.atomic_cas_retries,
                                             }),
                                         };
                                         return Ok(EngineRoutingResponse {
@@ -1235,22 +1708,23 @@ impl GraphEngine {
         &self,
         name: impl Into<NodeName>,
     ) -> Result<CandidateId, EngineError> {
-        Ok(self.catalog.insert_node_candidate(name)?)
+        let _operation = self.lifecycle.begin_mutation()?;
+        self.with_catalog(|catalog| Ok(catalog.insert_node_candidate(name)?))
     }
     pub fn insert_node_candidate_with_payload(
         &self,
         name: impl Into<NodeName>,
         payload: impl Into<NodePayload>,
     ) -> Result<CandidateId, EngineError> {
-        Ok(self
-            .catalog
-            .insert_node_candidate_with_payload(name, payload)?)
+        let _operation = self.lifecycle.begin_mutation()?;
+        self.with_catalog(|catalog| Ok(catalog.insert_node_candidate_with_payload(name, payload)?))
     }
     pub fn insert_relation_candidate(
         &self,
         name: impl Into<RelationName>,
     ) -> Result<CandidateId, EngineError> {
-        Ok(self.catalog.insert_relation_candidate(name)?)
+        let _operation = self.lifecycle.begin_mutation()?;
+        self.with_catalog(|catalog| Ok(catalog.insert_relation_candidate(name)?))
     }
     pub fn insert_edge_candidate(
         &self,
@@ -1259,9 +1733,10 @@ impl GraphEngine {
         relation_kind: RelationId,
         base_weight: f32,
     ) -> Result<CandidateId, EngineError> {
-        Ok(self
-            .catalog
-            .insert_edge_candidate(source, destination, relation_kind, base_weight)?)
+        let _operation = self.lifecycle.begin_mutation()?;
+        self.with_catalog(|catalog| {
+            Ok(catalog.insert_edge_candidate(source, destination, relation_kind, base_weight)?)
+        })
     }
     pub fn insert_edge_candidate_with_base_weight(
         &self,
@@ -1270,30 +1745,33 @@ impl GraphEngine {
         relation_kind: RelationId,
         base_weight: BaseWeight,
     ) -> Result<CandidateId, EngineError> {
-        Ok(self.catalog.insert_edge_candidate_with_base_weight(
-            source,
-            destination,
-            relation_kind,
-            base_weight,
-        )?)
+        let _operation = self.lifecycle.begin_mutation()?;
+        self.with_catalog(|catalog| {
+            Ok(catalog.insert_edge_candidate_with_base_weight(
+                source,
+                destination,
+                relation_kind,
+                base_weight,
+            )?)
+        })
     }
     pub fn get_candidate(&self, id: CandidateId) -> Result<Candidate, EngineError> {
-        Ok(self.catalog.get_candidate(id)?)
+        self.with_catalog(|catalog| Ok(catalog.get_candidate(id)?))
     }
     pub fn lookup_node_exact(&self, name: &str) -> Result<Option<NodeId>, EngineError> {
-        Ok(self.catalog.lookup_node_exact(name)?)
+        self.with_catalog(|catalog| Ok(catalog.lookup_node_exact(name)?))
     }
     pub fn lookup_relation_exact(&self, name: &str) -> Result<Option<RelationId>, EngineError> {
-        Ok(self.catalog.lookup_relation_exact(name)?)
+        self.with_catalog(|catalog| Ok(catalog.lookup_relation_exact(name)?))
     }
     pub fn get_node(&self, id: NodeId) -> Result<NodeRecord, EngineError> {
-        Ok(self.catalog.get_node(id)?)
+        self.with_catalog(|catalog| Ok(catalog.get_node(id)?))
     }
     pub fn get_relation(&self, id: RelationId) -> Result<RelationRecord, EngineError> {
-        Ok(self.catalog.get_relation(id)?)
+        self.with_catalog(|catalog| Ok(catalog.get_relation(id)?))
     }
     pub fn get_edge(&self, id: EdgeId) -> Result<EdgeRecord, EngineError> {
-        Ok(self.catalog.get_edge(id)?)
+        self.with_catalog(|catalog| Ok(catalog.get_edge(id)?))
     }
 
     pub fn confirm_validated_candidate(
@@ -1313,14 +1791,22 @@ impl GraphEngine {
         &self,
         mutation: impl FnOnce(&Catalog) -> Result<T, pathhydra_store::CatalogError>,
     ) -> Result<ConfirmedMutation<T>, EngineError> {
+        let _operation = self.lifecycle.begin_mutation()?;
         let mut state = self
             .routing
             .write()
             .map_err(|_| EngineError::LockPoisoned {
                 lock: "published routing state",
             })?;
+        self.publication_active.store(true, Ordering::Release);
+        let _publication_activity = PublicationActivity(&self.publication_active);
         self.await_retirement_capacity(&state);
-        let durable_result = mutation(&self.catalog)?;
+        let catalog = self
+            .catalog_guard()?
+            .as_ref()
+            .cloned()
+            .ok_or(crate::LifecycleError::ShutDown)?;
+        let durable_result = mutation(&catalog)?;
         let (compiled, report) = self.compile_current_image();
         let publication = match compiled {
             Ok(image) => {
@@ -1480,8 +1966,33 @@ impl GraphEngine {
         ImageBuildReport,
     ) {
         let started = Instant::now();
+        let catalog = match self.catalog_guard() {
+            Ok(guard) => guard.as_ref().cloned(),
+            Err(error) => {
+                let reason = RoutingUnavailableReason::Bundle(error.to_string());
+                let report = ImageBuildReport::new(
+                    started.elapsed(),
+                    ImageBuildOutcome::Failed(reason.clone()),
+                    (0, 0, 0),
+                    None,
+                );
+                return (Err(reason), report);
+            }
+        };
+        let Some(catalog) = catalog else {
+            let reason = RoutingUnavailableReason::Bundle(
+                "the durable catalog is unavailable after shutdown".to_owned(),
+            );
+            let report = ImageBuildReport::new(
+                started.elapsed(),
+                ImageBuildOutcome::Failed(reason.clone()),
+                (0, 0, 0),
+                None,
+            );
+            return (Err(reason), report);
+        };
         let (mut result, counts, bundle_metrics) = build_current_bundle(
-            &self.catalog,
+            &catalog,
             &self.routing_image_root,
             &self.config,
             Some(&self.publication_faults),
@@ -1966,6 +2477,43 @@ fn trip_publication(
     faults.map_or(Ok(()), |faults| faults.trip(stage))
 }
 
+fn bounded_verification_limits(
+    requested: VerificationLimits,
+    maximum_records: u64,
+    maximum_duration: Duration,
+) -> VerificationLimits {
+    VerificationLimits {
+        maximum_records: Some(
+            requested
+                .maximum_records
+                .map_or(maximum_records, |value| value.min(maximum_records)),
+        ),
+        maximum_duration: Some(
+            requested
+                .maximum_duration
+                .map_or(maximum_duration, |value| value.min(maximum_duration)),
+        ),
+    }
+}
+
+fn drained_operations(
+    before: crate::ActiveOperationCounts,
+    remaining: crate::ActiveOperationCounts,
+) -> crate::ActiveOperationCounts {
+    crate::ActiveOperationCounts {
+        routes: before.routes.saturating_sub(remaining.routes),
+        mutations: before.mutations.saturating_sub(remaining.mutations),
+        checkpoints: before.checkpoints.saturating_sub(remaining.checkpoints),
+        maintenance: before.maintenance.saturating_sub(remaining.maintenance),
+    }
+}
+
+impl Drop for GraphEngine {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
 fn saturating_increment(counter: &AtomicU64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_add(1))
@@ -2072,6 +2620,136 @@ mod tests {
                 .node_count(),
             8
         );
+    }
+
+    #[test]
+    fn shutdown_cancels_a_real_active_partitioned_route_and_retry_joins_io() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            GraphEngine::open(
+                root.path().join("catalog"),
+                EngineConfig {
+                    max_active_image_bytes: 8,
+                    target_partition_topology_bytes: 48,
+                    hard_maximum_partition_topology_bytes: 48,
+                    host_partition_cache_bytes: 112,
+                    host_partition_cache_entries: 1,
+                    routing_io_staging_bytes: 56,
+                    routing_io_worker_count: 1,
+                    maximum_queued_partition_reads: 1,
+                    routing_image_root: Some(root.path().join("routing")),
+                    shutdown_drain_timeout: Duration::from_millis(1),
+                    ..EngineConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let source = confirm_node(&engine, "source");
+        let destination = confirm_node(&engine, "destination");
+        let relation_candidate = engine.insert_relation_candidate("relation").unwrap();
+        let ConfirmedRecord::Relation(relation) = engine
+            .confirm_validated_candidate(relation_candidate)
+            .unwrap()
+            .into_parts()
+            .0
+        else {
+            panic!("expected relation")
+        };
+        let edge = engine
+            .insert_edge_candidate(source.id(), destination.id(), relation.id(), 1.0)
+            .unwrap();
+        engine.confirm_validated_candidate(edge).unwrap();
+        let request = RoutingRequest::new(
+            source.id(),
+            [destination.id()],
+            RelationProfile::new([(
+                relation.id(),
+                RelationUse::Enabled(RelationMultiplier::new(1.0).unwrap()),
+            )]),
+            false,
+            SearchBudget::Unlimited,
+            TiePolicy::StablePredecessor,
+        );
+        engine
+            .routing_bundle_fault_injection()
+            .unwrap()
+            .delay_reads(Duration::from_secs(1));
+        let route = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || engine.route(RequestId::new(900), &request))
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let active_routes = engine.lifecycle.snapshot().unwrap().active.routes;
+            let cache = engine
+                .routing
+                .read()
+                .unwrap()
+                .execution()
+                .unwrap()
+                .cpu
+                .host_cache()
+                .unwrap();
+            if active_routes == 1 && cache.misses > 0 && cache.queue_depth > 0 {
+                break;
+            }
+            assert!(
+                !route.is_finished(),
+                "route finished before entering partition I/O"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "route never entered partition I/O"
+            );
+            std::thread::yield_now();
+        }
+
+        let first = engine.shutdown().unwrap();
+        assert!(!first.complete());
+        assert!(!first.drain.drained);
+        assert_eq!(first.active_requests_signalled, 1);
+        assert_eq!(first.newly_signalled_requests, 1);
+        assert_eq!(first.drain.remaining.routes, 1);
+        assert_eq!(first.failures[0].stage, ShutdownFailureStage::Drain);
+        let _ = route.join().unwrap();
+
+        let retried = engine.shutdown().unwrap();
+        assert!(retried.complete(), "{:#?}", retried.failures);
+        assert!(retried.drain.drained);
+        assert_eq!(retried.active_before.routes, 1);
+        assert_eq!(retried.drained.routes, 1);
+        assert!(retried.partition_io_stopped);
+    }
+
+    #[test]
+    fn maintenance_contention_is_refused_through_the_engine_api() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = GraphEngine::open(
+            root.path().join("catalog"),
+            EngineConfig {
+                routing_image_root: Some(root.path().join("routing")),
+                maximum_maintenance_workers: 1,
+                maximum_queued_maintenance: 0,
+                ..EngineConfig::default()
+            },
+        )
+        .unwrap();
+        let active = engine.lifecycle.begin_maintenance().unwrap();
+        assert!(matches!(
+            engine.verify_catalog(VerificationLimits::default()),
+            Err(EngineError::Lifecycle(
+                crate::LifecycleError::MaintenanceBusy { maximum_workers: 1 }
+            ))
+        ));
+        assert!(matches!(
+            engine.compact_store(),
+            Err(EngineError::Lifecycle(
+                crate::LifecycleError::MaintenanceBusy { maximum_workers: 1 }
+            ))
+        ));
+        drop(active);
+        assert!(engine.verify_catalog(VerificationLimits::default()).is_ok());
+        assert!(engine.shutdown().unwrap().complete());
     }
 
     #[test]
@@ -2196,7 +2874,14 @@ mod tests {
             let engine = Arc::clone(&engine);
             std::thread::spawn(move || engine.confirm_validated_candidate(candidate).unwrap())
         };
-        std::thread::sleep(Duration::from_millis(30));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.retirement.snapshot().cumulative_backpressure_waits == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "publication did not enter retirement backpressure"
+            );
+            std::thread::yield_now();
+        }
         assert!(!worker.is_finished(), "publication must wait at the limit");
         assert_eq!(engine.retirement.snapshot().bundle_count, 1);
         drop(first_lease);

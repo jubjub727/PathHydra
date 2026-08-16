@@ -142,6 +142,7 @@ pub fn cuda<'a>(
     let reserved = pathhydra_cuda::estimate_search_bytes(
         fixture.image.node_count(),
         fixture.image.relation_kind_count(),
+        fixture.image.adjacency_count(),
         fixture.request.destinations().len(),
         algorithm,
     )
@@ -238,6 +239,7 @@ pub fn partitioned_cuda<'a>(
     let reserved = pathhydra_cuda::estimate_search_bytes(
         chunked.node_count(),
         chunked.relation_kind_count(),
+        chunked.adjacency_count(),
         fixture.request.destinations().len(),
         algorithm,
     )
@@ -284,7 +286,7 @@ pub fn partitioned_cuda<'a>(
     }
 }
 
-fn same_distances(expected: &RoutingResponse, actual: &RoutingResponse) -> bool {
+pub(crate) fn same_distances(expected: &RoutingResponse, actual: &RoutingResponse) -> bool {
     expected
         .results()
         .iter()

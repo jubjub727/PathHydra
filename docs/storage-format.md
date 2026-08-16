@@ -138,6 +138,28 @@ exact-name mappings, and next-ID counters. Malformed or inconsistent
 structures are returned as typed errors; open never repairs, drops,
 deduplicates, or merges them.
 
+Ordinary batches explicitly keep the WAL enabled and do not request a device
+sync. Checkpoint and shutdown hold the catalog mutation boundary, synchronize
+the WAL, synchronously flush every current column family, and only then report
+durability. Checkpoint uses RocksDB's checkpoint API and includes provisional
+and confirmed records while omitting rebuildable routing files. Offline restore
+copies only into a fresh admitted destination, validates the complete current
+layout under caller work/time bounds, clears a stale routing pointer, and then
+uses the production engine to rebuild and smoke the bundle.
+
+The selected database options use four background jobs. The outgoing and
+incoming adjacency families use an eight-byte fixed prefix extractor; all
+other family compression, checksums, write buffers, and table behavior retain
+the current RocksDB defaults. Structured metrics report per-family availability
+rather than converting an unsupported property to zero. Catalog-owned
+maintenance counters and process-owned offline restore counters are kept
+separate so a restore remains observable after its fresh destination opens.
+Checkpoint concurrency refusals count as failed checkpoint attempts. Explicit
+compaction follows background/write-stop observation with a synchronous
+durability probe; a storage-exhausted probe is reported as typed compaction
+storage exhaustion, while a background failure without that capacity evidence
+remains a distinct background failure.
+
 ## Atomic mutations
 
 Candidate insertion writes only the candidate and advances the candidate

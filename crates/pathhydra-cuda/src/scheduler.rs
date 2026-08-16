@@ -19,6 +19,32 @@ use pathhydra_routing::RoutingRequest;
 
 use crate::CudaAlgorithm;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CudaParallelStrategy {
+    RelationThreadsAtomicBinary64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CudaResetMode {
+    ExplicitClear,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CudaTargetMode {
+    SortedSparseHost,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CudaProfileMode {
+    InlineExact,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CudaPathEvidenceMode {
+    CpuPassSameImage,
+    NotRequested,
+}
+
 #[cfg(feature = "cuda")]
 use crate::{CudaError, CudaFailureKind, CudaPartitionedImage, CudaResidentImage};
 
@@ -38,13 +64,26 @@ pub struct CudaRouteDiagnostics {
     pub relaxation_attempts: u64,
     pub relaxation_updates: u64,
     pub phases: u64,
-    pub frontier_high_water: u32,
     pub partitions_required: u64,
     pub host_cache_hits: u64,
     pub device_cache_hits: u64,
     pub file_bytes: u64,
     pub staged_bytes: u64,
     pub transfer_bytes: u64,
+    pub parallel_strategy: CudaParallelStrategy,
+    pub reset_mode: CudaResetMode,
+    pub target_mode: CudaTargetMode,
+    pub profile_mode: CudaProfileMode,
+    pub path_evidence_mode: CudaPathEvidenceMode,
+    pub state_initialization_duration: Duration,
+    pub partition_scheduling_duration: Duration,
+    pub relation_relaxation_duration: Duration,
+    pub response_transfer_duration: Duration,
+    pub frontier_compaction_duration: Duration,
+    pub compacted_task_count: u32,
+    pub destination_completion_duration: Duration,
+    pub destination_count_checked: usize,
+    pub atomic_cas_retries: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -101,7 +140,7 @@ impl RouteImage {
 #[cfg(feature = "cuda")]
 enum Command {
     Route(RouteJob),
-    Shutdown,
+    Shutdown(Sender<usize>),
 }
 
 #[cfg(feature = "cuda")]
@@ -134,6 +173,16 @@ pub struct CudaWorker {
     sender: Sender<Command>,
     thread: Option<JoinHandle<()>>,
     counters: Arc<WorkerCounters>,
+    stopping: Arc<AtomicBool>,
+    shutdown: Option<CudaWorkerShutdown>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CudaWorkerShutdown {
+    pub queued_at_request: usize,
+    pub active_at_request: usize,
+    pub queued_routes_rejected: usize,
+    pub joined: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -143,6 +192,8 @@ impl CudaWorker {
         let (sender, receiver) = mpsc::channel();
         let counters = Arc::new(WorkerCounters::default());
         let worker_counters = Arc::clone(&counters);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&stopping);
         let thread = thread::Builder::new()
             .name("pathhydra-cuda".to_owned())
             .spawn(move || {
@@ -151,6 +202,7 @@ impl CudaWorker {
                     maximum_batch_lanes.max(1),
                     batch_delay,
                     worker_counters,
+                    worker_stopping,
                 );
             })
             .expect("the CUDA worker thread must be creatable");
@@ -158,6 +210,8 @@ impl CudaWorker {
             sender,
             thread: Some(thread),
             counters,
+            stopping,
+            shutdown: None,
         }
     }
 
@@ -169,6 +223,9 @@ impl CudaWorker {
         cancellation: Arc<AtomicBool>,
         reserved_search_bytes: usize,
     ) -> Result<CudaRouteOutput, CudaError> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(worker_error("CUDA worker is shutting down"));
+        }
         let (reply, result) = mpsc::channel();
         self.counters.queued.fetch_add(1, Ordering::Relaxed);
         if self
@@ -200,6 +257,9 @@ impl CudaWorker {
         cancellation: Arc<AtomicBool>,
         reserved_search_bytes: usize,
     ) -> Result<CudaRouteOutput, CudaError> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(worker_error("CUDA worker is shutting down"));
+        }
         let (reply, result) = mpsc::channel();
         self.counters.queued.fetch_add(1, Ordering::Relaxed);
         if self
@@ -239,15 +299,38 @@ impl CudaWorker {
                 .is_some_and(|thread| !thread.is_finished()),
         }
     }
+
+    /// Stops admission, rejects work still queued behind active batches, and
+    /// joins the worker. Repeated calls return the first completed report.
+    pub fn shutdown(&mut self) -> CudaWorkerShutdown {
+        if let Some(report) = self.shutdown {
+            return report;
+        }
+        self.stopping.store(true, Ordering::Release);
+        let queued_at_request = self.counters.queued.load(Ordering::Acquire);
+        let active_at_request = self.counters.active.load(Ordering::Acquire);
+        let (reply, result) = mpsc::channel();
+        let sent = self.sender.send(Command::Shutdown(reply)).is_ok();
+        let queued_routes_rejected = if sent { result.recv().unwrap_or(0) } else { 0 };
+        let joined = self
+            .thread
+            .take()
+            .is_none_or(|thread| thread.join().is_ok());
+        let report = CudaWorkerShutdown {
+            queued_at_request,
+            active_at_request,
+            queued_routes_rejected,
+            joined,
+        };
+        self.shutdown = Some(report);
+        report
+    }
 }
 
 #[cfg(feature = "cuda")]
 impl Drop for CudaWorker {
     fn drop(&mut self) {
-        let _ = self.sender.send(Command::Shutdown);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        let _ = self.shutdown();
     }
 }
 
@@ -257,6 +340,7 @@ fn worker_loop(
     maximum_batch_lanes: usize,
     batch_delay: Duration,
     counters: Arc<WorkerCounters>,
+    stopping: Arc<AtomicBool>,
 ) {
     let mut deferred = VecDeque::new();
     loop {
@@ -264,16 +348,32 @@ fn worker_loop(
         let Some(command) = command else {
             return;
         };
-        let Command::Route(first) = command else {
-            for command in deferred.drain(..) {
-                if let Command::Route(job) = command {
-                    let _ = job.reply.send(Err(worker_error(
-                        "CUDA worker shut down before admitting the deferred route",
-                    )));
-                }
+        let first = match command {
+            Command::Route(first) if !stopping.load(Ordering::Acquire) => first,
+            Command::Route(job) => {
+                reject_queued(
+                    job,
+                    &counters,
+                    "CUDA worker rejected a route during shutdown",
+                );
+                continue;
             }
-            drain_queued(&receiver);
-            return;
+            Command::Shutdown(reply) => {
+                let mut rejected = 0;
+                for command in deferred.drain(..) {
+                    if let Command::Route(job) = command {
+                        rejected += 1;
+                        reject_queued(
+                            job,
+                            &counters,
+                            "CUDA worker shut down before admitting the deferred route",
+                        );
+                    }
+                }
+                rejected += drain_queued(&receiver, &counters);
+                let _ = reply.send(rejected);
+                return;
+            }
         };
         let collected_at = Instant::now();
         let mut batch = vec![first];
@@ -283,6 +383,13 @@ fn worker_loop(
                 break;
             }
             match receiver.recv_timeout(remaining) {
+                Ok(Command::Route(job)) if stopping.load(Ordering::Acquire) => {
+                    reject_queued(
+                        job,
+                        &counters,
+                        "CUDA worker rejected a collected route during shutdown",
+                    );
+                }
                 Ok(Command::Route(job))
                     if job.image.ptr_eq(&batch[0].image) && job.algorithm == batch[0].algorithm =>
                 {
@@ -339,14 +446,25 @@ fn worker_loop(
 }
 
 #[cfg(feature = "cuda")]
-fn drain_queued(receiver: &Receiver<Command>) {
+fn drain_queued(receiver: &Receiver<Command>, counters: &WorkerCounters) -> usize {
+    let mut rejected = 0;
     while let Ok(command) = receiver.try_recv() {
         if let Command::Route(job) = command {
-            let _ = job.reply.send(Err(worker_error(
+            rejected += 1;
+            reject_queued(
+                job,
+                counters,
                 "CUDA worker shut down before admitting the queued route",
-            )));
+            );
         }
     }
+    rejected
+}
+
+#[cfg(feature = "cuda")]
+fn reject_queued(job: RouteJob, counters: &WorkerCounters, message: &'static str) {
+    counters.queued.fetch_sub(1, Ordering::Relaxed);
+    let _ = job.reply.send(Err(worker_error(message)));
 }
 
 #[cfg(feature = "cuda")]

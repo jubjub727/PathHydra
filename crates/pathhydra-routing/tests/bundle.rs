@@ -277,7 +277,7 @@ fn io_loads_coalesce_and_faults_cancellation_and_shutdown_are_typed() {
         },
     )
     .unwrap();
-    image.shutdown_io_workers();
+    image.shutdown_io_workers().unwrap();
     assert!(matches!(
         route_partitioned(&image, &request),
         Err(pathhydra_routing::RoutingError::ImageAccess(_))

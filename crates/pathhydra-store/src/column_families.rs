@@ -1,5 +1,3 @@
-use rocksdb::{ColumnFamilyDescriptor, Options};
-
 pub(crate) const CANDIDATES: &str = "candidates";
 pub(crate) const NODES: &str = "nodes";
 pub(crate) const NODE_NAMES: &str = "node_names";
@@ -19,8 +17,3 @@ pub(crate) const ALL: [&str; 8] = [
     OUTGOING_EDGES,
     INCOMING_EDGES,
 ];
-
-pub(crate) fn descriptors() -> impl Iterator<Item = ColumnFamilyDescriptor> {
-    ALL.into_iter()
-        .map(|name| ColumnFamilyDescriptor::new(name, Options::default()))
-}

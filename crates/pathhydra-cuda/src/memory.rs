@@ -145,18 +145,45 @@ impl CudaAdmissionController {
 pub fn estimate_search_bytes(
     node_count: usize,
     relation_count: usize,
+    adjacency_count: usize,
     destination_count: usize,
     algorithm: CudaAlgorithm,
 ) -> Result<usize, CudaError> {
+    estimate_search_bytes_for_request(
+        node_count,
+        relation_count,
+        adjacency_count,
+        destination_count,
+        algorithm,
+        None,
+    )
+}
+
+pub fn estimate_search_bytes_for_request(
+    node_count: usize,
+    relation_count: usize,
+    adjacency_count: usize,
+    destination_count: usize,
+    algorithm: CudaAlgorithm,
+    cpu_evidence_working_bytes: Option<usize>,
+) -> Result<usize, CudaError> {
+    // This deliberately covers the worst resident/partitioned overlap: host
+    // initialization and control arrays, device distance/frontier/removed
+    // arrays, one downloaded distance image, and delta bucket state. Topology
+    // cache/staging has its own admission controller.
     let per_node = match algorithm {
-        CudaAlgorithm::Frontier => 8 + 4 + 4 + 4 + 4,
-        CudaAlgorithm::DeltaStepping(_) => 8 + 4 + 4 + 4 + 4 + 4 + 8,
+        CudaAlgorithm::Frontier => 64,
+        CudaAlgorithm::DeltaStepping(_) => 72,
     };
     node_count
         .checked_mul(per_node)
         .and_then(|bytes| bytes.checked_add(relation_count.checked_mul(8)?))
-        .and_then(|bytes| bytes.checked_add(destination_count.checked_mul(16)?))
-        .and_then(|bytes| bytes.checked_add(128))
+        // Worst overlap while resident task compaction uploads one u64 edge
+        // ordinal plus one u32 source per edge: host and device copies coexist.
+        .and_then(|bytes| bytes.checked_add(adjacency_count.checked_mul(24)?))
+        .and_then(|bytes| bytes.checked_add(destination_count.checked_mul(64)?))
+        .and_then(|bytes| bytes.checked_add(cpu_evidence_working_bytes.unwrap_or(0)))
+        .and_then(|bytes| bytes.checked_add(512))
         .ok_or_else(|| {
             CudaError::new(
                 CudaFailureKind::Admission,

@@ -8,15 +8,17 @@ resident topology, partition-cache bytes/slots, pageable staging, search,
 concurrency, batch, and algorithm limits. Configuration values are validated
 before opening a driver where possible.
 
-Capabilities separate compile-time support from runtime availability and list
-the distance-only request subset. Health reports device identity and current
+Capabilities separate compile-time support from runtime availability and name
+the graph-parallel, reset, target, profile, and same-image path-evidence modes.
+Exact path requests are supported; finite examined-edge budgets remain CPU.
+Health reports device identity and current
 free/total memory, resident counts/bytes, worker state, queued/active lanes,
 admission high-water values, device-cache hits/misses/copies/evictions/slot
 waits/in-use slots, uploads, launches, failures, fallbacks,
 cancellations, and context reinitializations. Request diagnostics identify the
 selected executor, reason/fallback, algorithm/delta, lane/batch, bytes,
 partition/file/staged/transfer bytes, launches, synchronized duration, phases,
-and relaxations. No names,
+atomic CAS retries, path-evidence work, and relaxations. No names,
 payloads, complete profiles, or destinations are logged.
 
 The device cache exposes host-loading, copying, evicting, ready, in-use, and
@@ -54,3 +56,10 @@ Windows sharing violations retain retryable retirement state. Backups may omit
 the routing-image root; a restored pointer whose child is absent is cleared and
 rebuilt. `StartupBundlePolicy::RequireValidBundle` can disable automatic startup
 rebuild until an operator calls `rebuild_routing_image`.
+
+Explicit engine shutdown closes admission and cancels/drains routes before it
+asks the CUDA worker to stop. The worker rejects queued lanes, completes the
+active batch through its normal terminal path, joins, and reports queued,
+active, rejected, and joined counts. `Drop` uses the same path and never
+intentionally detaches the worker. A validated restore rebuilds the omitted
+bundle and initializes a fresh context/worker before its route smoke check.

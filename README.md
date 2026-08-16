@@ -20,9 +20,11 @@ flowchart LR
     d -->|relation| g["node"]
 ```
 
-The Rust engine can perform supported distance-only selection on NVIDIA CUDA
-with either complete topology residency or bounded source-segment partitions.
-Hydration and caller-owned subgraph composition remain host operations.
+The Rust engine can perform exact selection on NVIDIA CUDA with either complete
+topology residency or bounded source-segment partitions. When paths are
+requested, CUDA selects exact distances and the acquired CPU image supplies
+verified edge evidence. Hydration and caller-owned subgraph composition remain
+host operations.
 
 ## Core model
 
@@ -71,9 +73,11 @@ post-commit image-build failure. The current boundaries are documented in
 The optional `cuda` feature adds Rust-authored `sm_86` PTX loaded through the
 CUDA Driver API, immutable resident and partition-cached topology, exact
 frontier and delta-stepping distance routing, independent queued lanes, memory
-admission, CPU fallback, health, and explicit recovery. CUDA does not support
-returned paths or finite examined-edge budgets; permissive policies rerun the
-complete request on the CPU representation from the same bundle lease.
+admission, CPU fallback, health, and explicit recovery. Unlimited-budget path
+requests use CUDA distance selection followed by a cancellation-aware CPU
+evidence pass on the same image or bundle lease; distance states must agree
+bit-for-bit before evidence is returned. Finite examined-edge budgets remain a
+CPU-only shape under permissive policies and a typed refusal under `RequireCuda`.
 The local RTX 3080 baseline does not justify automatic acceleration, so `Auto`
 remains conservative and no universal speedup is claimed. See [the CUDA build
 guide](docs/cuda-build.md), [routing contract](docs/cuda-routing.md), and

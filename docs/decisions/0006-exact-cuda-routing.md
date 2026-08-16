@@ -11,11 +11,14 @@ positive infinity represents unvisited state and never becomes a public
 logical distance.
 
 CUDA eligibility is one origin, any destination multiset, a complete explicit
-profile, distance-only output, unlimited examined-edge budget, current numeric
-and tie policies, fixed-width representable counts, a matching fully resident
-image, and a healthy scheduler/device. Paths and finite deterministic
-examined-edge budgets use CPU under `CpuOnly`, `PreferCuda`, and `Auto`, and are
-typed refusals under `RequireCuda`.
+profile, unlimited examined-edge budget, current numeric and tie policies,
+fixed-width representable counts, a matching resident or partitioned image, and
+a healthy scheduler/device. Distance-only output returns CUDA selection
+directly. Path output uses CUDA distance selection followed by a
+cancellation-aware CPU evidence pass on the same acquired image or bundle; all
+destination states and exact logical-distance bits must agree before edge
+evidence is returned. Finite deterministic examined-edge budgets use CPU under
+`CpuOnly`, `PreferCuda`, and `Auto`, and are typed refusals under `RequireCuda`.
 
 `Auto` is conservative: the RTX 3080 baseline shows the initial kernels do not
 provide a stable universal crossover, so automatic routing remains on CPU.

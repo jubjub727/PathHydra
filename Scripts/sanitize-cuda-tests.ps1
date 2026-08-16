@@ -10,5 +10,9 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-& $sanitizer.Source --tool racecheck --error-exitcode 99 --target-processes all cargo test -p pathhydra-cuda --features cuda --test agreement -- --test-threads=1
+# WDDM can overflow Racecheck's launch tracker when the agreement suite
+# deliberately submits from concurrent host threads. Blocking launches keeps
+# the tool's kernel instrumentation complete; ordinary CUDA tests retain the
+# concurrent scheduling coverage.
+& $sanitizer.Source --tool racecheck --force-blocking-launches --error-exitcode 99 --target-processes all cargo test -p pathhydra-cuda --features cuda --test agreement -- --test-threads=1
 exit $LASTEXITCODE

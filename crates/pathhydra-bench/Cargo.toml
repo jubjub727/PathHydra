@@ -6,11 +6,12 @@ publish.workspace = true
 
 [features]
 default = []
-cuda = ["dep:pathhydra-cuda", "pathhydra-cuda/cuda"]
+cuda = ["dep:pathhydra-cuda", "pathhydra-cuda/cuda", "pathhydra-engine/cuda"]
 
 [dependencies]
 pathhydra-core = { path = "../pathhydra-core" }
 pathhydra-cuda = { path = "../pathhydra-cuda", optional = true }
+pathhydra-engine = { path = "../pathhydra-engine" }
 pathhydra-routing = { path = "../pathhydra-routing" }
 pathhydra-store = { path = "../pathhydra-store" }
 tempfile = "3.27.0"

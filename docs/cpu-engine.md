@@ -1,10 +1,10 @@
 # Graph engine executors
 
 `pathhydra-engine::GraphEngine` is the coherent storage and execution boundary.
-The deterministic CPU executor remains the semantic oracle and the only
-path-capable executor. An optional concrete NVIDIA CUDA executor handles the
-documented distance-only subset without changing responses. Its API is
-pre-release and intentionally concrete.
+The deterministic CPU executor remains the semantic oracle. The concrete NVIDIA
+CUDA executor returns exact distances and, for path requests, verifies every
+distance bit before a CPU evidence pass over the same immutable image. Finite
+examined-edge budgets remain CPU-only. The API is pre-release and concrete.
 
 ## Publication
 
@@ -36,8 +36,9 @@ reconstruction; CUDA checks at safe host-visible launch boundaries.
 Every engine route returns its response plus executor, policies, image counts, reservation, monotonic durations, completion reason, examined edges, relaxations, finalized nodes, frontier high-water mark, destination state counts, and reconstruction steps. No payload is logged.
 
 Capabilities report build and runtime CUDA facts independently, device
-identity, algorithms, unsupported paths/budgets, and the full-residency
-requirement. Health adds resident bytes/counts, current device memory, worker
+identity, algorithms, path-evidence and finite-budget policy, and partitioned
+execution. Resource limits are a redacted snapshot with no filesystem paths.
+Health adds resident bytes/counts, current device memory, worker
 and admission state, uploads, launches, failures, fallbacks, cancellations,
 and reinitializations. These values are process-local and expose no mutable
 state. See [CUDA routing](cuda-routing.md).
@@ -49,6 +50,24 @@ state. See [CUDA routing](cuda-routing.md).
 - Old images live only while previously admitted routes hold their `Arc`.
 - Repair mutations and explicit rebuild can restore availability.
 - Cancellation, admission refusal, and hydration errors do not mutate storage or publication state.
-- Restart validates RocksDB and builds one fresh current image.
+- Restart validates RocksDB and reuses a complete matching Plan 06 bundle when
+  possible; otherwise it clears an unusable pointer and rebuilds from confirmed
+  records.
 - CUDA residency can be rebuilt without changing the CPU image; a poisoned
   context is replaced explicitly with `reinitialize_cuda`.
+
+## Explicit shutdown
+
+`GraphEngine::shutdown` first closes route, mutation, checkpoint, and
+maintenance admission, signals active request cancellation, and waits for the
+configured drain bound. A timeout leaves the engine in `Closing`; after work
+drains, a repeated call continues safely. A complete shutdown stops partition
+I/O, drains and joins CUDA work, synchronizes WAL and memtables, waits for
+RocksDB background work, releases the database handle, requests retired-bundle
+cleanup, and reports each stage plus active-before and drained counts for every
+operation class. `Drop` invokes the same idempotent path as a fallback and never
+intentionally detaches workers.
+
+Maintenance uses the selected caller-executed policy: one configurable worker
+slot and a zero-length queue, so concurrent excess work is refused rather than
+silently accumulated. Checkpoint concurrency is admitted independently.

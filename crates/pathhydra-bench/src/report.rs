@@ -54,3 +54,44 @@ pub fn write(measurement: &Measurement<'_>) {
         measurement.driver,
     );
 }
+
+pub struct StrategyMeasurement<'a> {
+    pub workload: &'a str,
+    pub executor: &'a str,
+    pub algorithm: &'a str,
+    pub strategy: &'a str,
+    pub sample: usize,
+    pub requested_lanes: usize,
+    pub observed_batch_width: usize,
+    pub lane_index: usize,
+    pub operations: usize,
+    pub elapsed: Duration,
+    pub queue: Duration,
+    pub correctness: bool,
+    pub gpu_name: &'a str,
+}
+
+pub fn strategy_header() {
+    println!(
+        "workload,executor,algorithm,strategy,sample,requested_lanes,observed_batch_width,lane_index,operations,route_us,queue_us,correct,gpu,host_rust,kernel_rust,ptx_target"
+    );
+}
+
+pub fn write_strategy(measurement: &StrategyMeasurement<'_>) {
+    println!(
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},1.95.0,nightly-2024-02-17,sm_86",
+        measurement.workload,
+        measurement.executor,
+        measurement.algorithm,
+        measurement.strategy,
+        measurement.sample,
+        measurement.requested_lanes,
+        measurement.observed_batch_width,
+        measurement.lane_index,
+        measurement.operations,
+        measurement.elapsed.as_micros(),
+        measurement.queue.as_micros(),
+        measurement.correctness,
+        measurement.gpu_name,
+    );
+}

@@ -86,6 +86,284 @@ pub(crate) fn smoke_arithmetic(
         .map_err(synchronization_error)
 }
 
+pub(crate) fn benchmark_reset_strategy(
+    owner: &CudaContextOwner,
+    node_count: usize,
+    strategy: crate::CudaBenchmarkResetStrategy,
+) -> Result<(), CudaError> {
+    let count = u32::try_from(node_count).map_err(|_| abi_count("benchmark node"))?;
+    if count == 0 {
+        return Ok(());
+    }
+    let generation = 7_u32;
+    let mode = u32::from(matches!(
+        strategy,
+        crate::CudaBenchmarkResetStrategy::GenerationStamp
+    ));
+    let mut distances = owner
+        .stream
+        .clone_htod(&vec![0_u64; node_count])
+        .map_err(allocation_error)?;
+    let mut frontier = owner
+        .stream
+        .clone_htod(&vec![1_u32; node_count])
+        .map_err(allocation_error)?;
+    let stamp_count = if matches!(strategy, crate::CudaBenchmarkResetStrategy::ExplicitClear) {
+        1
+    } else {
+        node_count
+    };
+    let mut stamps = owner
+        .stream
+        .clone_htod(&vec![0_u32; stamp_count])
+        .map_err(allocation_error)?;
+    let mut builder = owner.stream.launch_builder(&owner.benchmark_reset_function);
+    builder.arg(&mut distances);
+    builder.arg(&mut frontier);
+    builder.arg(&mut stamps);
+    builder.arg(&count);
+    builder.arg(&generation);
+    builder.arg(&mode);
+    // SAFETY: the benchmark reset ABI is exactly the six arguments above; all
+    // distance/frontier contain `count` aligned initialized elements. Stamps
+    // has `count` elements in generation mode and one sentinel in explicit
+    // mode, where the kernel never dereferences it. Buffers are uniquely
+    // writable and synchronous downloads keep them alive through completion.
+    unsafe { builder.launch(LaunchConfig::for_num_elems(count)) }.map_err(launch_error)?;
+    let distances = owner
+        .stream
+        .clone_dtoh(&distances)
+        .map_err(synchronization_error)?;
+    let frontier = owner
+        .stream
+        .clone_dtoh(&frontier)
+        .map_err(synchronization_error)?;
+    let stamps = owner
+        .stream
+        .clone_dtoh(&stamps)
+        .map_err(synchronization_error)?;
+    let stamps_valid = match strategy {
+        crate::CudaBenchmarkResetStrategy::ExplicitClear => stamps.iter().all(|&value| value == 0),
+        crate::CudaBenchmarkResetStrategy::GenerationStamp => {
+            stamps.iter().all(|&value| value == generation)
+        }
+    };
+    if distances
+        .iter()
+        .any(|&bits| bits != f64::INFINITY.to_bits())
+        || frontier.iter().any(|&value| value != 0)
+        || !stamps_valid
+    {
+        return Err(CudaError::new(
+            CudaFailureKind::KernelInvariant,
+            "benchmark reset strategy produced invalid state",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn benchmark_target_strategy(
+    owner: &CudaContextOwner,
+    node_count: usize,
+    destinations: &[u32],
+    strategy: crate::CudaBenchmarkTargetStrategy,
+) -> Result<(), CudaError> {
+    let count = u32::try_from(node_count).map_err(|_| abi_count("benchmark node"))?;
+    if count == 0 || destinations.is_empty() {
+        return Ok(());
+    }
+    if destinations.iter().any(|&node| node as usize >= node_count) {
+        return Err(CudaError::new(
+            CudaFailureKind::Admission,
+            "benchmark target is outside the dense node range",
+        ));
+    }
+    let generation = 7_u32;
+    let (representation, mode) = match strategy {
+        crate::CudaBenchmarkTargetStrategy::SortedSparse => {
+            let mut sparse = destinations.to_vec();
+            sparse.sort_unstable();
+            sparse.dedup();
+            (sparse, 0_u32)
+        }
+        crate::CudaBenchmarkTargetStrategy::DenseBitset => {
+            let mut dense = vec![0_u32; node_count];
+            for &node in destinations {
+                dense[node as usize] = 1;
+            }
+            (dense, 1_u32)
+        }
+        crate::CudaBenchmarkTargetStrategy::GenerationDense => {
+            let mut dense = vec![0_u32; node_count];
+            for &node in destinations {
+                dense[node as usize] = generation;
+            }
+            (dense, 2_u32)
+        }
+    };
+    let representation_len =
+        u32::try_from(representation.len()).map_err(|_| abi_count("target representation"))?;
+    let representation = owner
+        .stream
+        .clone_htod(&representation)
+        .map_err(allocation_error)?;
+    let mut membership = owner
+        .stream
+        .alloc_zeros::<u32>(node_count)
+        .map_err(allocation_error)?;
+    let mut builder = owner
+        .stream
+        .launch_builder(&owner.benchmark_target_function);
+    builder.arg(&representation);
+    builder.arg(&representation_len);
+    builder.arg(&count);
+    builder.arg(&generation);
+    builder.arg(&mode);
+    builder.arg(&mut membership);
+    // SAFETY: the target benchmark ABI is exactly the six arguments above;
+    // representation length matches its allocation, membership has `count`
+    // uniquely writable elements, all target IDs were range checked, and the
+    // synchronous download preserves every buffer through completion.
+    unsafe { builder.launch(LaunchConfig::for_num_elems(count)) }.map_err(launch_error)?;
+    let membership = owner
+        .stream
+        .clone_dtoh(&membership)
+        .map_err(synchronization_error)?;
+    for (node, &member) in membership.iter().enumerate() {
+        let expected = u32::from(destinations.contains(&(node as u32)));
+        if member != expected {
+            return Err(CudaError::new(
+                CudaFailureKind::KernelInvariant,
+                "benchmark target strategy produced invalid membership",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn benchmark_profile_strategy(
+    owner: &CudaContextOwner,
+    base_weight_bits: &[u32],
+    relation_indexes: &[u32],
+    multiplier_bits: &[u32],
+    reuse_count: usize,
+    maximum_chunk_edges: usize,
+    strategy: crate::CudaBenchmarkProfileStrategy,
+) -> Result<(), CudaError> {
+    if base_weight_bits.len() != relation_indexes.len()
+        || multiplier_bits.is_empty()
+        || reuse_count == 0
+        || maximum_chunk_edges == 0
+    {
+        return Err(CudaError::new(
+            CudaFailureKind::Admission,
+            "invalid benchmark profile shape",
+        ));
+    }
+    let relation_count =
+        u32::try_from(multiplier_bits.len()).map_err(|_| abi_count("benchmark relation"))?;
+    if relation_indexes
+        .iter()
+        .any(|&index| index >= relation_count)
+    {
+        return Err(CudaError::new(
+            CudaFailureKind::Admission,
+            "benchmark profile relation index is out of range",
+        ));
+    }
+    let multiplier_device = owner
+        .stream
+        .clone_htod(multiplier_bits)
+        .map_err(allocation_error)?;
+    for chunk_start in (0..base_weight_bits.len()).step_by(maximum_chunk_edges) {
+        let chunk_end = base_weight_bits
+            .len()
+            .min(chunk_start.saturating_add(maximum_chunk_edges));
+        let bases = &base_weight_bits[chunk_start..chunk_end];
+        let relations = &relation_indexes[chunk_start..chunk_end];
+        let edge_count = u32::try_from(bases.len()).map_err(|_| abi_count("benchmark edge"))?;
+        let bases_device = owner.stream.clone_htod(bases).map_err(allocation_error)?;
+        let relations_device = owner
+            .stream
+            .clone_htod(relations)
+            .map_err(allocation_error)?;
+        let mut output = owner
+            .stream
+            .alloc_zeros::<u64>(bases.len())
+            .map_err(allocation_error)?;
+        match strategy {
+            crate::CudaBenchmarkProfileStrategy::Inline => {
+                for _ in 0..reuse_count {
+                    let mut builder = owner
+                        .stream
+                        .launch_builder(&owner.benchmark_profile_inline_function);
+                    builder.arg(&bases_device);
+                    builder.arg(&relations_device);
+                    builder.arg(&multiplier_device);
+                    builder.arg(&relation_count);
+                    builder.arg(&edge_count);
+                    builder.arg(&mut output);
+                    // SAFETY: the inline benchmark ABI matches these six
+                    // arguments, the edge arrays/output have `edge_count`
+                    // elements, relation indexes were checked, and the final
+                    // synchronous download covers all repeated launches.
+                    unsafe { builder.launch(LaunchConfig::for_num_elems(edge_count)) }
+                        .map_err(launch_error)?;
+                }
+            }
+            crate::CudaBenchmarkProfileStrategy::Materialized => {
+                let mut materialized = owner
+                    .stream
+                    .alloc_zeros::<u64>(bases.len())
+                    .map_err(allocation_error)?;
+                let mut builder = owner
+                    .stream
+                    .launch_builder(&owner.benchmark_profile_inline_function);
+                builder.arg(&bases_device);
+                builder.arg(&relations_device);
+                builder.arg(&multiplier_device);
+                builder.arg(&relation_count);
+                builder.arg(&edge_count);
+                builder.arg(&mut materialized);
+                // SAFETY: the materialization launch has the same checked ABI
+                // and bounds as the inline launch; later consume launches and
+                // the final download keep materialized storage alive.
+                unsafe { builder.launch(LaunchConfig::for_num_elems(edge_count)) }
+                    .map_err(launch_error)?;
+                for _ in 0..reuse_count {
+                    let mut builder = owner
+                        .stream
+                        .launch_builder(&owner.benchmark_profile_consume_function);
+                    builder.arg(&materialized);
+                    builder.arg(&edge_count);
+                    builder.arg(&mut output);
+                    // SAFETY: the consume ABI matches these three arguments;
+                    // input/output each have `edge_count` elements and the
+                    // synchronous download follows all launches.
+                    unsafe { builder.launch(LaunchConfig::for_num_elems(edge_count)) }
+                        .map_err(launch_error)?;
+                }
+            }
+        }
+        let output = owner
+            .stream
+            .clone_dtoh(&output)
+            .map_err(synchronization_error)?;
+        for (index, &actual) in output.iter().enumerate() {
+            let expected = f64::from(f32::from_bits(bases[index]))
+                * f64::from(f32::from_bits(multiplier_bits[relations[index] as usize]));
+            if actual != expected.to_bits() {
+                return Err(CudaError::new(
+                    CudaFailureKind::KernelInvariant,
+                    "benchmark profile strategy produced invalid effective weight",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_topology(
     owner: &CudaContextOwner,
@@ -168,12 +446,6 @@ pub(crate) fn route(
     cancellation: &AtomicBool,
     reserved_search_bytes: usize,
 ) -> Result<CudaRouteOutput, CudaError> {
-    if request.return_paths() {
-        return Err(CudaError::new(
-            CudaFailureKind::Admission,
-            "paths are unsupported by CUDA",
-        ));
-    }
     if request.budget() != SearchBudget::Unlimited {
         return Err(CudaError::new(
             CudaFailureKind::Admission,
@@ -202,22 +474,35 @@ pub(crate) fn route(
         .iter()
         .map(|&destination| image.dense_node_id(destination))
         .collect();
+    let mut target_set: Vec<_> = mapped_destinations
+        .iter()
+        .filter_map(|dense| dense.map(|value| value.as_u32()))
+        .collect();
+    target_set.sort_unstable();
+    target_set.dedup();
 
     let cancelled_before_launch = cancellation.load(Ordering::Acquire);
     let no_search_needed = image.adjacency_count() == 0
-        || mapped_destinations
+        || target_set
             .iter()
-            .all(|destination| destination.is_none_or(|destination| destination == origin));
+            .all(|&destination| destination == origin.as_u32());
     let started = Instant::now();
     let mut host_to_device_bytes = 0_usize;
     let mut device_to_host_bytes = 0_usize;
     let mut launches = 0_u64;
     let mut counters = [0_u64; 5];
+    let mut atomic_cas_retries = 0_u64;
+    let mut state_initialization_duration = Duration::ZERO;
+    let mut relation_relaxation_duration = Duration::ZERO;
+    let mut response_transfer_duration = Duration::ZERO;
+    let mut frontier_compaction_duration = Duration::ZERO;
+    let mut compacted_task_count = 0_u64;
     let distance_bits = if cancelled_before_launch || no_search_needed {
         let mut bits = vec![f64::INFINITY.to_bits(); image.node_count()];
         bits[origin.as_u32() as usize] = 0.0_f64.to_bits();
         bits
     } else {
+        let initialization_started = Instant::now();
         let stream = &resident.context.stream;
         let node_count = u32::try_from(image.node_count()).map_err(|_| abi_count("node"))?;
         let relation_count =
@@ -238,77 +523,52 @@ pub(crate) fn route(
         let mut counters_device = stream.alloc_zeros::<u64>(5).map_err(allocation_error)?;
         host_to_device_bytes =
             enabled.len() * 4 + multiplier_bits.len() * 4 + image.node_count() * 8;
-        match algorithm {
-            CudaAlgorithm::Frontier => {
-                let mut builder = stream.launch_builder(&resident.context.frontier_function);
-                builder.arg(&resident.offsets);
-                builder.arg(&resident.destinations);
-                builder.arg(&resident.relation_indexes);
-                builder.arg(&resident.base_weight_bits);
-                builder.arg(&node_count);
-                builder.arg(&adjacency_count);
-                builder.arg(&enabled_device);
-                builder.arg(&multiplier_device);
-                builder.arg(&relation_count);
-                builder.arg(&origin_u32);
-                builder.arg(&mut distance_device);
-                builder.arg(&mut status_device);
-                builder.arg(&mut counters_device);
-                // SAFETY: the function ABI exactly matches the ordered arguments;
-                // resident topology arrays were uploaded and synchronized together;
-                // node/relation/adjacency counts were checked into their fixed-width
-                // types; all mutable buffers are initialized, correctly aligned,
-                // uniquely borrowed, and long enough; the single-thread kernel bounds
-                // every access; downloads below synchronize before any lifetime ends.
-                unsafe {
-                    builder.launch(LaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (1, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
-                }
-                .map_err(launch_error)?;
-            }
-            CudaAlgorithm::DeltaStepping(delta) => {
-                let delta_bits = delta.delta().to_bits();
-                let scratch_len = image.node_count().checked_mul(2).ok_or_else(|| {
-                    CudaError::new(CudaFailureKind::Allocation, "delta scratch length overflow")
-                })?;
-                let mut scratch_device = stream
-                    .alloc_zeros::<u32>(scratch_len)
-                    .map_err(allocation_error)?;
-                let mut builder = stream.launch_builder(&resident.context.delta_function);
-                builder.arg(&resident.offsets);
-                builder.arg(&resident.destinations);
-                builder.arg(&resident.relation_indexes);
-                builder.arg(&resident.base_weight_bits);
-                builder.arg(&node_count);
-                builder.arg(&adjacency_count);
-                builder.arg(&enabled_device);
-                builder.arg(&multiplier_device);
-                builder.arg(&relation_count);
-                builder.arg(&origin_u32);
-                builder.arg(&delta_bits);
-                builder.arg(&mut distance_device);
-                builder.arg(&mut scratch_device);
-                builder.arg(&mut status_device);
-                builder.arg(&mut counters_device);
-                // SAFETY: this is the audited delta ABI in the exact declared
-                // order. All topology/profile/count obligations above apply;
-                // scratch has exactly two node-sized initialized arrays, output
-                // buffers are uniquely borrowed, and synchronous downloads keep
-                // every allocation and function/context handle alive to completion.
-                unsafe {
-                    builder.launch(LaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (1, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
-                }
-                .map_err(launch_error)?;
-            }
-        }
-        launches = 1;
+        state_initialization_duration = initialization_started.elapsed();
+        let relaxation_started = Instant::now();
+        let execution = match algorithm {
+            CudaAlgorithm::Frontier => run_resident_frontier(
+                resident,
+                image.arrays().offsets,
+                &enabled_device,
+                &multiplier_device,
+                node_count,
+                relation_count,
+                adjacency_count,
+                origin_u32,
+                &mut distance_device,
+                &mut status_device,
+                &mut counters_device,
+                cancellation,
+            )?,
+            CudaAlgorithm::DeltaStepping(delta) => run_resident_delta(
+                resident,
+                image.arrays().offsets,
+                &enabled_device,
+                &multiplier_device,
+                node_count,
+                relation_count,
+                adjacency_count,
+                origin_u32,
+                delta.delta(),
+                &mut distance_device,
+                &mut status_device,
+                &mut counters_device,
+                cancellation,
+            )?,
+        };
+        launches = execution.launches;
+        host_to_device_bytes = host_to_device_bytes
+            .saturating_add(execution.task_upload_bytes)
+            .saturating_add(execution.control_upload_bytes);
+        device_to_host_bytes =
+            device_to_host_bytes.saturating_add(execution.control_download_bytes);
+        counters[3] = execution.phases;
+        compacted_task_count = execution.compacted_tasks;
+        frontier_compaction_duration = execution.compaction_duration;
+        relation_relaxation_duration = relaxation_started
+            .elapsed()
+            .saturating_sub(frontier_compaction_duration);
+        let transfer_started = Instant::now();
         let distances = stream
             .clone_dtoh(&distance_device)
             .map_err(synchronization_error)?;
@@ -319,7 +579,13 @@ pub(crate) fn route(
             .clone_dtoh(&counters_device)
             .map_err(synchronization_error)?;
         counters.copy_from_slice(&downloaded_counters);
-        device_to_host_bytes = distances.len() * 8 + 4 + counters.len() * 8;
+        counters[3] = execution.phases;
+        atomic_cas_retries = counters[4];
+        response_transfer_duration = transfer_started.elapsed();
+        device_to_host_bytes = device_to_host_bytes
+            .saturating_add(distances.len().saturating_mul(8))
+            .saturating_add(4)
+            .saturating_add(counters.len().saturating_mul(8));
         if status != [0] {
             return Err(CudaError::new(
                 CudaFailureKind::KernelInvariant,
@@ -329,6 +595,15 @@ pub(crate) fn route(
         distances
     };
     let cancelled = cancelled_before_launch || cancellation.load(Ordering::Acquire);
+    let finalized_nodes = if cancelled {
+        0
+    } else {
+        distance_bits
+            .iter()
+            .filter(|&&bits| f64::from_bits(bits).is_finite())
+            .count() as u64
+    };
+    let destination_started = Instant::now();
     let results: Vec<DestinationResult> = request
         .destinations()
         .iter()
@@ -365,14 +640,31 @@ pub(crate) fn route(
     } else {
         CompletionReason::FrontierExhausted
     };
-    let response = RoutingResponse::distance_only(
+    let destination_completion_duration = destination_started.elapsed();
+    let mut response = RoutingResponse::distance_only(
         request.origin(),
         results,
         packed.canonical().clone(),
         request.tie_policy(),
-        (counters[0], counters[4]),
+        (counters[0], finalized_nodes),
         completion_reason,
     );
+    if request.return_paths() && !cancelled {
+        let faults = resident.fault_injection();
+        faults.trip(crate::CudaFaultStage::PathEvidence)?;
+        faults.pause_path_evidence()?;
+        let (evidence, _) = pathhydra_routing::route_controlled(image, request, cancellation)
+            .map_err(|error| {
+                CudaError::new(
+                    CudaFailureKind::KernelInvariant,
+                    format!("same-image CPU path evidence pass failed: {error}"),
+                )
+            })?;
+        if evidence.completion_reason() != CompletionReason::Cancelled {
+            verify_path_evidence(&response, &evidence)?;
+        }
+        response = evidence;
+    }
     Ok(CudaRouteOutput {
         response,
         diagnostics: CudaRouteDiagnostics {
@@ -390,15 +682,96 @@ pub(crate) fn route(
             relaxation_attempts: counters[1],
             relaxation_updates: counters[2],
             phases: counters[3],
-            frontier_high_water: u32::try_from(counters[4]).unwrap_or(u32::MAX),
             partitions_required: 0,
             host_cache_hits: 0,
             device_cache_hits: 0,
             file_bytes: 0,
             staged_bytes: 0,
             transfer_bytes: 0,
+            parallel_strategy: crate::CudaParallelStrategy::RelationThreadsAtomicBinary64,
+            reset_mode: crate::CudaResetMode::ExplicitClear,
+            target_mode: crate::CudaTargetMode::SortedSparseHost,
+            profile_mode: crate::CudaProfileMode::InlineExact,
+            path_evidence_mode: if request.return_paths() {
+                crate::CudaPathEvidenceMode::CpuPassSameImage
+            } else {
+                crate::CudaPathEvidenceMode::NotRequested
+            },
+            state_initialization_duration,
+            partition_scheduling_duration: Duration::ZERO,
+            relation_relaxation_duration,
+            response_transfer_duration,
+            frontier_compaction_duration,
+            compacted_task_count: u32::try_from(compacted_task_count).unwrap_or(u32::MAX),
+            destination_completion_duration,
+            destination_count_checked: request.destinations().len(),
+            atomic_cas_retries,
         },
     })
+}
+
+#[derive(Default)]
+struct PhaseExecution {
+    launches: u64,
+    phases: u64,
+    compaction_duration: Duration,
+    compacted_tasks: u64,
+    task_upload_bytes: usize,
+    control_upload_bytes: usize,
+    control_download_bytes: usize,
+}
+
+type ResidentTasks = (Vec<u64>, Vec<u32>);
+
+fn compact_resident_tasks(
+    offsets: &[u64],
+    selected_sources: impl Fn(usize) -> bool,
+    cancellation: &AtomicBool,
+) -> Result<Option<ResidentTasks>, CudaError> {
+    let mut selected_edge_count = 0_usize;
+    for source in 0..offsets.len().saturating_sub(1) {
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if selected_sources(source) {
+            let count = usize::try_from(offsets[source + 1].saturating_sub(offsets[source]))
+                .map_err(|_| host_compaction_allocation_error())?;
+            selected_edge_count = selected_edge_count
+                .checked_add(count)
+                .ok_or_else(host_compaction_allocation_error)?;
+        }
+    }
+    let mut edges = Vec::new();
+    let mut sources = Vec::new();
+    edges
+        .try_reserve_exact(selected_edge_count)
+        .map_err(|_| host_compaction_allocation_error())?;
+    sources
+        .try_reserve_exact(selected_edge_count)
+        .map_err(|_| host_compaction_allocation_error())?;
+    for source in 0..offsets.len().saturating_sub(1) {
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if !selected_sources(source) {
+            continue;
+        }
+        for edge in offsets[source]..offsets[source + 1] {
+            if edge & 1023 == 0 && cancellation.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            edges.push(edge);
+            sources.push(source as u32);
+        }
+    }
+    Ok(Some((edges, sources)))
+}
+
+fn host_compaction_allocation_error() -> CudaError {
+    CudaError::new(
+        CudaFailureKind::Allocation,
+        "CUDA host task-compaction allocation failed",
+    )
 }
 
 fn abi_count(structure: &'static str) -> CudaError {
@@ -406,6 +779,491 @@ fn abi_count(structure: &'static str) -> CudaError {
         CudaFailureKind::Admission,
         format!("CUDA {structure} count does not fit the kernel ABI"),
     )
+}
+
+pub(crate) fn verify_path_evidence(
+    distances: &RoutingResponse,
+    evidence: &RoutingResponse,
+) -> Result<(), CudaError> {
+    if distances.results().len() != evidence.results().len() {
+        return Err(CudaError::new(
+            CudaFailureKind::KernelInvariant,
+            "CPU path evidence changed destination cardinality",
+        ));
+    }
+    for (distance, path) in distances.results().iter().zip(evidence.results()) {
+        let agrees = match (distance.state(), path.state()) {
+            (DestinationState::Exact(left), DestinationState::Exact(right)) => {
+                left.logical_distance().to_bits() == right.logical_distance().to_bits()
+                    && right.path().is_some()
+            }
+            (left, right) => left == right,
+        };
+        if !agrees {
+            return Err(CudaError::new(
+                CudaFailureKind::KernelInvariant,
+                "CPU path evidence disagreed with exact CUDA distance state",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_resident_frontier(
+    resident: &CudaResidentImage,
+    offsets: &[u64],
+    enabled: &CudaSlice<u32>,
+    multipliers: &CudaSlice<u32>,
+    node_count: u32,
+    relation_count: u32,
+    adjacency_count: u64,
+    origin: u32,
+    distances: &mut CudaSlice<u64>,
+    status: &mut CudaSlice<u32>,
+    counters: &mut CudaSlice<u64>,
+    cancellation: &AtomicBool,
+) -> Result<PhaseExecution, CudaError> {
+    let stream = &resident.context.stream;
+    let mut active_host = vec![0_u32; node_count as usize];
+    active_host[origin as usize] = 1;
+    let mut next = stream
+        .alloc_zeros::<u32>(node_count as usize)
+        .map_err(allocation_error)?;
+    let mut changed = stream.alloc_zeros::<u32>(1).map_err(allocation_error)?;
+    let mut launches = 0_u64;
+    let mut phases = 0_u64;
+    let mut compaction_duration = Duration::ZERO;
+    let mut compacted_tasks = 0_u64;
+    let mut control_upload_bytes = 0_usize;
+    let mut control_download_bytes = 0_usize;
+    for _ in 0..node_count.max(1) {
+        if cancellation.load(Ordering::Acquire) {
+            break;
+        }
+        stream
+            .memcpy_htod(&vec![0_u32; node_count as usize], &mut next)
+            .map_err(synchronization_error)?;
+        stream
+            .memcpy_htod(&[0_u32], &mut changed)
+            .map_err(synchronization_error)?;
+        control_upload_bytes = control_upload_bytes
+            .saturating_add(node_count as usize * 4)
+            .saturating_add(4);
+        resident
+            .fault_injection()
+            .trip(crate::CudaFaultStage::TaskCompaction)?;
+        if !resident
+            .fault_injection()
+            .pause_task_compaction(cancellation)?
+        {
+            break;
+        }
+        let compact_started = Instant::now();
+        let Some((task_edges, task_sources)) =
+            compact_resident_tasks(offsets, |source| active_host[source] == 1, cancellation)?
+        else {
+            break;
+        };
+        compaction_duration = compaction_duration.saturating_add(compact_started.elapsed());
+        compacted_tasks = compacted_tasks.saturating_add(task_edges.len() as u64);
+        if task_edges.is_empty() {
+            break;
+        }
+        let (phase_launches, task_upload_duration) = launch_resident_frontier_chunks(
+            resident,
+            enabled,
+            multipliers,
+            node_count,
+            relation_count,
+            adjacency_count,
+            &task_edges,
+            &task_sources,
+            &mut next,
+            distances,
+            &mut changed,
+            status,
+            counters,
+        )?;
+        launches = launches.saturating_add(phase_launches);
+        compaction_duration = compaction_duration.saturating_add(task_upload_duration);
+        phases = phases.saturating_add(1);
+        let changed_host = stream.clone_dtoh(&changed).map_err(synchronization_error)?;
+        let next_host = stream.clone_dtoh(&next).map_err(synchronization_error)?;
+        control_download_bytes = control_download_bytes
+            .saturating_add(4)
+            .saturating_add(next_host.len().saturating_mul(4))
+            .saturating_add(4);
+        check_kernel_status(stream, status)?;
+        if changed_host == [0] {
+            break;
+        }
+        active_host = next_host;
+    }
+    Ok(PhaseExecution {
+        launches,
+        phases,
+        compaction_duration,
+        compacted_tasks,
+        task_upload_bytes: usize::try_from(compacted_tasks)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(12),
+        control_upload_bytes,
+        control_download_bytes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_resident_frontier_chunks(
+    resident: &CudaResidentImage,
+    enabled: &CudaSlice<u32>,
+    multipliers: &CudaSlice<u32>,
+    node_count: u32,
+    relation_count: u32,
+    adjacency_count: u64,
+    task_edges: &[u64],
+    task_sources: &[u32],
+    next: &mut CudaSlice<u32>,
+    distances: &mut CudaSlice<u64>,
+    changed: &mut CudaSlice<u32>,
+    status: &mut CudaSlice<u32>,
+    counters: &mut CudaSlice<u64>,
+) -> Result<(u64, Duration), CudaError> {
+    let mut launches = 0_u64;
+    let mut upload_duration = Duration::ZERO;
+    for (edge_chunk, source_chunk) in task_edges
+        .chunks(u32::MAX as usize)
+        .zip(task_sources.chunks(u32::MAX as usize))
+    {
+        let upload_started = Instant::now();
+        let edge_tasks = resident
+            .context
+            .stream
+            .clone_htod(edge_chunk)
+            .map_err(allocation_error)?;
+        let source_tasks = resident
+            .context
+            .stream
+            .clone_htod(source_chunk)
+            .map_err(allocation_error)?;
+        upload_duration = upload_duration.saturating_add(upload_started.elapsed());
+        let count = edge_chunk.len() as u32;
+        let mut builder = resident
+            .context
+            .stream
+            .launch_builder(&resident.context.frontier_function);
+        builder.arg(&edge_tasks);
+        builder.arg(&source_tasks);
+        builder.arg(&count);
+        builder.arg(&resident.destinations);
+        builder.arg(&resident.relation_indexes);
+        builder.arg(&resident.base_weight_bits);
+        builder.arg(&node_count);
+        builder.arg(&adjacency_count);
+        builder.arg(enabled);
+        builder.arg(multipliers);
+        builder.arg(&relation_count);
+        builder.arg(&mut *next);
+        builder.arg(&mut *distances);
+        builder.arg(&mut *changed);
+        builder.arg(&mut *status);
+        builder.arg(&mut *counters);
+        // SAFETY: the parallel frontier ABI exactly matches these arguments.
+        // Immutable topology spans adjacency_count entries; the chunk bounds
+        // every thread. Mutable words are initialized atomic storage retained
+        // through the synchronous status download after all chunk launches.
+        unsafe { builder.launch(LaunchConfig::for_num_elems(count)) }.map_err(launch_error)?;
+        resident
+            .context
+            .stream
+            .synchronize()
+            .map_err(synchronization_error)?;
+        launches = launches.saturating_add(1);
+    }
+    Ok((launches, upload_duration))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_resident_delta(
+    resident: &CudaResidentImage,
+    offsets: &[u64],
+    enabled: &CudaSlice<u32>,
+    multipliers: &CudaSlice<u32>,
+    node_count: u32,
+    relation_count: u32,
+    adjacency_count: u64,
+    origin: u32,
+    delta: f64,
+    distances: &mut CudaSlice<u64>,
+    status: &mut CudaSlice<u32>,
+    counters: &mut CudaSlice<u64>,
+    cancellation: &AtomicBool,
+) -> Result<PhaseExecution, CudaError> {
+    let stream = &resident.context.stream;
+    let mut removed = stream
+        .alloc_zeros::<u32>(node_count as usize)
+        .map_err(allocation_error)?;
+    let mut changed = stream.alloc_zeros::<u32>(1).map_err(allocation_error)?;
+    let mut bucket = 0_u64;
+    let mut launches = 0_u64;
+    let mut phases = 0_u64;
+    let mut compaction_duration = Duration::ZERO;
+    let mut compacted_tasks = 0_u64;
+    let mut control_upload_bytes = 0_usize;
+    let mut control_download_bytes = 0_usize;
+    let mut current = vec![f64::INFINITY.to_bits(); node_count as usize];
+    current[origin as usize] = 0.0_f64.to_bits();
+    'search: loop {
+        if cancellation.load(Ordering::Acquire) {
+            break;
+        }
+        stream
+            .memcpy_htod(&vec![0_u32; node_count as usize], &mut removed)
+            .map_err(synchronization_error)?;
+        control_upload_bytes = control_upload_bytes.saturating_add(node_count as usize * 4);
+        loop {
+            stream
+                .memcpy_htod(&[0_u32], &mut changed)
+                .map_err(synchronization_error)?;
+            control_upload_bytes = control_upload_bytes.saturating_add(4);
+            resident
+                .fault_injection()
+                .trip(crate::CudaFaultStage::TaskCompaction)?;
+            if !resident
+                .fault_injection()
+                .pause_task_compaction(cancellation)?
+            {
+                break 'search;
+            }
+            let compact_started = Instant::now();
+            let Some((task_edges, task_sources)) = compact_resident_tasks(
+                offsets,
+                |source| bucket_index(f64::from_bits(current[source]), delta) == Some(bucket),
+                cancellation,
+            )?
+            else {
+                break 'search;
+            };
+            compaction_duration = compaction_duration.saturating_add(compact_started.elapsed());
+            compacted_tasks = compacted_tasks.saturating_add(task_edges.len() as u64);
+            if task_edges.is_empty() {
+                break;
+            }
+            let (phase_launches, task_upload_duration) = launch_resident_delta_chunks(
+                resident,
+                enabled,
+                multipliers,
+                node_count,
+                relation_count,
+                adjacency_count,
+                delta.to_bits(),
+                bucket,
+                0,
+                &task_edges,
+                &task_sources,
+                &mut removed,
+                distances,
+                &mut changed,
+                status,
+                counters,
+            )?;
+            launches = launches.saturating_add(phase_launches);
+            compaction_duration = compaction_duration.saturating_add(task_upload_duration);
+            let changed_host = stream.clone_dtoh(&changed).map_err(synchronization_error)?;
+            current = stream
+                .clone_dtoh(distances)
+                .map_err(synchronization_error)?;
+            control_download_bytes = control_download_bytes
+                .saturating_add(4)
+                .saturating_add(current.len().saturating_mul(8))
+                .saturating_add(4);
+            check_kernel_status(stream, status)?;
+            if changed_host == [0] {
+                break;
+            }
+        }
+        let removed_host = stream.clone_dtoh(&removed).map_err(synchronization_error)?;
+        control_download_bytes =
+            control_download_bytes.saturating_add(removed_host.len().saturating_mul(4));
+        resident
+            .fault_injection()
+            .trip(crate::CudaFaultStage::TaskCompaction)?;
+        if !resident
+            .fault_injection()
+            .pause_task_compaction(cancellation)?
+        {
+            break;
+        }
+        let compact_started = Instant::now();
+        let Some((task_edges, task_sources)) =
+            compact_resident_tasks(offsets, |source| removed_host[source] == 1, cancellation)?
+        else {
+            break;
+        };
+        compaction_duration = compaction_duration.saturating_add(compact_started.elapsed());
+        compacted_tasks = compacted_tasks.saturating_add(task_edges.len() as u64);
+        let (phase_launches, task_upload_duration) = launch_resident_delta_chunks(
+            resident,
+            enabled,
+            multipliers,
+            node_count,
+            relation_count,
+            adjacency_count,
+            delta.to_bits(),
+            bucket,
+            1,
+            &task_edges,
+            &task_sources,
+            &mut removed,
+            distances,
+            &mut changed,
+            status,
+            counters,
+        )?;
+        launches = launches.saturating_add(phase_launches);
+        compaction_duration = compaction_duration.saturating_add(task_upload_duration);
+        check_kernel_status(stream, status)?;
+        phases = phases.saturating_add(1);
+        current = stream
+            .clone_dtoh(distances)
+            .map_err(synchronization_error)?;
+        control_download_bytes = control_download_bytes
+            .saturating_add(4)
+            .saturating_add(current.len().saturating_mul(8));
+        let Some(next) = next_bucket(&current, delta, bucket)? else {
+            break;
+        };
+        bucket = next;
+    }
+    Ok(PhaseExecution {
+        launches,
+        phases,
+        compaction_duration,
+        compacted_tasks,
+        task_upload_bytes: usize::try_from(compacted_tasks)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(12),
+        control_upload_bytes,
+        control_download_bytes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_resident_delta_chunks(
+    resident: &CudaResidentImage,
+    enabled: &CudaSlice<u32>,
+    multipliers: &CudaSlice<u32>,
+    node_count: u32,
+    relation_count: u32,
+    adjacency_count: u64,
+    delta_bits: u64,
+    bucket: u64,
+    edge_class: u32,
+    task_edges: &[u64],
+    task_sources: &[u32],
+    removed: &mut CudaSlice<u32>,
+    distances: &mut CudaSlice<u64>,
+    changed: &mut CudaSlice<u32>,
+    status: &mut CudaSlice<u32>,
+    counters: &mut CudaSlice<u64>,
+) -> Result<(u64, Duration), CudaError> {
+    let mut launches = 0_u64;
+    let mut upload_duration = Duration::ZERO;
+    for (edge_chunk, source_chunk) in task_edges
+        .chunks(u32::MAX as usize)
+        .zip(task_sources.chunks(u32::MAX as usize))
+    {
+        let upload_started = Instant::now();
+        let edge_tasks = resident
+            .context
+            .stream
+            .clone_htod(edge_chunk)
+            .map_err(allocation_error)?;
+        let source_tasks = resident
+            .context
+            .stream
+            .clone_htod(source_chunk)
+            .map_err(allocation_error)?;
+        upload_duration = upload_duration.saturating_add(upload_started.elapsed());
+        let count = edge_chunk.len() as u32;
+        let mut builder = resident
+            .context
+            .stream
+            .launch_builder(&resident.context.delta_function);
+        builder.arg(&edge_tasks);
+        builder.arg(&source_tasks);
+        builder.arg(&count);
+        builder.arg(&resident.destinations);
+        builder.arg(&resident.relation_indexes);
+        builder.arg(&resident.base_weight_bits);
+        builder.arg(&node_count);
+        builder.arg(&adjacency_count);
+        builder.arg(enabled);
+        builder.arg(multipliers);
+        builder.arg(&relation_count);
+        builder.arg(&delta_bits);
+        builder.arg(&bucket);
+        builder.arg(&edge_class);
+        builder.arg(&mut *removed);
+        builder.arg(&mut *distances);
+        builder.arg(&mut *changed);
+        builder.arg(&mut *status);
+        builder.arg(&mut *counters);
+        // SAFETY: the parallel delta ABI has these exact fixed-width values and
+        // buffers. Each chunk covers disjoint immutable relation inputs while
+        // distance, removed, status, and counters use device atomics.
+        unsafe { builder.launch(LaunchConfig::for_num_elems(count)) }.map_err(launch_error)?;
+        resident
+            .context
+            .stream
+            .synchronize()
+            .map_err(synchronization_error)?;
+        launches = launches.saturating_add(1);
+    }
+    Ok((launches, upload_duration))
+}
+
+fn next_bucket(distances: &[u64], delta: f64, current: u64) -> Result<Option<u64>, CudaError> {
+    let mut next = None;
+    for &bits in distances {
+        let distance = f64::from_bits(bits);
+        if !distance.is_finite() {
+            continue;
+        }
+        let quotient = distance / delta;
+        if !quotient.is_finite() || quotient < 0.0 || quotient >= u64::MAX as f64 {
+            return Err(CudaError::new(
+                CudaFailureKind::KernelInvariant,
+                "delta bucket index overflow",
+            ));
+        }
+        let candidate = quotient as u64;
+        if candidate > current {
+            next = Some(next.map_or(candidate, |old: u64| old.min(candidate)));
+        }
+    }
+    Ok(next)
+}
+
+pub(crate) fn bucket_index(distance: f64, delta: f64) -> Option<u64> {
+    let quotient = distance / delta;
+    (quotient.is_finite() && quotient >= 0.0 && quotient < u64::MAX as f64)
+        .then_some(quotient as u64)
+}
+
+fn check_kernel_status(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    status: &CudaSlice<u32>,
+) -> Result<(), CudaError> {
+    let status = stream.clone_dtoh(status).map_err(synchronization_error)?;
+    if status == [0] {
+        Ok(())
+    } else {
+        Err(CudaError::new(
+            CudaFailureKind::KernelInvariant,
+            format!("CUDA routing kernel returned status {}", status[0]),
+        ))
+    }
 }
 
 fn driver_error(context: &'static str) -> impl FnOnce(cudarc::driver::DriverError) -> CudaError {
@@ -441,7 +1299,9 @@ pub(crate) fn launch_partition_frontier(
     multipliers: &CudaSlice<u32>,
     node_count: u32,
     relation_count: u32,
-    active_sources: &CudaSlice<u32>,
+    task_edges: &CudaSlice<u32>,
+    task_sources: &CudaSlice<u32>,
+    task_count: u32,
     next_active_sources: &mut CudaSlice<u32>,
     distances: &mut CudaSlice<u64>,
     changed: &mut CudaSlice<u32>,
@@ -451,10 +1311,9 @@ pub(crate) fn launch_partition_frontier(
     let mut builder = owner
         .stream
         .launch_builder(&owner.partition_frontier_function);
-    builder.arg(&partition.segment_sources);
-    builder.arg(&partition.segment_starts);
-    builder.arg(&partition.segment_counts);
-    builder.arg(&partition.segment_count);
+    builder.arg(task_edges);
+    builder.arg(task_sources);
+    builder.arg(&task_count);
     builder.arg(&partition.destinations);
     builder.arg(&partition.relation_indexes);
     builder.arg(&partition.base_weight_bits);
@@ -463,17 +1322,17 @@ pub(crate) fn launch_partition_frontier(
     builder.arg(enabled);
     builder.arg(multipliers);
     builder.arg(&relation_count);
-    builder.arg(active_sources);
     builder.arg(next_active_sources);
     builder.arg(distances);
     builder.arg(changed);
     builder.arg(status);
     builder.arg(counters);
-    // SAFETY: the partition cache uploads and validates all six immutable
-    // arrays together; its fixed counts exactly match the kernel ABI. Search
-    // buffers are initialized, uniquely mutable, and retained until the caller
-    // synchronizes the stream before releasing the partition cache pin.
-    unsafe { builder.launch(single_thread()) }
+    // SAFETY: the partition cache uploads and validates the three immutable
+    // topology arrays together. The compact edge/source arrays have identical
+    // task_count lengths, and one thread is launched per task. Search and task
+    // buffers remain alive until stream synchronization and event-gated
+    // cache-pin release.
+    unsafe { builder.launch(LaunchConfig::for_num_elems(task_count)) }
         .map(|_| ())
         .map_err(launch_error)
 }
@@ -489,16 +1348,19 @@ pub(crate) fn launch_partition_delta(
     delta_bits: u64,
     bucket: u64,
     edge_class: u32,
+    task_edges: &CudaSlice<u32>,
+    task_sources: &CudaSlice<u32>,
+    task_count: u32,
+    removed_sources: &mut CudaSlice<u32>,
     distances: &mut CudaSlice<u64>,
     changed: &mut CudaSlice<u32>,
     status: &mut CudaSlice<u32>,
     counters: &mut CudaSlice<u64>,
 ) -> Result<(), CudaError> {
     let mut builder = owner.stream.launch_builder(&owner.partition_delta_function);
-    builder.arg(&partition.segment_sources);
-    builder.arg(&partition.segment_starts);
-    builder.arg(&partition.segment_counts);
-    builder.arg(&partition.segment_count);
+    builder.arg(task_edges);
+    builder.arg(task_sources);
+    builder.arg(&task_count);
     builder.arg(&partition.destinations);
     builder.arg(&partition.relation_indexes);
     builder.arg(&partition.base_weight_bits);
@@ -510,6 +1372,7 @@ pub(crate) fn launch_partition_delta(
     builder.arg(&delta_bits);
     builder.arg(&bucket);
     builder.arg(&edge_class);
+    builder.arg(removed_sources);
     builder.arg(distances);
     builder.arg(changed);
     builder.arg(status);
@@ -517,34 +1380,7 @@ pub(crate) fn launch_partition_delta(
     // SAFETY: the frontier partition obligations apply, and validated host
     // configuration supplies a positive finite delta, canonical class, and
     // bucket index. Stream synchronization precedes every slot release/reuse.
-    unsafe { builder.launch(single_thread()) }
+    unsafe { builder.launch(LaunchConfig::for_num_elems(task_count)) }
         .map(|_| ())
         .map_err(launch_error)
-}
-
-pub(crate) fn launch_frontier_compaction(
-    owner: &CudaContextOwner,
-    distances: &CudaSlice<u64>,
-    node_count: u32,
-    finite: &mut CudaSlice<u32>,
-) -> Result<(), CudaError> {
-    let mut builder = owner
-        .stream
-        .launch_builder(&owner.frontier_compaction_function);
-    builder.arg(distances);
-    builder.arg(&node_count);
-    builder.arg(finite);
-    // SAFETY: distances contains node_count initialized words, finite owns one
-    // writable word, and the synchronous caller retains both through completion.
-    unsafe { builder.launch(single_thread()) }
-        .map(|_| ())
-        .map_err(launch_error)
-}
-
-const fn single_thread() -> LaunchConfig {
-    LaunchConfig {
-        grid_dim: (1, 1, 1),
-        block_dim: (1, 1, 1),
-        shared_mem_bytes: 0,
-    }
 }

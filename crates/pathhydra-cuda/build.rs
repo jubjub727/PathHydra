@@ -16,11 +16,12 @@ fn main() {
         "kernel/Cargo.toml",
         "kernel/lib.rs",
         "kernel/arithmetic.rs",
+        "kernel/atomic.rs",
+        "kernel/benchmark.rs",
         "kernel/frontier.rs",
         "kernel/delta.rs",
         "kernel/partition_frontier.rs",
         "kernel/partition_delta.rs",
-        "kernel/frontier_compaction.rs",
         "../../cuda-toolchain.toml",
     ] {
         println!("cargo:rerun-if-changed={source}");

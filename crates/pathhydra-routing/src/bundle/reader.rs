@@ -762,22 +762,32 @@ impl IoCoordinator {
         }
     }
 
-    fn shutdown(&self) {
-        let count = self.workers.lock().map_or(0, |workers| workers.len());
+    fn shutdown(&self) -> Result<(), RoutingError> {
+        let mut workers = self
+            .workers
+            .lock()
+            .map_err(|_| RoutingError::ImageAccess("routing I/O worker lock is poisoned".into()))?;
+        let count = workers.len();
         for _ in 0..count {
             let _ = self.sender.send(IoJob::Shutdown);
         }
-        if let Ok(mut workers) = self.workers.lock() {
-            for worker in workers.drain(..) {
-                let _ = worker.join();
-            }
+        let mut join_failed = false;
+        for worker in workers.drain(..) {
+            join_failed |= worker.join().is_err();
+        }
+        if join_failed {
+            Err(RoutingError::ImageAccess(
+                "a routing I/O worker terminated unexpectedly".into(),
+            ))
+        } else {
+            Ok(())
         }
     }
 }
 
 impl Drop for IoCoordinator {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown();
     }
 }
 
@@ -1239,10 +1249,11 @@ impl ChunkedRoutingImage {
             .map(|value| value.map(|data| PartitionLease { id, data }))
     }
     #[doc(hidden)]
-    pub fn shutdown_io_workers(&self) {
+    pub fn shutdown_io_workers(&self) -> Result<(), RoutingError> {
         if let Some(coordinator) = self.cache.coordinator.get() {
-            coordinator.shutdown();
+            coordinator.shutdown()?;
         }
+        Ok(())
     }
 }
 impl RoutingTopology for ChunkedRoutingImage {
@@ -1331,4 +1342,29 @@ pub fn route_partitioned_controlled(
             io_wait: Duration::ZERO,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn io_shutdown_reports_a_panicked_worker_and_still_joins_every_handle() {
+        let (sender, receiver) = bounded(1);
+        drop(receiver);
+        let healthy = thread::spawn(|| {});
+        let panicked = thread::spawn(|| panic!("injected routing I/O worker panic"));
+        let coordinator = IoCoordinator {
+            sender,
+            workers: Mutex::new(vec![healthy, panicked]),
+        };
+
+        assert!(matches!(
+            coordinator.shutdown(),
+            Err(RoutingError::ImageAccess(reason))
+                if reason == "a routing I/O worker terminated unexpectedly"
+        ));
+        assert!(coordinator.workers.lock().unwrap().is_empty());
+        assert!(coordinator.shutdown().is_ok());
+    }
 }

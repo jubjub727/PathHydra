@@ -23,7 +23,14 @@ throughput claim.
 
 ## Topology larger than local device residency
 
-The manual `--suite scale` run generated and reopened a production bundle with:
+The manual scale gate writes its generated bundle beneath the ignored `target`
+directory and defaults explicitly to the required 12-GiB target:
+
+```powershell
+cargo run -p pathhydra-bench --release --features cuda -- --suite scale target/pathhydra-scale-bundle 12
+```
+
+That run generated and reopened a production bundle with:
 
 | Field | Observed value |
 | --- | ---: |

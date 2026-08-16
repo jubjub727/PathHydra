@@ -140,6 +140,7 @@ fn run_cuda(
     let reserved = pathhydra_cuda::estimate_search_bytes(
         image.node_count(),
         image.relation_kind_count(),
+        image.adjacency_count(),
         request.destinations().len(),
         pathhydra_cuda::CudaAlgorithm::Frontier,
     )

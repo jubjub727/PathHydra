@@ -15,7 +15,8 @@ use pathhydra_routing::{
 use crate::{
     CudaAlgorithm, CudaContextOwner, CudaError, CudaFailureKind, CudaFaultInjection,
     CudaFaultStage, CudaRouteDiagnostics, CudaRouteOutput, DeviceTopologyCacheSnapshot,
-    StagingSnapshot, launch, topology_cache::DeviceTopologyCache,
+    StagingSnapshot, launch,
+    topology_cache::{DevicePartition, DeviceTopologyCache},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,6 +35,69 @@ pub struct CudaPartitionedImage {
     cache: DeviceTopologyCache,
     config: CudaPartitionedConfig,
     faults: Arc<CudaFaultInjection>,
+}
+
+#[derive(Default)]
+struct RoutePhaseTiming {
+    state_initialization: Duration,
+    partition_scheduling: Duration,
+    relation_relaxation: Duration,
+    response_transfer: Duration,
+    frontier_compaction: Duration,
+    compacted_tasks: u64,
+    task_upload_bytes: usize,
+    destination_completion: Duration,
+}
+
+type PartitionTasks = (Vec<u32>, Vec<u32>);
+
+fn compact_partition_tasks(
+    partition: &DevicePartition,
+    selected_sources: &[u32],
+    cancellation: &AtomicBool,
+) -> Result<Option<PartitionTasks>, CudaError> {
+    let mut selected_edge_count = 0_usize;
+    for &(source, _, count) in &partition.host_segments {
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if selected_sources.get(source as usize).copied() == Some(1) {
+            selected_edge_count = selected_edge_count
+                .checked_add(count as usize)
+                .ok_or_else(host_compaction_allocation_error)?;
+        }
+    }
+    let mut edges = Vec::new();
+    let mut sources = Vec::new();
+    edges
+        .try_reserve_exact(selected_edge_count)
+        .map_err(|_| host_compaction_allocation_error())?;
+    sources
+        .try_reserve_exact(selected_edge_count)
+        .map_err(|_| host_compaction_allocation_error())?;
+    for &(source, start, count) in &partition.host_segments {
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if selected_sources.get(source as usize).copied() != Some(1) {
+            continue;
+        }
+        for edge in start..start.saturating_add(count) {
+            if edge & 1023 == 0 && cancellation.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            edges.push(edge);
+            sources.push(source);
+        }
+    }
+    Ok(Some((edges, sources)))
+}
+
+fn host_compaction_allocation_error() -> CudaError {
+    CudaError::new(
+        CudaFailureKind::Allocation,
+        "partitioned CUDA host task-compaction allocation failed",
+    )
 }
 
 impl CudaPartitionedImage {
@@ -122,12 +186,6 @@ impl CudaPartitionedImage {
         cancellation: &AtomicBool,
         reserved_search_bytes: usize,
     ) -> Result<CudaRouteOutput, CudaError> {
-        if request.return_paths() {
-            return Err(CudaError::new(
-                CudaFailureKind::Admission,
-                "paths are unsupported by CUDA",
-            ));
-        }
         if request.budget() != SearchBudget::Unlimited {
             return Err(CudaError::new(
                 CudaFailureKind::Admission,
@@ -148,11 +206,15 @@ impl CudaPartitionedImage {
             .iter()
             .map(|&destination| self.cpu_image.dense_node_id(destination))
             .collect();
+        let mut target_set: Vec<_> = mapped
+            .iter()
+            .filter_map(|dense| dense.map(|value| value.as_u32()))
+            .collect();
+        target_set.sort_unstable();
+        target_set.dedup();
         let cancelled_before_launch = cancellation.load(Ordering::Acquire);
         let no_search = self.cpu_image.adjacency_count() == 0
-            || mapped
-                .iter()
-                .all(|destination| destination.is_none_or(|dense| dense == origin));
+            || target_set.iter().all(|&dense| dense == origin.as_u32());
         let started = Instant::now();
         let before_host = self.cpu_image.cache_snapshot();
         let before_device = self.cache.snapshot();
@@ -161,12 +223,15 @@ impl CudaPartitionedImage {
         let mut launches = 0_u64;
         let mut logical_phases = 0_u64;
         let mut counters = [0_u64; 5];
+        let mut atomic_cas_retries = 0_u64;
         let mut cancelled = cancelled_before_launch;
+        let mut timing = RoutePhaseTiming::default();
         let distance_bits = if cancelled_before_launch || no_search {
             let mut distances = vec![f64::INFINITY.to_bits(); self.cpu_image.node_count()];
             distances[origin.as_u32() as usize] = 0.0_f64.to_bits();
             distances
         } else {
+            let initialization_started = Instant::now();
             self.faults.trip(CudaFaultStage::HostAllocation)?;
             let stream = &self.context.stream;
             let node_count = u32::try_from(self.cpu_image.node_count())
@@ -179,13 +244,16 @@ impl CudaPartitionedImage {
             let enabled_device = stream.clone_htod(&enabled).map_err(allocation_error)?;
             let multiplier_device = stream.clone_htod(&multipliers).map_err(allocation_error)?;
             let mut distances = stream.clone_htod(&initial).map_err(allocation_error)?;
+            self.faults.trip(CudaFaultStage::ParallelScratch)?;
             let mut changed = stream.alloc_zeros::<u32>(1).map_err(allocation_error)?;
+            let mut removed = stream
+                .alloc_zeros::<u32>(self.cpu_image.node_count())
+                .map_err(allocation_error)?;
             let mut status = stream.alloc_zeros::<u32>(1).map_err(allocation_error)?;
             let mut device_counters = stream.alloc_zeros::<u64>(5).map_err(allocation_error)?;
             let mut active_host = vec![0_u32; self.cpu_image.node_count()];
             active_host[origin.as_u32() as usize] = 1;
             let zero_active = vec![0_u32; self.cpu_image.node_count()];
-            let mut active_device = stream.clone_htod(&active_host).map_err(allocation_error)?;
             let mut next_active_device =
                 stream.clone_htod(&zero_active).map_err(allocation_error)?;
             host_to_device_bytes = enabled
@@ -193,22 +261,34 @@ impl CudaPartitionedImage {
                 .checked_mul(4)
                 .and_then(|value| value.checked_add(multipliers.len().checked_mul(4)?))
                 .and_then(|value| value.checked_add(initial.len().checked_mul(8)?))
-                .and_then(|value| value.checked_add(initial.len().checked_mul(8)?))
+                .and_then(|value| value.checked_add(zero_active.len().checked_mul(4)?))
                 .ok_or_else(|| invariant("request transfer byte count overflow"))?;
+            timing.state_initialization = initialization_started.elapsed();
             match algorithm {
                 CudaAlgorithm::Frontier => {
                     let phase_limit = self.cpu_image.node_count().max(1);
                     for _ in 0..phase_limit {
+                        let scheduling_started = Instant::now();
                         let partition_ids = self.active_partition_ids(&active_host);
+                        timing.partition_scheduling = timing
+                            .partition_scheduling
+                            .saturating_add(scheduling_started.elapsed());
                         if partition_ids.is_empty() {
                             break;
                         }
+                        let reset_started = Instant::now();
                         stream
                             .memcpy_htod(&[0_u32], &mut changed)
                             .map_err(synchronization_error)?;
                         stream
                             .memcpy_htod(&zero_active, &mut next_active_device)
                             .map_err(synchronization_error)?;
+                        host_to_device_bytes = host_to_device_bytes
+                            .saturating_add(4)
+                            .saturating_add(zero_active.len().saturating_mul(4));
+                        timing.state_initialization = timing
+                            .state_initialization
+                            .saturating_add(reset_started.elapsed());
                         if !self.launch_all_frontier(
                             &partition_ids,
                             cancellation,
@@ -216,47 +296,78 @@ impl CudaPartitionedImage {
                             &multiplier_device,
                             node_count,
                             relation_count,
-                            &active_device,
+                            &active_host,
                             &mut next_active_device,
                             &mut distances,
                             &mut changed,
                             &mut status,
                             &mut device_counters,
                             &mut launches,
+                            &mut timing,
                         )? {
                             cancelled = true;
                             break;
                         }
                         logical_phases = logical_phases.saturating_add(1);
+                        let scheduling_started = Instant::now();
                         let next_active = stream
                             .clone_dtoh(&next_active_device)
                             .map_err(synchronization_error)?;
                         device_to_host_bytes = device_to_host_bytes
                             .saturating_add(next_active.len().saturating_mul(4));
                         check_status(stream, &status, &mut device_to_host_bytes)?;
+                        timing.partition_scheduling = timing
+                            .partition_scheduling
+                            .saturating_add(scheduling_started.elapsed());
                         if next_active.iter().all(|&active| active == 0) {
                             break;
                         }
                         active_host = next_active;
-                        std::mem::swap(&mut active_device, &mut next_active_device);
                     }
                 }
                 CudaAlgorithm::DeltaStepping(delta) => {
                     let mut bucket = 0_u64;
                     let mut current_distances = initial;
                     loop {
+                        let reset_started = Instant::now();
+                        stream
+                            .memcpy_htod(&zero_active, &mut removed)
+                            .map_err(synchronization_error)?;
+                        host_to_device_bytes = host_to_device_bytes
+                            .saturating_add(zero_active.len().saturating_mul(4));
+                        timing.state_initialization = timing
+                            .state_initialization
+                            .saturating_add(reset_started.elapsed());
                         loop {
+                            let scheduling_started = Instant::now();
                             let partition_ids = self.bucket_partition_ids(
                                 &current_distances,
                                 delta.delta(),
                                 bucket,
                             )?;
+                            let selected_sources: Vec<u32> = current_distances
+                                .iter()
+                                .map(|&bits| {
+                                    u32::from(
+                                        launch::bucket_index(f64::from_bits(bits), delta.delta())
+                                            == Some(bucket),
+                                    )
+                                })
+                                .collect();
+                            timing.partition_scheduling = timing
+                                .partition_scheduling
+                                .saturating_add(scheduling_started.elapsed());
                             if partition_ids.is_empty() {
                                 break;
                             }
+                            let reset_started = Instant::now();
                             stream
                                 .memcpy_htod(&[0_u32], &mut changed)
                                 .map_err(synchronization_error)?;
+                            host_to_device_bytes = host_to_device_bytes.saturating_add(4);
+                            timing.state_initialization = timing
+                                .state_initialization
+                                .saturating_add(reset_started.elapsed());
                             if !self.launch_all_delta(
                                 &partition_ids,
                                 cancellation,
@@ -267,15 +378,19 @@ impl CudaPartitionedImage {
                                 delta.delta().to_bits(),
                                 bucket,
                                 0,
+                                &selected_sources,
+                                &mut removed,
                                 &mut distances,
                                 &mut changed,
                                 &mut status,
                                 &mut device_counters,
                                 &mut launches,
+                                &mut timing,
                             )? {
                                 cancelled = true;
                                 break;
                             }
+                            let scheduling_started = Instant::now();
                             let changed_host =
                                 stream.clone_dtoh(&changed).map_err(synchronization_error)?;
                             current_distances = stream
@@ -285,6 +400,9 @@ impl CudaPartitionedImage {
                                 .saturating_add(4)
                                 .saturating_add(current_distances.len().saturating_mul(8));
                             check_status(stream, &status, &mut device_to_host_bytes)?;
+                            timing.partition_scheduling = timing
+                                .partition_scheduling
+                                .saturating_add(scheduling_started.elapsed());
                             if changed_host == [0] {
                                 break;
                             }
@@ -292,8 +410,15 @@ impl CudaPartitionedImage {
                         if cancelled {
                             break;
                         }
-                        let heavy_partitions =
-                            self.bucket_partition_ids(&current_distances, delta.delta(), bucket)?;
+                        let scheduling_started = Instant::now();
+                        let removed_host =
+                            stream.clone_dtoh(&removed).map_err(synchronization_error)?;
+                        device_to_host_bytes = device_to_host_bytes
+                            .saturating_add(removed_host.len().saturating_mul(4));
+                        let heavy_partitions = self.active_partition_ids(&removed_host);
+                        timing.partition_scheduling = timing
+                            .partition_scheduling
+                            .saturating_add(scheduling_started.elapsed());
                         if !self.launch_all_delta(
                             &heavy_partitions,
                             cancellation,
@@ -304,15 +429,19 @@ impl CudaPartitionedImage {
                             delta.delta().to_bits(),
                             bucket,
                             1,
+                            &removed_host,
+                            &mut removed,
                             &mut distances,
                             &mut changed,
                             &mut status,
                             &mut device_counters,
                             &mut launches,
+                            &mut timing,
                         )? {
                             cancelled = true;
                             break;
                         }
+                        let scheduling_started = Instant::now();
                         check_status(stream, &status, &mut device_to_host_bytes)?;
                         logical_phases = logical_phases.saturating_add(1);
                         current_distances = stream
@@ -335,15 +464,15 @@ impl CudaPartitionedImage {
                                 next = Some(next.map_or(candidate, |old: u64| old.min(candidate)));
                             }
                         }
+                        timing.partition_scheduling = timing
+                            .partition_scheduling
+                            .saturating_add(scheduling_started.elapsed());
                         let Some(next) = next else { break };
                         bucket = next;
                     }
                 }
             }
-            let mut finite = stream.alloc_zeros::<u32>(1).map_err(allocation_error)?;
-            launch::launch_frontier_compaction(&self.context, &distances, node_count, &mut finite)?;
-            launches = launches.saturating_add(1);
-            let finite = stream.clone_dtoh(&finite).map_err(synchronization_error)?;
+            let response_started = Instant::now();
             let output = stream
                 .clone_dtoh(&distances)
                 .map_err(synchronization_error)?;
@@ -352,12 +481,24 @@ impl CudaPartitionedImage {
                 .map_err(synchronization_error)?;
             counters.copy_from_slice(&downloaded);
             counters[3] = logical_phases;
-            counters[4] = u64::from(finite[0]);
+            atomic_cas_retries = counters[4];
             device_to_host_bytes = device_to_host_bytes
-                .saturating_add(4 + output.len().saturating_mul(8) + counters.len() * 8);
+                .saturating_add(output.len().saturating_mul(8) + counters.len() * 8);
+            timing.response_transfer = timing
+                .response_transfer
+                .saturating_add(response_started.elapsed());
             output
         };
         cancelled |= cancellation.load(Ordering::Acquire);
+        let finalized_nodes = if cancelled {
+            0
+        } else {
+            distance_bits
+                .iter()
+                .filter(|&&bits| f64::from_bits(bits).is_finite())
+                .count() as u64
+        };
+        let destination_started = Instant::now();
         let results: Vec<_> = request
             .destinations()
             .iter()
@@ -394,21 +535,43 @@ impl CudaPartitionedImage {
         } else {
             CompletionReason::FrontierExhausted
         };
-        let response = RoutingResponse::distance_only(
+        let mut response = RoutingResponse::distance_only(
             request.origin(),
             results,
             packed.canonical().clone(),
             request.tie_policy(),
-            (counters[0], counters[4]),
+            (counters[0], finalized_nodes),
             completion,
         );
+        timing.destination_completion = timing
+            .destination_completion
+            .saturating_add(destination_started.elapsed());
+        if request.return_paths() && !cancelled {
+            self.faults.trip(CudaFaultStage::PathEvidence)?;
+            self.faults.pause_path_evidence()?;
+            let (evidence, _, _) = pathhydra_routing::route_partitioned_controlled(
+                &self.cpu_image,
+                request,
+                cancellation,
+            )
+            .map_err(|error| {
+                invariant(&format!(
+                    "same-bundle CPU path evidence pass failed: {error}"
+                ))
+            })?;
+            if evidence.completion_reason() != CompletionReason::Cancelled {
+                launch::verify_path_evidence(&response, &evidence)?;
+            }
+            response = evidence;
+        }
         let after_host = self.cpu_image.cache_snapshot();
         let after_device = self.cache.snapshot();
         let transfer_bytes = after_device
             .transfer_bytes
             .saturating_sub(before_device.transfer_bytes);
         host_to_device_bytes = host_to_device_bytes
-            .saturating_add(usize::try_from(transfer_bytes).unwrap_or(usize::MAX));
+            .saturating_add(usize::try_from(transfer_bytes).unwrap_or(usize::MAX))
+            .saturating_add(timing.task_upload_bytes);
         Ok(CudaRouteOutput {
             response,
             diagnostics: CudaRouteDiagnostics {
@@ -426,7 +589,6 @@ impl CudaPartitionedImage {
                 relaxation_attempts: counters[1],
                 relaxation_updates: counters[2],
                 phases: counters[3],
-                frontier_high_water: u32::try_from(counters[4]).unwrap_or(u32::MAX),
                 partitions_required: after_device.misses.saturating_sub(before_device.misses)
                     + after_device.hits.saturating_sub(before_device.hits),
                 host_cache_hits: after_host.hits.saturating_sub(before_host.hits),
@@ -434,6 +596,24 @@ impl CudaPartitionedImage {
                 file_bytes: after_host.read_bytes.saturating_sub(before_host.read_bytes),
                 staged_bytes: transfer_bytes,
                 transfer_bytes,
+                parallel_strategy: crate::CudaParallelStrategy::RelationThreadsAtomicBinary64,
+                reset_mode: crate::CudaResetMode::ExplicitClear,
+                target_mode: crate::CudaTargetMode::SortedSparseHost,
+                profile_mode: crate::CudaProfileMode::InlineExact,
+                path_evidence_mode: if request.return_paths() {
+                    crate::CudaPathEvidenceMode::CpuPassSameImage
+                } else {
+                    crate::CudaPathEvidenceMode::NotRequested
+                },
+                state_initialization_duration: timing.state_initialization,
+                partition_scheduling_duration: timing.partition_scheduling,
+                relation_relaxation_duration: timing.relation_relaxation,
+                response_transfer_duration: timing.response_transfer,
+                frontier_compaction_duration: timing.frontier_compaction,
+                compacted_task_count: u32::try_from(timing.compacted_tasks).unwrap_or(u32::MAX),
+                destination_completion_duration: timing.destination_completion,
+                destination_count_checked: request.destinations().len(),
+                atomic_cas_retries,
             },
         })
     }
@@ -447,15 +627,17 @@ impl CudaPartitionedImage {
         multipliers: &CudaSlice<u32>,
         node_count: u32,
         relation_count: u32,
-        active_sources: &CudaSlice<u32>,
+        active_sources: &[u32],
         next_active_sources: &mut CudaSlice<u32>,
         distances: &mut CudaSlice<u64>,
         changed: &mut CudaSlice<u32>,
         status: &mut CudaSlice<u32>,
         counters: &mut CudaSlice<u64>,
         launches: &mut u64,
+        timing: &mut RoutePhaseTiming,
     ) -> Result<bool, CudaError> {
         let mut queued = false;
+        let mut task_buffers = Vec::new();
         for &id in partition_ids {
             if cancellation.load(Ordering::Acquire) {
                 if queued {
@@ -463,6 +645,7 @@ impl CudaPartitionedImage {
                 }
                 return Ok(false);
             }
+            let scheduling_started = Instant::now();
             let partition = match self.cache.acquire(id, cancellation) {
                 Ok(Some(partition)) => partition,
                 Ok(None) => {
@@ -478,6 +661,9 @@ impl CudaPartitionedImage {
                     return Err(error);
                 }
             };
+            timing.partition_scheduling = timing
+                .partition_scheduling
+                .saturating_add(scheduling_started.elapsed());
             if cancellation.load(Ordering::Acquire) {
                 if queued {
                     self.synchronize_partition_work()?;
@@ -490,6 +676,54 @@ impl CudaPartitionedImage {
                 }
                 return Err(error);
             }
+            if let Err(error) = self.faults.trip(CudaFaultStage::TaskCompaction) {
+                if queued {
+                    self.synchronize_partition_work_after_failure();
+                }
+                return Err(error);
+            }
+            if !self.faults.pause_task_compaction(cancellation)? {
+                if queued {
+                    self.synchronize_partition_work()?;
+                }
+                return Ok(false);
+            }
+            let compaction_started = Instant::now();
+            let Some((task_edges, task_sources)) =
+                compact_partition_tasks(&partition, active_sources, cancellation)?
+            else {
+                if queued {
+                    self.synchronize_partition_work()?;
+                }
+                return Ok(false);
+            };
+            let task_count = u32::try_from(task_edges.len())
+                .map_err(|_| invariant("compacted partition task count exceeds CUDA ABI"))?;
+            if task_count == 0 {
+                timing.frontier_compaction = timing
+                    .frontier_compaction
+                    .saturating_add(compaction_started.elapsed());
+                continue;
+            }
+            let task_edges = self
+                .context
+                .stream
+                .clone_htod(&task_edges)
+                .map_err(allocation_error)?;
+            let task_sources = self
+                .context
+                .stream
+                .clone_htod(&task_sources)
+                .map_err(allocation_error)?;
+            timing.frontier_compaction = timing
+                .frontier_compaction
+                .saturating_add(compaction_started.elapsed());
+            timing.compacted_tasks = timing.compacted_tasks.saturating_add(u64::from(task_count));
+            timing.task_upload_bytes = timing
+                .task_upload_bytes
+                .saturating_add(task_edges.len().saturating_mul(4))
+                .saturating_add(task_sources.len().saturating_mul(4));
+            let relaxation_started = Instant::now();
             if let Err(error) = launch::launch_partition_frontier(
                 &self.context,
                 &partition,
@@ -497,7 +731,9 @@ impl CudaPartitionedImage {
                 multipliers,
                 node_count,
                 relation_count,
-                active_sources,
+                &task_edges,
+                &task_sources,
+                task_count,
                 next_active_sources,
                 distances,
                 changed,
@@ -516,6 +752,10 @@ impl CudaPartitionedImage {
                 self.synchronize_partition_work_after_failure();
                 return Err(error);
             }
+            task_buffers.push((task_edges, task_sources));
+            timing.relation_relaxation = timing
+                .relation_relaxation
+                .saturating_add(relaxation_started.elapsed());
             *launches = launches.saturating_add(1);
         }
         if queued {
@@ -523,7 +763,11 @@ impl CudaPartitionedImage {
                 self.synchronize_partition_work_after_failure();
                 return Err(error);
             }
+            let relaxation_started = Instant::now();
             self.synchronize_partition_work()?;
+            timing.relation_relaxation = timing
+                .relation_relaxation
+                .saturating_add(relaxation_started.elapsed());
         }
         Ok(true)
     }
@@ -540,13 +784,17 @@ impl CudaPartitionedImage {
         delta_bits: u64,
         bucket: u64,
         class: u32,
+        selected_sources: &[u32],
+        removed: &mut CudaSlice<u32>,
         distances: &mut CudaSlice<u64>,
         changed: &mut CudaSlice<u32>,
         status: &mut CudaSlice<u32>,
         counters: &mut CudaSlice<u64>,
         launches: &mut u64,
+        timing: &mut RoutePhaseTiming,
     ) -> Result<bool, CudaError> {
         let mut queued = false;
+        let mut task_buffers = Vec::new();
         for &id in partition_ids {
             if cancellation.load(Ordering::Acquire) {
                 if queued {
@@ -554,6 +802,7 @@ impl CudaPartitionedImage {
                 }
                 return Ok(false);
             }
+            let scheduling_started = Instant::now();
             let partition = match self.cache.acquire(id, cancellation) {
                 Ok(Some(partition)) => partition,
                 Ok(None) => {
@@ -569,6 +818,9 @@ impl CudaPartitionedImage {
                     return Err(error);
                 }
             };
+            timing.partition_scheduling = timing
+                .partition_scheduling
+                .saturating_add(scheduling_started.elapsed());
             if cancellation.load(Ordering::Acquire) {
                 if queued {
                     self.synchronize_partition_work()?;
@@ -581,6 +833,54 @@ impl CudaPartitionedImage {
                 }
                 return Err(error);
             }
+            if let Err(error) = self.faults.trip(CudaFaultStage::TaskCompaction) {
+                if queued {
+                    self.synchronize_partition_work_after_failure();
+                }
+                return Err(error);
+            }
+            if !self.faults.pause_task_compaction(cancellation)? {
+                if queued {
+                    self.synchronize_partition_work()?;
+                }
+                return Ok(false);
+            }
+            let compaction_started = Instant::now();
+            let Some((task_edges, task_sources)) =
+                compact_partition_tasks(&partition, selected_sources, cancellation)?
+            else {
+                if queued {
+                    self.synchronize_partition_work()?;
+                }
+                return Ok(false);
+            };
+            let task_count = u32::try_from(task_edges.len())
+                .map_err(|_| invariant("compacted partition task count exceeds CUDA ABI"))?;
+            if task_count == 0 {
+                timing.frontier_compaction = timing
+                    .frontier_compaction
+                    .saturating_add(compaction_started.elapsed());
+                continue;
+            }
+            let task_edges = self
+                .context
+                .stream
+                .clone_htod(&task_edges)
+                .map_err(allocation_error)?;
+            let task_sources = self
+                .context
+                .stream
+                .clone_htod(&task_sources)
+                .map_err(allocation_error)?;
+            timing.frontier_compaction = timing
+                .frontier_compaction
+                .saturating_add(compaction_started.elapsed());
+            timing.compacted_tasks = timing.compacted_tasks.saturating_add(u64::from(task_count));
+            timing.task_upload_bytes = timing
+                .task_upload_bytes
+                .saturating_add(task_edges.len().saturating_mul(4))
+                .saturating_add(task_sources.len().saturating_mul(4));
+            let relaxation_started = Instant::now();
             if let Err(error) = launch::launch_partition_delta(
                 &self.context,
                 &partition,
@@ -591,6 +891,10 @@ impl CudaPartitionedImage {
                 delta_bits,
                 bucket,
                 class,
+                &task_edges,
+                &task_sources,
+                task_count,
+                removed,
                 distances,
                 changed,
                 status,
@@ -608,6 +912,10 @@ impl CudaPartitionedImage {
                 self.synchronize_partition_work_after_failure();
                 return Err(error);
             }
+            task_buffers.push((task_edges, task_sources));
+            timing.relation_relaxation = timing
+                .relation_relaxation
+                .saturating_add(relaxation_started.elapsed());
             *launches = launches.saturating_add(1);
         }
         if queued {
@@ -615,7 +923,11 @@ impl CudaPartitionedImage {
                 self.synchronize_partition_work_after_failure();
                 return Err(error);
             }
+            let relaxation_started = Instant::now();
             self.synchronize_partition_work()?;
+            timing.relation_relaxation = timing
+                .relation_relaxation
+                .saturating_add(relaxation_started.elapsed());
         }
         Ok(true)
     }

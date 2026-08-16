@@ -19,7 +19,10 @@ pub struct CudaContextOwner {
     pub(crate) delta_function: CudaFunction,
     pub(crate) partition_frontier_function: CudaFunction,
     pub(crate) partition_delta_function: CudaFunction,
-    pub(crate) frontier_compaction_function: CudaFunction,
+    pub(crate) benchmark_reset_function: CudaFunction,
+    pub(crate) benchmark_target_function: CudaFunction,
+    pub(crate) benchmark_profile_inline_function: CudaFunction,
+    pub(crate) benchmark_profile_consume_function: CudaFunction,
     capabilities: CudaDeviceCapabilities,
     module_load_duration: Duration,
 }
@@ -64,11 +67,11 @@ impl CudaContextOwner {
                 })?;
         let frontier_function =
             module
-                .load_function("pathhydra_frontier_route")
+                .load_function("pathhydra_frontier_phase")
                 .map_err(|error| {
                     CudaError::new(
                         CudaFailureKind::Module,
-                        format!("embedded PTX lacks frontier kernel: {error}"),
+                        format!("embedded PTX lacks parallel frontier-phase kernel: {error}"),
                     )
                 })?;
         let validate_topology_function = module
@@ -80,11 +83,11 @@ impl CudaContextOwner {
                 )
             })?;
         let delta_function = module
-            .load_function("pathhydra_delta_route")
+            .load_function("pathhydra_delta_phase")
             .map_err(|error| {
                 CudaError::new(
                     CudaFailureKind::Module,
-                    format!("embedded PTX lacks delta kernel: {error}"),
+                    format!("embedded PTX lacks parallel delta-phase kernel: {error}"),
                 )
             })?;
         let partition_frontier_function = module
@@ -104,12 +107,37 @@ impl CudaContextOwner {
                         format!("embedded PTX lacks partition-delta kernel: {error}"),
                     )
                 })?;
-        let frontier_compaction_function = module
-            .load_function("pathhydra_frontier_compaction")
+        let benchmark_reset_function =
+            module
+                .load_function("pathhydra_benchmark_reset")
+                .map_err(|error| {
+                    CudaError::new(
+                        CudaFailureKind::Module,
+                        format!("embedded PTX lacks benchmark reset kernel: {error}"),
+                    )
+                })?;
+        let benchmark_target_function = module
+            .load_function("pathhydra_benchmark_target")
             .map_err(|error| {
                 CudaError::new(
                     CudaFailureKind::Module,
-                    format!("embedded PTX lacks frontier-compaction kernel: {error}"),
+                    format!("embedded PTX lacks benchmark target kernel: {error}"),
+                )
+            })?;
+        let benchmark_profile_inline_function = module
+            .load_function("pathhydra_benchmark_profile_inline")
+            .map_err(|error| {
+                CudaError::new(
+                    CudaFailureKind::Module,
+                    format!("embedded PTX lacks benchmark inline-profile kernel: {error}"),
+                )
+            })?;
+        let benchmark_profile_consume_function = module
+            .load_function("pathhydra_benchmark_profile_consume")
+            .map_err(|error| {
+                CudaError::new(
+                    CudaFailureKind::Module,
+                    format!("embedded PTX lacks benchmark materialized-profile kernel: {error}"),
                 )
             })?;
         Ok(Arc::new(Self {
@@ -121,7 +149,10 @@ impl CudaContextOwner {
             delta_function,
             partition_frontier_function,
             partition_delta_function,
-            frontier_compaction_function,
+            benchmark_reset_function,
+            benchmark_target_function,
+            benchmark_profile_inline_function,
+            benchmark_profile_consume_function,
             capabilities,
             module_load_duration: started.elapsed(),
         }))
@@ -144,6 +175,44 @@ impl CudaContextOwner {
         addends: &[f64],
     ) -> Result<Vec<f64>, CudaError> {
         launch::smoke_arithmetic(self, input, multipliers, addends)
+    }
+
+    pub fn benchmark_reset_strategy(
+        &self,
+        node_count: usize,
+        strategy: crate::CudaBenchmarkResetStrategy,
+    ) -> Result<(), CudaError> {
+        launch::benchmark_reset_strategy(self, node_count, strategy)
+    }
+
+    pub fn benchmark_target_strategy(
+        &self,
+        node_count: usize,
+        destinations: &[u32],
+        strategy: crate::CudaBenchmarkTargetStrategy,
+    ) -> Result<(), CudaError> {
+        launch::benchmark_target_strategy(self, node_count, destinations, strategy)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn benchmark_profile_strategy(
+        &self,
+        base_weight_bits: &[u32],
+        relation_indexes: &[u32],
+        multiplier_bits: &[u32],
+        reuse_count: usize,
+        maximum_chunk_edges: usize,
+        strategy: crate::CudaBenchmarkProfileStrategy,
+    ) -> Result<(), CudaError> {
+        launch::benchmark_profile_strategy(
+            self,
+            base_weight_bits,
+            relation_indexes,
+            multiplier_bits,
+            reuse_count,
+            maximum_chunk_edges,
+            strategy,
+        )
     }
 
     pub fn current_memory(&self) -> Result<(usize, usize), CudaError> {

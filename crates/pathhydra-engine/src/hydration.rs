@@ -168,6 +168,7 @@ pub struct HydratedSubgraph {
 
 impl GraphEngine {
     pub fn hydrate(&self, request: &HydrationRequest) -> Result<HydrationResponse, EngineError> {
+        let _operation = self.lifecycle.begin_route()?;
         let handle_count = request
             .node_ids
             .len()
@@ -197,9 +198,9 @@ impl GraphEngine {
         } else {
             None
         };
-        let batch = self
-            .catalog
-            .confirmed_records_by_id(&request.node_ids, &request.edge_ids)?;
+        let batch = self.with_catalog(|catalog| {
+            Ok(catalog.confirmed_records_by_id(&request.node_ids, &request.edge_ids)?)
+        })?;
         let mut nodes = try_vec(request.node_ids.len())?;
         for &id in &request.node_ids {
             let state = batch
@@ -236,6 +237,7 @@ impl GraphEngine {
         response: &RoutingResponse,
         destination_position: usize,
     ) -> Result<HydratedPath, EngineError> {
+        let _operation = self.lifecycle.begin_route()?;
         let destination = response.results().get(destination_position).ok_or(
             HydrationError::DestinationPositionOutOfBounds {
                 position: destination_position,
@@ -258,7 +260,8 @@ impl GraphEngine {
         let _published = self.routing.read().map_err(|_| EngineError::LockPoisoned {
             lock: "published routing state",
         })?;
-        let batch = self.catalog.confirmed_records_by_id(&node_ids, &edge_ids)?;
+        let batch = self
+            .with_catalog(|catalog| Ok(catalog.confirmed_records_by_id(&node_ids, &edge_ids)?))?;
         let missing_nodes: Vec<_> = node_ids
             .iter()
             .copied()
@@ -341,6 +344,7 @@ impl GraphEngine {
         subgraph: &Subgraph,
         profile: Option<RelationProfile>,
     ) -> Result<HydratedSubgraph, EngineError> {
+        let _operation = self.lifecycle.begin_route()?;
         let handles = subgraph.handles();
         let response = self.hydrate(&HydrationRequest::new(
             handles.nodes().iter().copied(),

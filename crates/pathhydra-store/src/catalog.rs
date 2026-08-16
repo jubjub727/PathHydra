@@ -1,14 +1,17 @@
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet, HashMap},
-    path::Path,
-    sync::{Mutex, MutexGuard, RwLock, RwLockWriteGuard},
+    fs,
+    path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard, RwLock, RwLockWriteGuard, atomic::AtomicUsize},
+    time::Instant,
 };
 
 use pathhydra_core::{
     BaseWeight, Candidate, CandidateId, ConfirmedRecord, EdgeId, EdgeRecord, NodeId, NodeName,
     NodePayload, NodeRecord, RelationId, RelationName, RelationRecord,
 };
-use rocksdb::{ColumnFamily, DB, Direction, IteratorMode, Options, WriteBatch};
+use rocksdb::{ColumnFamily, DB, Direction, IteratorMode, WriteBatch};
 
 use crate::{
     codec::{
@@ -18,14 +21,18 @@ use crate::{
         encode_name_key, encode_node, encode_relation, encode_u64_record,
     },
     column_families,
-    error::{CatalogError, ConfirmedId, EdgeEndpoint, RecordKind},
+    error::{CatalogError, ConfirmedId, EdgeEndpoint, RecordKind, rocksdb_error},
+    metrics::{StoreMetrics, WriteOperationClass},
+    operations::{OperationError, require_existing_catalog_path, validate_column_families},
+    options,
+    paths::normalize_canonical,
 };
 
 const META_NEXT_CANDIDATE_ID: &[u8] = b"next-candidate-id";
 const META_NEXT_NODE_ID: &[u8] = b"next-node-id";
 const META_NEXT_RELATION_ID: &[u8] = b"next-relation-id";
 const META_NEXT_EDGE_ID: &[u8] = b"next-edge-id";
-const META_ACTIVE_ROUTING_IMAGE: &[u8] = b"active-routing-image";
+pub(crate) const META_ACTIVE_ROUTING_IMAGE: &[u8] = b"active-routing-image";
 const INITIAL_ID: u64 = 1;
 
 type NodeNameIndex = HashMap<Box<str>, NodeId>;
@@ -80,6 +87,9 @@ impl ActiveRoutingImage {
 pub struct ConfirmedGraphScan<'a> {
     catalog: &'a Catalog,
     _guard: MutexGuard<'a, ()>,
+    started: Instant,
+    records: Cell<u64>,
+    decoded_bytes: Cell<u64>,
 }
 
 #[derive(Debug)]
@@ -99,6 +109,7 @@ impl<'a> ConfirmedGraphScan<'a> {
             let (key, value) = entry
                 .map_err(CatalogError::from)
                 .map_err(ScanError::Catalog)?;
+            self.record_decoded(&key, &value);
             let id = decode_id_key(&key)
                 .map_err(|error| record_error(column_families::NODES, "key", error))
                 .map_err(ScanError::Catalog)?;
@@ -120,6 +131,7 @@ impl<'a> ConfirmedGraphScan<'a> {
             let (key, value) = entry
                 .map_err(CatalogError::from)
                 .map_err(ScanError::Catalog)?;
+            self.record_decoded(&key, &value);
             let id = decode_id_key(&key)
                 .map_err(|error| record_error(column_families::RELATION_KINDS, "key", error))
                 .map_err(ScanError::Catalog)?;
@@ -144,6 +156,7 @@ impl<'a> ConfirmedGraphScan<'a> {
             let (key, value) = entry
                 .map_err(CatalogError::from)
                 .map_err(ScanError::Catalog)?;
+            self.record_decoded(&key, &value);
             let (source, edge_id) = decode_adjacency_key(&key)
                 .map_err(|error| record_error(column_families::OUTGOING_EDGES, "key", error))
                 .map_err(ScanError::Catalog)?;
@@ -196,13 +209,37 @@ impl<'a> ConfirmedGraphScan<'a> {
         encoded.extend_from_slice(&length.to_le_bytes());
         encoded.extend_from_slice(name);
         encoded.extend_from_slice(&pointer.manifest_checksum);
-        self.catalog.db.put(META_ACTIVE_ROUTING_IMAGE, encoded)?;
-        Ok(())
+        let mut batch = WriteBatch::default();
+        batch.put(META_ACTIVE_ROUTING_IMAGE, encoded);
+        self.catalog
+            .commit_batch(batch, WriteOperationClass::RoutingPointer)
     }
 
     pub fn clear_active_routing_image(&self) -> Result<(), CatalogError> {
-        self.catalog.db.delete(META_ACTIVE_ROUTING_IMAGE)?;
-        Ok(())
+        let mut batch = WriteBatch::default();
+        batch.delete(META_ACTIVE_ROUTING_IMAGE);
+        self.catalog
+            .commit_batch(batch, WriteOperationClass::RoutingPointer)
+    }
+
+    fn record_decoded(&self, key: &[u8], value: &[u8]) {
+        self.records.set(self.records.get().saturating_add(1));
+        self.decoded_bytes.set(
+            self.decoded_bytes
+                .get()
+                .saturating_add(u64::try_from(key.len() + value.len()).unwrap_or(u64::MAX)),
+        );
+    }
+}
+
+impl Drop for ConfirmedGraphScan<'_> {
+    fn drop(&mut self) {
+        self.catalog.metrics.record_scan(
+            true,
+            self.records.get(),
+            self.decoded_bytes.get(),
+            self.started.elapsed(),
+        );
     }
 }
 
@@ -302,30 +339,98 @@ impl ConfirmedGraphRecords {
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CatalogConfig {
+    pub maximum_concurrent_checkpoints: usize,
+}
+
+impl Default for CatalogConfig {
+    fn default() -> Self {
+        Self {
+            maximum_concurrent_checkpoints: 1,
+        }
+    }
+}
+
 pub struct Catalog {
-    db: DB,
-    write_mutex: Mutex<()>,
+    pub(crate) db: DB,
+    pub(crate) path: PathBuf,
+    pub(crate) write_mutex: Mutex<()>,
     node_names: RwLock<NodeNameIndex>,
     relation_names: RwLock<RelationNameIndex>,
+    pub(crate) metrics: StoreMetrics,
+    pub(crate) active_checkpoints: AtomicUsize,
+    pub(crate) maximum_concurrent_checkpoints: usize,
 }
 
 impl Catalog {
     /// Opens and validates a complete catalog before publishing it.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CatalogError> {
-        let mut options = Options::default();
-        options.create_if_missing(true);
-        options.create_missing_column_families(true);
+        Self::open_with_config(path, CatalogConfig::default())
+    }
 
-        let db = DB::open_cf_descriptors(&options, path, column_families::descriptors())?;
+    pub fn open_with_config(
+        path: impl AsRef<Path>,
+        config: CatalogConfig,
+    ) -> Result<Self, CatalogError> {
+        validate_config(config)?;
+        let db = DB::open_cf_descriptors(
+            &options::database_options(true),
+            path.as_ref(),
+            options::descriptors(),
+        )?;
         initialize_metadata(&db)?;
+        validate_metadata_records(&db)?;
         let (node_names, relation_names) = rebuild_indexes_and_validate(&db)?;
+        let path = normalize_canonical(fs::canonicalize(path.as_ref())?);
 
         Ok(Self {
             db,
+            path,
             write_mutex: Mutex::new(()),
             node_names: RwLock::new(node_names),
             relation_names: RwLock::new(relation_names),
+            metrics: StoreMetrics::default(),
+            active_checkpoints: AtomicUsize::new(0),
+            maximum_concurrent_checkpoints: config.maximum_concurrent_checkpoints,
         })
+    }
+
+    /// Opens only an existing catalog with exactly the current column families.
+    /// This mode never creates a database, column family, or metadata record.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, OperationError> {
+        Self::open_existing_with_config(path, CatalogConfig::default())
+    }
+
+    pub fn open_existing_with_config(
+        path: impl AsRef<Path>,
+        config: CatalogConfig,
+    ) -> Result<Self, OperationError> {
+        validate_config(config)?;
+        let path = require_existing_catalog_path(path.as_ref())?;
+        validate_column_families(&path)?;
+        let db = DB::open_cf_descriptors(
+            &options::database_options(false),
+            &path,
+            options::descriptors(),
+        )?;
+        validate_metadata_records(&db)?;
+        let (node_names, relation_names) = rebuild_indexes_and_validate(&db)?;
+        Ok(Self {
+            db,
+            path,
+            write_mutex: Mutex::new(()),
+            node_names: RwLock::new(node_names),
+            relation_names: RwLock::new(relation_names),
+            metrics: StoreMetrics::default(),
+            active_checkpoints: AtomicUsize::new(0),
+            maximum_concurrent_checkpoints: config.maximum_concurrent_checkpoints,
+        })
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Inserts a provisional node candidate with an explicitly empty payload.
@@ -477,6 +582,9 @@ impl Catalog {
         Ok(ConfirmedGraphScan {
             catalog: self,
             _guard: self.write_guard()?,
+            started: Instant::now(),
+            records: Cell::new(0),
+            decoded_bytes: Cell::new(0),
         })
     }
 
@@ -580,8 +688,7 @@ impl Catalog {
         batch.delete_cf(edges, encode_id_key(id.as_u64()));
         batch.delete_cf(outgoing, encode_adjacency_key(edge.source(), id));
         batch.delete_cf(incoming, encode_adjacency_key(edge.destination(), id));
-        self.db.write(batch)?;
-        Ok(())
+        self.commit_batch(batch, WriteOperationClass::EdgeDeletion)
     }
 
     /// Removes a confirmed node, every incident confirmed edge, and the exact
@@ -634,7 +741,7 @@ impl Catalog {
         }
         batch.delete_cf(nodes, encode_id_key(id.as_u64()));
         batch.delete_cf(names, name_key);
-        self.db.write(batch)?;
+        self.commit_batch(batch, WriteOperationClass::NodeDeletion)?;
         index.remove(node.name().as_str());
         Ok(())
     }
@@ -670,7 +777,7 @@ impl Catalog {
         let mut batch = WriteBatch::default();
         batch.put_cf(candidates, encode_id_key(next_id), encoded);
         batch.put(META_NEXT_CANDIDATE_ID, encode_u64_record(following_id));
-        self.db.write(batch)?;
+        self.commit_batch(batch, WriteOperationClass::CandidateInsertion)?;
         Ok(id)
     }
 
@@ -707,7 +814,7 @@ impl Catalog {
         batch.put_cf(names_cf, &name_key, encode_u64_record(next_id));
         batch.delete_cf(candidates, encode_id_key(candidate_id.as_u64()));
         batch.put(META_NEXT_NODE_ID, encode_u64_record(following_id));
-        self.db.write(batch)?;
+        self.commit_batch(batch, WriteOperationClass::ConfirmedPromotion)?;
 
         index.insert(record.name().as_str().into(), record.id());
         Ok(ConfirmedRecord::Node(record))
@@ -748,7 +855,7 @@ impl Catalog {
         batch.put_cf(names_cf, &name_key, encode_u64_record(next_id));
         batch.delete_cf(candidates, encode_id_key(candidate_id.as_u64()));
         batch.put(META_NEXT_RELATION_ID, encode_u64_record(following_id));
-        self.db.write(batch)?;
+        self.commit_batch(batch, WriteOperationClass::ConfirmedPromotion)?;
 
         index.insert(record.name().as_str().into(), record.id());
         Ok(ConfirmedRecord::Relation(record))
@@ -797,16 +904,35 @@ impl Catalog {
         );
         batch.delete_cf(candidates, encode_id_key(candidate_id.as_u64()));
         batch.put(META_NEXT_EDGE_ID, encode_u64_record(following_id));
-        self.db.write(batch)?;
+        self.commit_batch(batch, WriteOperationClass::ConfirmedPromotion)?;
         Ok(ConfirmedRecord::Edge(record))
     }
 
-    fn write_guard(&self) -> Result<MutexGuard<'_, ()>, CatalogError> {
+    pub(crate) fn write_guard(&self) -> Result<MutexGuard<'_, ()>, CatalogError> {
         self.write_mutex
             .lock()
             .map_err(|_| CatalogError::LockPoisoned {
                 lock: "catalog write",
             })
+    }
+
+    pub(crate) fn commit_batch(
+        &self,
+        batch: WriteBatch,
+        class: WriteOperationClass,
+    ) -> Result<(), CatalogError> {
+        let bytes = batch.size_in_bytes();
+        self.metrics.record_write_attempt(class);
+        match self.db.write_opt(batch, &options::write_options()) {
+            Ok(()) => {
+                self.metrics.record_write_success(class, bytes);
+                Ok(())
+            }
+            Err(error) => {
+                self.metrics.record_write_failure(class);
+                Err(rocksdb_error("catalog write", error))
+            }
+        }
     }
 
     fn node_index_write(&self) -> Result<RwLockWriteGuard<'_, NodeNameIndex>, CatalogError> {
@@ -859,7 +985,7 @@ fn initialize_metadata(db: &DB) -> Result<(), CatalogError> {
         for (key, _) in metadata {
             batch.put(key, encode_u64_record(INITIAL_ID));
         }
-        db.write(batch)?;
+        db.write_opt(batch, &options::write_options())?;
         return Ok(());
     }
     for (key, id) in metadata {
@@ -899,18 +1025,59 @@ fn ensure_database_empty(db: &DB) -> Result<(), CatalogError> {
     Ok(())
 }
 
-fn rebuild_indexes_and_validate(
+pub(crate) fn validate_metadata_records(db: &DB) -> Result<(), CatalogError> {
+    let allowed = [
+        META_NEXT_CANDIDATE_ID,
+        META_NEXT_NODE_ID,
+        META_NEXT_RELATION_ID,
+        META_NEXT_EDGE_ID,
+        META_ACTIVE_ROUTING_IMAGE,
+    ];
+    for entry in db.iterator(IteratorMode::Start) {
+        let (key, _) = entry?;
+        if !allowed.iter().any(|allowed| key.as_ref() == *allowed) {
+            return Err(corrupt(
+                "default",
+                bytes_id(&key),
+                "unknown metadata record in the current layout",
+            ));
+        }
+    }
+    for (key, name) in [
+        (META_NEXT_CANDIDATE_ID, "next-candidate-id"),
+        (META_NEXT_NODE_ID, "next-node-id"),
+        (META_NEXT_RELATION_ID, "next-relation-id"),
+        (META_NEXT_EDGE_ID, "next-edge-id"),
+    ] {
+        read_metadata(db, key, name)?;
+    }
+    read_active_routing_image(db)?;
+    Ok(())
+}
+
+pub(crate) fn rebuild_indexes_and_validate(
     db: &DB,
 ) -> Result<(NodeNameIndex, RelationNameIndex), CatalogError> {
-    validate_candidates(db)?;
-    let nodes = rebuild_node_index(db)?;
-    let relations = rebuild_relation_index(db)?;
-    validate_edges_and_adjacency(db)?;
-    validate_next_id_counters(db)?;
+    rebuild_indexes_and_validate_with(db, &mut || Ok(()))
+}
+
+pub(crate) fn rebuild_indexes_and_validate_with(
+    db: &DB,
+    check: &mut impl FnMut() -> Result<(), CatalogError>,
+) -> Result<(NodeNameIndex, RelationNameIndex), CatalogError> {
+    check()?;
+    validate_candidates(db, check)?;
+    let nodes = rebuild_node_index(db, check)?;
+    let relations = rebuild_relation_index(db, check)?;
+    validate_edges_and_adjacency(db, check)?;
+    validate_next_id_counters(db, check)?;
     Ok((nodes, relations))
 }
 
-fn validate_next_id_counters(db: &DB) -> Result<(), CatalogError> {
+fn validate_next_id_counters(
+    db: &DB,
+    check: &mut impl FnMut() -> Result<(), CatalogError>,
+) -> Result<(), CatalogError> {
     for (metadata_key, metadata_name, family) in [
         (
             META_NEXT_CANDIDATE_ID,
@@ -925,6 +1092,7 @@ fn validate_next_id_counters(db: &DB) -> Result<(), CatalogError> {
         ),
         (META_NEXT_EDGE_ID, "next-edge-id", column_families::EDGES),
     ] {
+        check()?;
         let next = read_metadata(db, metadata_key, metadata_name)?;
         if next == 0 {
             return Err(corrupt(
@@ -933,7 +1101,10 @@ fn validate_next_id_counters(db: &DB) -> Result<(), CatalogError> {
                 "next ID must be at least 1",
             ));
         }
-        let maximum = collect_ids(db, family)?.into_iter().max().unwrap_or(0);
+        let maximum = collect_ids_with(db, family, check)?
+            .into_iter()
+            .max()
+            .unwrap_or(0);
         if next <= maximum {
             return Err(corrupt(
                 "default",
@@ -945,9 +1116,13 @@ fn validate_next_id_counters(db: &DB) -> Result<(), CatalogError> {
     Ok(())
 }
 
-fn validate_candidates(db: &DB) -> Result<(), CatalogError> {
+fn validate_candidates(
+    db: &DB,
+    check: &mut impl FnMut() -> Result<(), CatalogError>,
+) -> Result<(), CatalogError> {
     let cf = column_family(db, column_families::CANDIDATES)?;
     for entry in db.iterator_cf(cf, IteratorMode::Start) {
+        check()?;
         let (key, value) = entry?;
         let id = decode_id_key(&key)
             .map_err(|error| record_error(column_families::CANDIDATES, bytes_id(&key), error))?;
@@ -957,11 +1132,15 @@ fn validate_candidates(db: &DB) -> Result<(), CatalogError> {
     Ok(())
 }
 
-fn rebuild_node_index(db: &DB) -> Result<NodeNameIndex, CatalogError> {
+fn rebuild_node_index(
+    db: &DB,
+    check: &mut impl FnMut() -> Result<(), CatalogError>,
+) -> Result<NodeNameIndex, CatalogError> {
     let mut names = HashMap::new();
     let names_cf = column_family(db, column_families::NODE_NAMES)?;
     let records_cf = column_family(db, column_families::NODES)?;
     for entry in db.iterator_cf(names_cf, IteratorMode::Start) {
+        check()?;
         let (key, value) = entry?;
         let name = decode_name_key(&key)
             .map_err(|error| record_error(column_families::NODE_NAMES, bytes_id(&key), error))?;
@@ -992,6 +1171,7 @@ fn rebuild_node_index(db: &DB) -> Result<NodeNameIndex, CatalogError> {
         }
     }
     for entry in db.iterator_cf(records_cf, IteratorMode::Start) {
+        check()?;
         let (key, value) = entry?;
         let id = decode_id_key(&key)
             .map_err(|error| record_error(column_families::NODES, bytes_id(&key), error))?;
@@ -1008,11 +1188,15 @@ fn rebuild_node_index(db: &DB) -> Result<NodeNameIndex, CatalogError> {
     Ok(names)
 }
 
-fn rebuild_relation_index(db: &DB) -> Result<RelationNameIndex, CatalogError> {
+fn rebuild_relation_index(
+    db: &DB,
+    check: &mut impl FnMut() -> Result<(), CatalogError>,
+) -> Result<RelationNameIndex, CatalogError> {
     let mut names = HashMap::new();
     let names_cf = column_family(db, column_families::RELATION_NAMES)?;
     let records_cf = column_family(db, column_families::RELATION_KINDS)?;
     for entry in db.iterator_cf(names_cf, IteratorMode::Start) {
+        check()?;
         let (key, value) = entry?;
         let name = decode_name_key(&key).map_err(|error| {
             record_error(column_families::RELATION_NAMES, bytes_id(&key), error)
@@ -1046,6 +1230,7 @@ fn rebuild_relation_index(db: &DB) -> Result<RelationNameIndex, CatalogError> {
         }
     }
     for entry in db.iterator_cf(records_cf, IteratorMode::Start) {
+        check()?;
         let (key, value) = entry?;
         let id = decode_id_key(&key).map_err(|error| {
             record_error(column_families::RELATION_KINDS, bytes_id(&key), error)
@@ -1064,9 +1249,13 @@ fn rebuild_relation_index(db: &DB) -> Result<RelationNameIndex, CatalogError> {
     Ok(names)
 }
 
-fn validate_edges_and_adjacency(db: &DB) -> Result<(), CatalogError> {
+fn validate_edges_and_adjacency(
+    db: &DB,
+    check: &mut impl FnMut() -> Result<(), CatalogError>,
+) -> Result<(), CatalogError> {
     let mut edges = HashMap::new();
-    for edge in all_edges(db)? {
+    for edge in all_edges_with(db, check)? {
+        check()?;
         require_node(db, edge.source(), EdgeEndpoint::Source).map_err(|_| {
             corrupt(
                 column_families::EDGES,
@@ -1098,6 +1287,7 @@ fn validate_edges_and_adjacency(db: &DB) -> Result<(), CatalogError> {
         &edges,
         true,
         &mut outgoing_count,
+        check,
     )?;
     let mut incoming_count = HashMap::new();
     validate_adjacency_family(
@@ -1106,8 +1296,10 @@ fn validate_edges_and_adjacency(db: &DB) -> Result<(), CatalogError> {
         &edges,
         false,
         &mut incoming_count,
+        check,
     )?;
     for edge in edges.values() {
+        check()?;
         if outgoing_count.get(&edge.id()) != Some(&1) {
             return Err(corrupt(
                 column_families::EDGES,
@@ -1132,9 +1324,11 @@ fn validate_adjacency_family(
     edges: &HashMap<EdgeId, EdgeRecord>,
     outgoing: bool,
     counts: &mut HashMap<EdgeId, usize>,
+    check: &mut impl FnMut() -> Result<(), CatalogError>,
 ) -> Result<(), CatalogError> {
     let cf = column_family(db, name)?;
     for entry in db.iterator_cf(cf, IteratorMode::Start) {
+        check()?;
         let (key, value) = entry?;
         let (node, edge_id) = decode_adjacency_key(&key)
             .map_err(|error| record_error(name, bytes_id(&key), error))?;
@@ -1291,10 +1485,15 @@ fn require_relation_kind(db: &DB, id: RelationId) -> Result<(), CatalogError> {
     }
 }
 
-fn collect_ids(db: &DB, name: &'static str) -> Result<Vec<u64>, CatalogError> {
+fn collect_ids_with(
+    db: &DB,
+    name: &'static str,
+    check: &mut impl FnMut() -> Result<(), CatalogError>,
+) -> Result<Vec<u64>, CatalogError> {
     let cf = column_family(db, name)?;
     let mut ids = Vec::new();
     for entry in db.iterator_cf(cf, IteratorMode::Start) {
+        check()?;
         let (key, _) = entry?;
         ids.push(decode_id_key(&key).map_err(|error| record_error(name, bytes_id(&key), error))?);
     }
@@ -1332,9 +1531,17 @@ fn all_relation_kinds(db: &DB) -> Result<Vec<RelationRecord>, CatalogError> {
 }
 
 fn all_edges(db: &DB) -> Result<Vec<EdgeRecord>, CatalogError> {
+    all_edges_with(db, &mut || Ok(()))
+}
+
+fn all_edges_with(
+    db: &DB,
+    check: &mut impl FnMut() -> Result<(), CatalogError>,
+) -> Result<Vec<EdgeRecord>, CatalogError> {
     let cf = column_family(db, column_families::EDGES)?;
     let mut edges = Vec::new();
     for entry in db.iterator_cf(cf, IteratorMode::Start) {
+        check()?;
         let (key, value) = entry?;
         let id = decode_id_key(&key)
             .map_err(|error| record_error(column_families::EDGES, bytes_id(&key), error))?;
@@ -1353,7 +1560,9 @@ fn read_metadata(db: &DB, key: &[u8], record_id: &'static str) -> Result<u64, Ca
     decode_u64_record(&value).map_err(|error| record_error("default", record_id, error))
 }
 
-fn read_active_routing_image(db: &DB) -> Result<Option<ActiveRoutingImage>, CatalogError> {
+pub(crate) fn read_active_routing_image(
+    db: &DB,
+) -> Result<Option<ActiveRoutingImage>, CatalogError> {
     let Some(encoded) = db.get(META_ACTIVE_ROUTING_IMAGE)? else {
         return Ok(None);
     };
@@ -1442,4 +1651,14 @@ fn bytes_id(bytes: &[u8]) -> String {
         let _ = write!(output, "{byte:02x}");
     }
     output
+}
+
+fn validate_config(config: CatalogConfig) -> Result<(), CatalogError> {
+    if config.maximum_concurrent_checkpoints == 0 {
+        return Err(CatalogError::InvalidConfiguration {
+            field: "maximum_concurrent_checkpoints",
+            reason: "must be nonzero",
+        });
+    }
+    Ok(())
 }

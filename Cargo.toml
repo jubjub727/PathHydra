@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/pathhydra-admin",
     "crates/pathhydra-core",
     "crates/pathhydra-bench",
     "crates/pathhydra-cuda",

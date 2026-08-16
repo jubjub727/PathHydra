@@ -85,6 +85,80 @@ fn forced_partitioned_frontier_and_delta_route_on_bounded_device_cache() {
 }
 
 #[test]
+fn shutdown_cancels_real_queued_and_active_cuda_routes_and_joins_worker() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = std::sync::Arc::new(
+        GraphEngine::open(
+            directory.path(),
+            EngineConfig {
+                shutdown_drain_timeout: std::time::Duration::from_secs(5),
+                cuda: CudaConfig {
+                    enabled: true,
+                    executor_policy: CudaExecutorPolicy::RequireCuda,
+                    minimum_free_memory_headroom: 0,
+                    maximum_concurrent_searches: 2,
+                    maximum_batch_lanes: 1,
+                    batch_collection_delay: std::time::Duration::ZERO,
+                    algorithm: CudaAlgorithmSelection::Frontier,
+                    ..CudaConfig::default()
+                },
+                ..EngineConfig::default()
+            },
+        )
+        .unwrap(),
+    );
+    let (source, destination, relation) = populate(&engine);
+    let route = request(source, destination, relation, true, SearchBudget::Unlimited);
+    let faults = engine.cuda_fault_injection().unwrap();
+    faults.hold_path_evidence(true);
+
+    let active = {
+        let engine = std::sync::Arc::clone(&engine);
+        let route = route.clone();
+        std::thread::spawn(move || engine.route(RequestId::new(700), &route))
+    };
+    assert!(faults.wait_for_path_evidence(std::time::Duration::from_secs(5)));
+    let queued = {
+        let engine = std::sync::Arc::clone(&engine);
+        std::thread::spawn(move || engine.route(RequestId::new(701), &route))
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let health = engine.health().unwrap();
+        if health.active_routes == 2
+            && health.cuda.active_lanes == 1
+            && health.cuda.queued_lanes == 1
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "CUDA routes never reached one active and one queued lane"
+        );
+        std::thread::yield_now();
+    }
+
+    let release = {
+        let faults = std::sync::Arc::clone(&faults);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            faults.hold_path_evidence(false);
+        })
+    };
+    let shutdown = engine.shutdown().unwrap();
+    release.join().unwrap();
+    let _ = active.join().unwrap();
+    let _ = queued.join().unwrap();
+    assert!(shutdown.complete(), "{:#?}", shutdown.failures);
+    assert_eq!(shutdown.active_requests_signalled, 2);
+    assert_eq!(shutdown.newly_signalled_requests, 2);
+    assert!(shutdown.drain.drained);
+    assert_eq!(shutdown.active_before.routes, 2);
+    assert_eq!(shutdown.drained.routes, 2);
+    assert!(shutdown.cuda_worker.is_some_and(|worker| worker.joined));
+}
+
+#[test]
 fn partitioned_cuda_requests_do_not_mix_bundles_during_node_deletion() {
     let directory = tempfile::tempdir().unwrap();
     let engine = std::sync::Arc::new(
@@ -225,7 +299,7 @@ fn request(
 }
 
 #[test]
-fn prefer_cuda_publishes_matching_residency_and_paths_fall_back_to_cpu() {
+fn prefer_cuda_publishes_matching_residency_and_exact_path_evidence() {
     let directory = tempfile::tempdir().unwrap();
     let engine = GraphEngine::open(
         directory.path(),
@@ -256,11 +330,20 @@ fn prefer_cuda_publishes_matching_residency_and_paths_fall_back_to_cpu() {
             &request(source, destination, relation, true, SearchBudget::Unlimited),
         )
         .unwrap();
-    assert_eq!(paths.diagnostics.executor, Executor::CpuReference);
+    assert_eq!(paths.diagnostics.executor, Executor::NvidiaCuda);
+    assert_eq!(paths.diagnostics.cuda_fallback_reason, None);
     assert_eq!(
-        paths.diagnostics.cuda_fallback_reason,
-        Some(CudaIneligibility::PathsUnsupportedByCuda)
+        paths
+            .diagnostics
+            .cuda
+            .as_ref()
+            .map(|diagnostics| diagnostics.path_evidence_mode),
+        Some("cpu-pass-same-image")
     );
+    assert!(matches!(
+        paths.response.results()[0].state(),
+        DestinationState::Exact(exact) if exact.path().is_some()
+    ));
     assert!(matches!(
         engine.health().unwrap().cuda.availability,
         CudaAvailability::Available
@@ -343,7 +426,7 @@ fn partitioned_context_loss_falls_back_to_cpu_until_explicit_reinitialization() 
 }
 
 #[test]
-fn require_cuda_refuses_unsupported_request_shapes_before_allocation() {
+fn require_cuda_accepts_exact_paths_and_refuses_finite_budgets_before_allocation() {
     let directory = tempfile::tempdir().unwrap();
     let engine = GraphEngine::open(
         directory.path(),
@@ -351,14 +434,16 @@ fn require_cuda_refuses_unsupported_request_shapes_before_allocation() {
     )
     .unwrap();
     let (source, destination, relation) = populate(&engine);
-    assert!(matches!(
-        engine.route(
+    let path = engine
+        .route(
             RequestId::new(10),
             &request(source, destination, relation, true, SearchBudget::Unlimited),
-        ),
-        Err(EngineError::CudaIneligible(
-            CudaIneligibility::PathsUnsupportedByCuda
-        ))
+        )
+        .unwrap();
+    assert_eq!(path.diagnostics.executor, Executor::NvidiaCuda);
+    assert!(matches!(
+        path.response.results()[0].state(),
+        DestinationState::Exact(exact) if exact.path().is_some()
     ));
     assert!(matches!(
         engine.route(
@@ -394,6 +479,7 @@ fn concurrent_origins_collect_as_independent_cuda_lanes() {
             maximum_partitioned_topology_cache_bytes: 64,
             maximum_partitioned_topology_cache_slots: 1,
             maximum_partitioned_host_staging_bytes: 64,
+            maximum_batch_lanes: 2,
             batch_collection_delay: std::time::Duration::from_millis(20),
             ..CudaConfig::default()
         },
@@ -443,4 +529,115 @@ fn concurrent_origins_collect_as_independent_cuda_lanes() {
     let health = engine.health().unwrap();
     assert!(health.cuda.partitioned_topology);
     assert!(health.cuda.device_topology_cache.unwrap().coalesced_waits > 0);
+}
+
+#[test]
+fn concurrent_delta_lanes_keep_independent_phase_progress() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = std::sync::Arc::new(
+        GraphEngine::open(
+            directory.path(),
+            EngineConfig {
+                cuda: CudaConfig {
+                    enabled: true,
+                    executor_policy: CudaExecutorPolicy::RequireCuda,
+                    minimum_free_memory_headroom: 0,
+                    maximum_reserved_search_bytes: 64 * 1024 * 1024,
+                    maximum_concurrent_searches: 2,
+                    maximum_batch_lanes: 2,
+                    batch_collection_delay: std::time::Duration::from_millis(20),
+                    algorithm: CudaAlgorithmSelection::DeltaStepping { delta: 0.1 },
+                    ..CudaConfig::default()
+                },
+                ..EngineConfig::default()
+            },
+        )
+        .unwrap(),
+    );
+    let mut nodes = Vec::new();
+    for index in 0..12 {
+        let candidate = engine
+            .insert_node_candidate(format!("delta-lane-node-{index}"))
+            .unwrap();
+        let ConfirmedRecord::Node(node) = engine
+            .confirm_validated_candidate(candidate)
+            .unwrap()
+            .into_parts()
+            .0
+        else {
+            panic!()
+        };
+        nodes.push(node.id());
+    }
+    let candidate = engine.insert_relation_candidate("delta-lane-road").unwrap();
+    let ConfirmedRecord::Relation(relation) = engine
+        .confirm_validated_candidate(candidate)
+        .unwrap()
+        .into_parts()
+        .0
+    else {
+        panic!()
+    };
+    for pair in nodes.windows(2) {
+        let candidate = engine
+            .insert_edge_candidate(pair[0], pair[1], relation.id(), 0.25)
+            .unwrap();
+        engine.confirm_validated_candidate(candidate).unwrap();
+    }
+    let requests = [
+        request(
+            nodes[0],
+            nodes[11],
+            relation.id(),
+            false,
+            SearchBudget::Unlimited,
+        ),
+        request(
+            nodes[8],
+            nodes[11],
+            relation.id(),
+            false,
+            SearchBudget::Unlimited,
+        ),
+    ];
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let workers: Vec<_> = requests
+        .into_iter()
+        .enumerate()
+        .map(|(lane, route)| {
+            let engine = engine.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                engine
+                    .route(RequestId::new(40_000 + lane as u64), &route)
+                    .unwrap()
+            })
+        })
+        .collect();
+    barrier.wait();
+    let outputs: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    let cuda: Vec<_> = outputs
+        .iter()
+        .map(|output| {
+            assert_eq!(output.diagnostics.executor, Executor::NvidiaCuda);
+            output.diagnostics.cuda.as_ref().unwrap()
+        })
+        .collect();
+    assert!(cuda.iter().all(|diagnostics| diagnostics.batch_width == 2));
+    assert_ne!(cuda[0].lane_index, cuda[1].lane_index);
+    assert_ne!(cuda[0].phases, cuda[1].phases);
+    assert!(matches!(
+        outputs[0].response.results()[0].state(),
+        DestinationState::Exact(exact)
+            if exact.logical_distance().to_bits() == (11.0_f64 * 0.25).to_bits()
+    ));
+    assert!(matches!(
+        outputs[1].response.results()[0].state(),
+        DestinationState::Exact(exact)
+            if exact.logical_distance().to_bits() == (3.0_f64 * 0.25).to_bits()
+    ));
 }

@@ -38,15 +38,13 @@ pub struct DeviceTopologyCacheSnapshot {
 
 #[derive(Debug)]
 pub(crate) struct DevicePartition {
-    pub segment_sources: CudaSlice<u32>,
-    pub segment_starts: CudaSlice<u32>,
-    pub segment_counts: CudaSlice<u32>,
     pub destinations: CudaSlice<u32>,
     pub relation_indexes: CudaSlice<u32>,
     pub base_weight_bits: CudaSlice<u32>,
-    pub segment_count: u32,
     pub edge_count: u32,
+    pub host_segments: Vec<(u32, u32, u32)>,
     pub bytes: usize,
+    pub transfer_bytes: usize,
 }
 
 struct ReadyEntry {
@@ -429,7 +427,9 @@ impl DeviceTopologyCache {
             }),
         );
         state.copies = state.copies.saturating_add(1);
-        state.transfer_bytes = state.transfer_bytes.saturating_add(bytes as u64);
+        state.transfer_bytes = state
+            .transfer_bytes
+            .saturating_add(partition.transfer_bytes as u64);
         self.inner.changed.notify_all();
         Ok(Some(DevicePartitionLease {
             id,
@@ -444,14 +444,8 @@ impl DeviceTopologyCache {
     ) -> Result<Arc<DevicePartition>, CudaError> {
         self.inner.faults.trip(CudaFaultStage::Copy)?;
         let segments: Vec<_> = host.source_segments().collect();
-        let sources: Vec<_> = segments.iter().map(|segment| segment.source).collect();
-        let starts: Vec<_> = segments.iter().map(|segment| segment.start).collect();
-        let counts: Vec<_> = segments.iter().map(|segment| segment.edge_count).collect();
         let stream = &self.inner.copy_stream;
         let partition = Arc::new(DevicePartition {
-            segment_sources: stream.clone_htod(&sources).map_err(upload_error)?,
-            segment_starts: stream.clone_htod(&starts).map_err(upload_error)?,
-            segment_counts: stream.clone_htod(&counts).map_err(upload_error)?,
             destinations: stream
                 .clone_htod(host.destinations())
                 .map_err(upload_error)?,
@@ -461,11 +455,18 @@ impl DeviceTopologyCache {
             base_weight_bits: stream
                 .clone_htod(host.base_weight_bits())
                 .map_err(upload_error)?,
-            segment_count: u32::try_from(segments.len())
-                .map_err(|_| cache_error("segment count exceeds CUDA ABI"))?,
             edge_count: u32::try_from(host.destinations().len())
                 .map_err(|_| cache_error("edge count exceeds CUDA ABI"))?,
-            bytes: host_device_bytes(host)?,
+            host_segments: segments
+                .iter()
+                .map(|segment| (segment.source, segment.start, segment.edge_count))
+                .collect(),
+            bytes: cached_partition_bytes(host)?,
+            transfer_bytes: host
+                .destinations()
+                .len()
+                .checked_mul(12)
+                .ok_or_else(|| cache_error("partition transfer byte count overflow"))?,
         });
         let copy_complete = stream.record_event(None).map_err(upload_error)?;
         if let Err(error) = self.inner.faults.trip(CudaFaultStage::ContextLoss) {
@@ -671,11 +672,12 @@ fn device_partition_bytes(
         .ok_or_else(|| cache_error("partition device byte count overflow"))
 }
 
-fn host_device_bytes(host: &pathhydra_routing::PartitionLease) -> Result<usize, CudaError> {
-    host.source_segments()
+fn cached_partition_bytes(host: &pathhydra_routing::PartitionLease) -> Result<usize, CudaError> {
+    let segment_count = host.source_segments().count();
+    host.destinations()
         .len()
         .checked_mul(12)
-        .and_then(|value| value.checked_add(host.destinations().len().checked_mul(12)?))
+        .and_then(|bytes| bytes.checked_add(segment_count.checked_mul(12)?))
         .ok_or_else(|| cache_error("partition device byte count overflow"))
 }
 

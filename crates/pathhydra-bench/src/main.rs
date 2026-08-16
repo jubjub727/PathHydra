@@ -1,15 +1,35 @@
 mod fixtures;
+mod operations;
 mod report;
 mod routing;
 mod scale;
+mod strategy;
 
 fn main() {
     let arguments: Vec<_> = std::env::args().collect();
     if arguments.len() < 3 || arguments[1] != "--suite" {
         eprintln!(
-            "usage: pathhydra-bench --suite baseline|out-of-core|scale [directory] [target-gib]"
+            "usage: pathhydra-bench --suite baseline|out-of-core|parallel-strategy|operations|scale [repeat-count|directory] [target-gib]"
         );
         std::process::exit(2);
+    }
+    if arguments[2] == "operations" {
+        operations::run();
+        return;
+    }
+    if arguments[2] == "parallel-strategy" {
+        let repeats = arguments.get(3).map_or(5, |value| {
+            value
+                .parse::<usize>()
+                .expect("repeat count must be a positive integer")
+        });
+        if repeats == 0 {
+            eprintln!("repeat count must be a positive integer");
+            std::process::exit(2);
+        }
+        report::strategy_header();
+        strategy::run(repeats);
+        return;
     }
     report::header();
     if arguments[2] == "scale" {

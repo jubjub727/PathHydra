@@ -34,8 +34,6 @@ pub struct CudaConfig {
     pub maximum_reserved_search_bytes: usize,
     pub batch_collection_delay: Duration,
     pub algorithm: CudaAlgorithmSelection,
-    pub delta_candidates: [f64; 4],
-    pub delta_candidate_count: usize,
 }
 
 impl Default for CudaConfig {
@@ -50,12 +48,10 @@ impl Default for CudaConfig {
             maximum_partitioned_host_staging_bytes: 32 * 1024 * 1024,
             minimum_free_memory_headroom: 1024 * 1024 * 1024,
             maximum_concurrent_searches: 4,
-            maximum_batch_lanes: 4,
+            maximum_batch_lanes: 1,
             maximum_reserved_search_bytes: 2 * 1024 * 1024 * 1024,
-            batch_collection_delay: Duration::from_micros(100),
+            batch_collection_delay: Duration::ZERO,
             algorithm: CudaAlgorithmSelection::Automatic,
-            delta_candidates: [0.01, 0.1, 1.0, 10.0],
-            delta_candidate_count: 4,
         }
     }
 }
@@ -64,7 +60,6 @@ impl Default for CudaConfig {
 pub enum CudaIneligibility {
     Disabled,
     SupportNotCompiled,
-    PathsUnsupportedByCuda,
     FiniteEdgeBudgetUnsupportedByCuda,
     NoResidentImage(String),
     ResourceRefusal(String),
@@ -77,7 +72,6 @@ impl fmt::Display for CudaIneligibility {
         match self {
             Self::Disabled => formatter.write_str("CUDA is disabled"),
             Self::SupportNotCompiled => formatter.write_str("CUDA support is not compiled in"),
-            Self::PathsUnsupportedByCuda => formatter.write_str("paths are unsupported by CUDA"),
             Self::FiniteEdgeBudgetUnsupportedByCuda => {
                 formatter.write_str("finite examined-edge budgets are unsupported by CUDA")
             }
@@ -133,11 +127,24 @@ pub struct CudaRequestDiagnostics {
     pub relaxation_attempts: u64,
     pub relaxation_updates: u64,
     pub phases: u64,
-    pub frontier_high_water: u32,
     pub partitions_required: u64,
     pub host_cache_hits: u64,
     pub device_cache_hits: u64,
     pub file_bytes: u64,
     pub staged_bytes: u64,
     pub transfer_bytes: u64,
+    pub parallel_strategy: &'static str,
+    pub reset_mode: &'static str,
+    pub target_mode: &'static str,
+    pub profile_mode: &'static str,
+    pub path_evidence_mode: &'static str,
+    pub state_initialization_duration: Duration,
+    pub partition_scheduling_duration: Duration,
+    pub relation_relaxation_duration: Duration,
+    pub response_transfer_duration: Duration,
+    pub frontier_compaction_duration: Duration,
+    pub compacted_task_count: u32,
+    pub destination_completion_duration: Duration,
+    pub destination_count_checked: usize,
+    pub atomic_cas_retries: u64,
 }
