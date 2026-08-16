@@ -37,6 +37,7 @@ impl CudaFaultInjection {
         self.hold_completion_events.store(hold, Ordering::Release);
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn completion_events_held(&self) -> bool {
         self.hold_completion_events.load(Ordering::Acquire)
     }
