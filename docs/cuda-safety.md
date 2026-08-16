@@ -29,3 +29,9 @@ Sanitizer:
 ```powershell
 powershell -File Scripts/sanitize-cuda-tests.ps1
 ```
+
+On Windows systems using WDDM, Compute Sanitizer can require NVIDIA's
+`EnableDebuggerInterface.bat` to be run explicitly as an administrator before
+instrumentation. That toolkit-provided script sets
+`HKLM\SOFTWARE\NVIDIA Corporation\GPUDebugger\EnableInterface` to `1`; remove
+the value after testing if the debugging interface should not remain enabled.

@@ -37,8 +37,8 @@ Measured warm route time in microseconds (all correctness fields were `true`):
 The first upload includes module/context cold effects; subsequent upload rows
 show steady context behavior. The CUDA Driver API version query returned 13030.
 
-Compute Sanitizer was not present in the driver-only development environment;
-`Scripts/sanitize-cuda-tests.ps1` fails visibly until an approved toolkit is
-installed. Numerical agreement and real Driver API smoke/integration tests are
-authoritative, but sanitizer completion remains an operational prerequisite
-before a public release.
+NVIDIA Compute Sanitizer 2026.2.1 from the CUDA 13.3.1 toolkit ran the complete
+agreement suite. `memcheck` reported 0 errors. `racecheck` reported 0 hazards,
+0 errors, and 0 warnings. The run used
+`Scripts/sanitize-cuda-tests.ps1` after explicitly enabling NVIDIA's WDDM
+debugger interface as documented in `docs/cuda-safety.md`.
