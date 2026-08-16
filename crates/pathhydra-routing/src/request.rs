@@ -216,6 +216,14 @@ impl ExactRoute {
         self.path.as_deref()
     }
 
+    #[must_use]
+    pub const fn distance_only(logical_distance: f64) -> Self {
+        Self {
+            logical_distance,
+            path: None,
+        }
+    }
+
     pub(crate) const fn new(logical_distance: f64, path: Option<Arc<RoutePath>>) -> Self {
         Self {
             logical_distance,
@@ -246,6 +254,11 @@ impl DestinationResult {
     #[must_use]
     pub const fn state(&self) -> &DestinationState {
         &self.state
+    }
+
+    #[must_use]
+    pub const fn from_state(destination: NodeId, state: DestinationState) -> Self {
+        Self { destination, state }
     }
 
     pub(crate) const fn new(destination: NodeId, state: DestinationState) -> Self {
@@ -302,6 +315,28 @@ impl RoutingResponse {
     #[must_use]
     pub const fn completion_reason(&self) -> CompletionReason {
         self.completion_reason
+    }
+
+    /// Constructs a validated distance-only executor response while preserving
+    /// the common public routing contract.
+    #[must_use]
+    pub fn distance_only(
+        origin: NodeId,
+        results: Vec<DestinationResult>,
+        profile: RelationProfile,
+        tie_policy: TiePolicy,
+        counts: (u64, u64),
+        completion_reason: CompletionReason,
+    ) -> Self {
+        Self::new(
+            origin,
+            results,
+            profile,
+            tie_policy,
+            false,
+            counts,
+            completion_reason,
+        )
     }
 
     pub(crate) fn new(

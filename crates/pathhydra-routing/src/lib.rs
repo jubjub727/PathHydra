@@ -63,8 +63,8 @@ pub use cpu::{
 };
 pub use error::{ArithmeticError, ArithmeticOperation, CompileError, ProfileError, RoutingError};
 pub use image::{
-    DenseNodeId, ElementWidths, ImageByteCounts, NUMERIC_POLICY_ID, OutgoingEdge, RoutingImage,
-    RoutingImageManifest, TIE_POLICY_ID,
+    DenseNodeId, ElementWidths, GpuTopologyManifest, ImageByteCounts, NUMERIC_POLICY_ID,
+    OutgoingEdge, RoutingImage, RoutingImageArrays, RoutingImageManifest, TIE_POLICY_ID,
 };
 pub use profile::{
     InvalidRelationMultiplier, PackedRelationProfile, RelationMultiplier, RelationProfile,

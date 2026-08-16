@@ -139,6 +139,26 @@ impl PackedRelationProfile {
         &self.canonical
     }
 
+    /// Returns fixed-width enabled flags and canonical multiplier bits in dense
+    /// relation-index order for an accelerator request.
+    pub fn accelerator_arrays(&self) -> (Vec<u32>, Vec<u32>) {
+        let mut enabled = Vec::with_capacity(self.uses.len());
+        let mut multiplier_bits = Vec::with_capacity(self.uses.len());
+        for relation_use in &self.uses {
+            match relation_use {
+                RelationUse::Disabled => {
+                    enabled.push(0);
+                    multiplier_bits.push(0);
+                }
+                RelationUse::Enabled(multiplier) => {
+                    enabled.push(1);
+                    multiplier_bits.push(multiplier.to_bits());
+                }
+            }
+        }
+        (enabled, multiplier_bits)
+    }
+
     pub(crate) fn relation_use(&self, image: &RoutingImage, id: RelationId) -> Option<RelationUse> {
         image
             .relation_index(id)

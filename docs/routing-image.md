@@ -24,9 +24,10 @@ slices:
 | external-to-dense | sorted `(NodeId, DenseNodeId)` entries |
 | dense-to-external | one `NodeId` for each dense node |
 | offsets | one `u64` start offset per node plus a final sentinel |
-| destinations | destination dense node per adjacency entry |
+| destinations | `u32` destination dense node per adjacency entry |
 | relation IDs | stable relation-kind ID per adjacency entry |
-| base weights | canonical `BaseWeight` per adjacency entry |
+| relation indexes | `u32` dense profile index per adjacency entry |
+| base-weight bits | canonical binary32 bits per adjacency entry |
 | edge IDs | stable edge ID per adjacency entry |
 | confirmed relation IDs | sorted relation kinds used to pack profiles |
 
@@ -37,11 +38,22 @@ any checked count or conversion overflow. Each source range is sorted by
 ascending `EdgeId`. Parallel edges and self-edges remain separate. Names,
 payloads, relation labels, and incoming adjacency are not copied.
 
+`RoutingImageArrays` exposes only read-only fixed-width topology slices plus
+host-only node/relation identity mappings. The dense relation index is
+rebuildable routing state, never relation identity. CPU path evidence continues
+to use stable relation and edge IDs.
+
 The manifest identifies the numeric and tie policies, node, relation-kind, and
 adjacency counts, element widths, exact allocated bytes represented by every
 boxed topology/mapping slice, and the presence of predecessor-capable edge
 IDs. It deliberately has no checksum because there are no canonical serialized
 bytes.
+
+The GPU topology manifest separately counts only offsets plus destination,
+relation-index, and base-weight arrays. Stable IDs, edge IDs, payloads, search
+state, packed profiles, queues, counters, destinations, and allocator headroom
+are not included. CUDA residency and search accounting report those categories
+separately.
 
 ## Profiles and arithmetic
 

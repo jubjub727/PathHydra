@@ -6,6 +6,37 @@ use std::{
 
 use pathhydra_routing::{RoutingImage, RoutingImageManifest};
 
+#[derive(Debug)]
+pub(crate) struct PublishedExecutionImage {
+    pub cpu: Arc<RoutingImage>,
+    #[cfg(feature = "cuda")]
+    pub cuda: Option<Arc<pathhydra_cuda::CudaResidentImage>>,
+    pub cuda_unavailable_reason: Option<crate::CudaAvailability>,
+}
+
+impl PublishedExecutionImage {
+    pub fn cpu_only(image: Arc<RoutingImage>, reason: crate::CudaAvailability) -> Self {
+        Self {
+            cpu: image,
+            #[cfg(feature = "cuda")]
+            cuda: None,
+            cuda_unavailable_reason: Some(reason),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn with_cuda(
+        image: Arc<RoutingImage>,
+        cuda: Arc<pathhydra_cuda::CudaResidentImage>,
+    ) -> Self {
+        Self {
+            cpu: image,
+            cuda: Some(cuda),
+            cuda_unavailable_reason: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RoutingUnavailableReason {
     ImageCompilation(String),
@@ -109,7 +140,7 @@ impl<T> ConfirmedMutation<T> {
 
 pub(crate) enum RoutingState {
     Available {
-        image: Arc<RoutingImage>,
+        image: Arc<PublishedExecutionImage>,
         published_at: Instant,
         last_build: ImageBuildReport,
     },
@@ -122,14 +153,21 @@ pub(crate) enum RoutingState {
 impl RoutingState {
     pub fn image(&self) -> Result<Arc<RoutingImage>, RoutingUnavailableReason> {
         match self {
-            Self::Available { image, .. } => Ok(Arc::clone(image)),
+            Self::Available { image, .. } => Ok(Arc::clone(&image.cpu)),
             Self::Unavailable { reason, .. } => Err(reason.clone()),
         }
     }
     pub fn manifest(&self) -> Option<&RoutingImageManifest> {
         match self {
-            Self::Available { image, .. } => Some(image.manifest()),
+            Self::Available { image, .. } => Some(image.cpu.manifest()),
             Self::Unavailable { .. } => None,
+        }
+    }
+
+    pub fn execution(&self) -> Result<Arc<PublishedExecutionImage>, RoutingUnavailableReason> {
+        match self {
+            Self::Available { image, .. } => Ok(Arc::clone(image)),
+            Self::Unavailable { reason, .. } => Err(reason.clone()),
         }
     }
     pub fn age(&self) -> Option<Duration> {

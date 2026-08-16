@@ -2,6 +2,8 @@
 resolver = "3"
 members = [
     "crates/pathhydra-core",
+    "crates/pathhydra-bench",
+    "crates/pathhydra-cuda",
     "crates/pathhydra-engine",
     "crates/pathhydra-routing",
     "crates/pathhydra-store",

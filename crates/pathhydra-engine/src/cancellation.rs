@@ -79,6 +79,10 @@ impl RequestRegistration<'_> {
     pub fn flag(&self) -> &AtomicBool {
         &self.flag
     }
+    #[cfg(feature = "cuda")]
+    pub fn flag_arc(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.flag)
+    }
 }
 impl Drop for RequestRegistration<'_> {
     fn drop(&mut self) {

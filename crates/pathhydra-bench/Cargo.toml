@@ -1,5 +1,5 @@
 [package]
-name = "pathhydra-engine"
+name = "pathhydra-bench"
 version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
@@ -13,9 +13,6 @@ pathhydra-core = { path = "../pathhydra-core" }
 pathhydra-cuda = { path = "../pathhydra-cuda", optional = true }
 pathhydra-routing = { path = "../pathhydra-routing" }
 pathhydra-store = { path = "../pathhydra-store" }
-pathhydra-subgraph = { path = "../pathhydra-subgraph" }
-
-[dev-dependencies]
 tempfile = "3.27.0"
 
 [lints]

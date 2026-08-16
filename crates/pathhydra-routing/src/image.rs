@@ -35,6 +35,7 @@ pub struct ElementWidths {
     pub node_id: usize,
     pub offset: usize,
     pub relation_id: usize,
+    pub relation_index: usize,
     pub base_weight: usize,
     pub edge_id: usize,
 }
@@ -46,6 +47,7 @@ pub struct ImageByteCounts {
     pub offsets: usize,
     pub destinations: usize,
     pub relation_ids: usize,
+    pub relation_indexes: usize,
     pub base_weights: usize,
     pub edge_ids: usize,
     pub confirmed_relation_ids: usize,
@@ -66,6 +68,9 @@ impl ImageByteCounts {
         let Some(total) = total.checked_add(self.relation_ids) else {
             return None;
         };
+        let Some(total) = total.checked_add(self.relation_indexes) else {
+            return None;
+        };
         let Some(total) = total.checked_add(self.base_weights) else {
             return None;
         };
@@ -73,6 +78,35 @@ impl ImageByteCounts {
             return None;
         };
         total.checked_add(self.confirmed_relation_ids)
+    }
+
+    #[must_use]
+    pub const fn total(self) -> usize {
+        match self.checked_total() {
+            Some(total) => total,
+            None => usize::MAX,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuTopologyManifest {
+    pub offset_bytes: usize,
+    pub destination_bytes: usize,
+    pub relation_index_bytes: usize,
+    pub base_weight_bytes: usize,
+}
+
+impl GpuTopologyManifest {
+    #[must_use]
+    pub const fn checked_total(self) -> Option<usize> {
+        let Some(total) = self.offset_bytes.checked_add(self.destination_bytes) else {
+            return None;
+        };
+        let Some(total) = total.checked_add(self.relation_index_bytes) else {
+            return None;
+        };
+        total.checked_add(self.base_weight_bytes)
     }
 
     #[must_use]
@@ -137,6 +171,7 @@ pub struct OutgoingEdge {
     destination: DenseNodeId,
     relation_id: RelationId,
     base_weight: BaseWeight,
+    relation_index: u32,
 }
 
 impl OutgoingEdge {
@@ -156,6 +191,21 @@ impl OutgoingEdge {
     pub const fn base_weight(self) -> BaseWeight {
         self.base_weight
     }
+    #[must_use]
+    pub const fn relation_index(self) -> u32 {
+        self.relation_index
+    }
+}
+
+/// Read-only, fixed-width arrays used to create a CUDA-resident routing image.
+#[derive(Clone, Copy, Debug)]
+pub struct RoutingImageArrays<'a> {
+    pub offsets: &'a [u64],
+    pub destinations: &'a [u32],
+    pub relation_indexes: &'a [u32],
+    pub base_weight_bits: &'a [u32],
+    pub dense_to_external: &'a [NodeId],
+    pub confirmed_relation_ids: &'a [RelationId],
 }
 
 #[derive(Clone, Debug)]
@@ -163,9 +213,10 @@ pub struct RoutingImage {
     pub(crate) external_to_dense: Box<[(NodeId, DenseNodeId)]>,
     pub(crate) dense_to_external: Box<[NodeId]>,
     pub(crate) offsets: Box<[u64]>,
-    pub(crate) destinations: Box<[DenseNodeId]>,
+    pub(crate) destinations: Box<[u32]>,
     pub(crate) relation_ids: Box<[RelationId]>,
-    pub(crate) base_weights: Box<[BaseWeight]>,
+    pub(crate) relation_indexes: Box<[u32]>,
+    pub(crate) base_weight_bits: Box<[u32]>,
     pub(crate) edge_ids: Box<[EdgeId]>,
     pub(crate) confirmed_relation_ids: Box<[RelationId]>,
     pub(crate) manifest: RoutingImageManifest,
@@ -219,6 +270,28 @@ impl RoutingImage {
         &self.confirmed_relation_ids
     }
 
+    #[must_use]
+    pub fn arrays(&self) -> RoutingImageArrays<'_> {
+        RoutingImageArrays {
+            offsets: &self.offsets,
+            destinations: &self.destinations,
+            relation_indexes: &self.relation_indexes,
+            base_weight_bits: &self.base_weight_bits,
+            dense_to_external: &self.dense_to_external,
+            confirmed_relation_ids: &self.confirmed_relation_ids,
+        }
+    }
+
+    #[must_use]
+    pub fn gpu_topology_manifest(&self) -> GpuTopologyManifest {
+        GpuTopologyManifest {
+            offset_bytes: self.manifest.byte_counts.offsets,
+            destination_bytes: self.manifest.byte_counts.destinations,
+            relation_index_bytes: self.manifest.byte_counts.relation_indexes,
+            base_weight_bytes: self.manifest.byte_counts.base_weights,
+        }
+    }
+
     pub fn outgoing_edges(
         &self,
         source: DenseNodeId,
@@ -241,9 +314,11 @@ impl RoutingImage {
     pub(crate) fn edge_at(&self, index: usize) -> OutgoingEdge {
         OutgoingEdge {
             edge_id: self.edge_ids[index],
-            destination: self.destinations[index],
+            destination: DenseNodeId::from_u32(self.destinations[index]),
             relation_id: self.relation_ids[index],
-            base_weight: self.base_weights[index],
+            base_weight: BaseWeight::from_bits(self.base_weight_bits[index])
+                .expect("compiled base-weight bits remain canonical"),
+            relation_index: self.relation_indexes[index],
         }
     }
 }
@@ -269,6 +344,7 @@ pub(crate) fn manifest(
         offsets: bytes(offset_count, size_of::<u64>())?,
         destinations: bytes(adjacency_count, size_of::<DenseNodeId>())?,
         relation_ids: bytes(adjacency_count, size_of::<RelationId>())?,
+        relation_indexes: bytes(adjacency_count, size_of::<u32>())?,
         base_weights: bytes(adjacency_count, size_of::<BaseWeight>())?,
         edge_ids: bytes(adjacency_count, size_of::<EdgeId>())?,
         confirmed_relation_ids: bytes(relation_kind_count, size_of::<RelationId>())?,
@@ -284,6 +360,7 @@ pub(crate) fn manifest(
             node_id: size_of::<NodeId>(),
             offset: size_of::<u64>(),
             relation_id: size_of::<RelationId>(),
+            relation_index: size_of::<u32>(),
             base_weight: size_of::<BaseWeight>(),
             edge_id: size_of::<EdgeId>(),
         },

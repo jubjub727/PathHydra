@@ -1,0 +1,5 @@
+[toolchain]
+channel = "nightly-2024-02-17"
+components = ["rust-src"]
+target = "nvptx64-nvidia-cuda"
+ptx_target = "sm_86"

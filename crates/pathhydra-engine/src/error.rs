@@ -7,13 +7,22 @@ use crate::{AdmissionRejection, RoutingUnavailableReason};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EngineConfigError {
-    ZeroLimit { limit: &'static str },
+    ZeroLimit {
+        limit: &'static str,
+    },
+    InvalidCudaValue {
+        field: &'static str,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for EngineConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroLimit { limit } => write!(formatter, "engine limit {limit} must be nonzero"),
+            Self::InvalidCudaValue { field, reason } => {
+                write!(formatter, "invalid CUDA configuration {field}: {reason}")
+            }
         }
     }
 }
@@ -27,6 +36,8 @@ pub enum EngineError {
     RoutingUnavailable(RoutingUnavailableReason),
     DuplicateActiveRequest(crate::RequestId),
     Admission(AdmissionRejection),
+    CudaIneligible(crate::CudaIneligibility),
+    CudaFailure(String),
     Routing(RoutingError),
     Hydration(crate::HydrationError),
     LockPoisoned { lock: &'static str },
@@ -42,6 +53,8 @@ impl fmt::Display for EngineError {
                 write!(formatter, "request ID {id} is already active")
             }
             Self::Admission(reason) => reason.fmt(formatter),
+            Self::CudaIneligible(reason) => write!(formatter, "CUDA route is ineligible: {reason}"),
+            Self::CudaFailure(reason) => write!(formatter, "CUDA execution failed: {reason}"),
             Self::Routing(error) => error.fmt(formatter),
             Self::Hydration(error) => error.fmt(formatter),
             Self::LockPoisoned { lock } => write!(formatter, "{lock} lock is poisoned"),

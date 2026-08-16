@@ -18,7 +18,9 @@ flowchart LR
     d -->|relation| g["node"]
 ```
 
-The long-term goal is to perform that selection in parallel on the GPU and return the hydrated subgraph with every included connection available for inspection.
+The Rust engine can perform the supported distance-only selection on a fully
+resident NVIDIA CUDA device. Hydration and caller-owned subgraph composition
+remain host operations.
 
 ## Core model
 
@@ -34,7 +36,7 @@ The long-term goal is to perform that selection in parallel on the GPU and retur
 PathHydra is intended to provide:
 
 - typed graph storage;
-- constrained, GPU-accelerated pathfinding;
+- constrained exact CPU and NVIDIA CUDA pathfinding;
 - exact context-weighted routing;
 - structurally safe subgraph construction;
 - traceable inference results;
@@ -64,8 +66,18 @@ post-commit image-build failure. The current boundaries are documented in
 [the routing-image reference](docs/routing-image.md), with engine behavior in
 [the CPU-engine reference](docs/cpu-engine.md).
 
-GPU acceleration, durable routing-image files, BAML/bindings, and a transport
-are not implemented yet.
+The optional `cuda` feature adds Rust-authored `sm_86` PTX loaded through the
+CUDA Driver API, immutable full-topology residency, exact frontier and
+delta-stepping distance routing, independent queued lanes, memory admission,
+CPU fallback, health, and explicit recovery. CUDA does not support returned
+paths or finite examined-edge budgets; permissive policies use the CPU oracle.
+The local RTX 3080 baseline does not justify automatic acceleration, so `Auto`
+remains conservative and no universal speedup is claimed. See [the CUDA build
+guide](docs/cuda-build.md), [routing contract](docs/cuda-routing.md), and
+[operations guide](docs/cuda-operations.md).
+
+Durable routing-image files, BAML/bindings, and a transport are not implemented
+yet.
 
 ## Development
 
@@ -85,3 +97,7 @@ cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+CUDA-capable development additionally uses the explicitly installed pinned
+nightly described in `docs/cuda-build.md`; runtime deployment needs a compatible
+NVIDIA driver but not the CUDA toolkit.

@@ -83,6 +83,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cudarc"
+version = "0.19.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42310153e06cf4cd532901f7096beb27504d681736a29ee90728ae4e2d93b2a8"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "either"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -153,6 +162,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "librocksdb-sys"
 version = "0.17.3+10.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -211,14 +230,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "pathhydra-bench"
+version = "0.1.0"
+dependencies = [
+ "pathhydra-core",
+ "pathhydra-cuda",
+ "pathhydra-routing",
+ "pathhydra-store",
+ "tempfile",
+]
+
+[[package]]
 name = "pathhydra-core"
 version = "0.1.0"
+
+[[package]]
+name = "pathhydra-cuda"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "pathhydra-core",
+ "pathhydra-routing",
+ "pathhydra-store",
+ "tempfile",
+]
 
 [[package]]
 name = "pathhydra-engine"
 version = "0.1.0"
 dependencies = [
  "pathhydra-core",
+ "pathhydra-cuda",
  "pathhydra-routing",
  "pathhydra-store",
  "pathhydra-subgraph",

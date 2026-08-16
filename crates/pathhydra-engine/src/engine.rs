@@ -5,6 +5,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "cuda")]
+use std::sync::{Mutex, atomic::AtomicBool};
+
 use pathhydra_core::{
     BaseWeight, Candidate, CandidateId, ConfirmedRecord, EdgeId, EdgeRecord, NodeId, NodeName,
     NodePayload, NodeRecord, RelationId, RelationName, RelationRecord,
@@ -16,11 +19,96 @@ use pathhydra_routing::{
 use pathhydra_store::Catalog;
 
 use crate::{
-    AdmissionController, CancellationOutcome, ConfirmedMutation, EngineCapabilities,
-    EngineConfigError, EngineError, EngineHealth, ImageBuildOutcome, ImageBuildReport,
-    PublicationOutcome, RequestId, RequestRegistry, RoutingHealth, RoutingState,
+    AdmissionController, CancellationOutcome, ConfirmedMutation, CudaAlgorithmSelection,
+    CudaAvailability, CudaConfig, CudaDeviceSummary, CudaExecutorPolicy, CudaHealth,
+    CudaIneligibility, CudaRequestDiagnostics, EngineCapabilities, EngineConfigError, EngineError,
+    EngineHealth, ExecutorSelectionReason, ImageBuildOutcome, ImageBuildReport, PublicationOutcome,
+    PublishedExecutionImage, RequestId, RequestRegistry, RoutingHealth, RoutingState,
     RoutingUnavailableReason,
 };
+
+#[cfg(feature = "cuda")]
+struct CudaRuntime {
+    context: Arc<pathhydra_cuda::CudaContextOwner>,
+    worker: pathhydra_cuda::CudaWorker,
+    config: CudaConfig,
+    admission: pathhydra_cuda::CudaAdmissionController,
+    healthy: AtomicBool,
+    last_failure: Mutex<Option<String>>,
+}
+
+#[cfg(feature = "cuda")]
+impl CudaRuntime {
+    fn initialize(config: CudaConfig) -> Result<Self, pathhydra_cuda::CudaError> {
+        let context = pathhydra_cuda::CudaContextOwner::initialize(config.device_ordinal)?;
+        let worker = pathhydra_cuda::CudaWorker::start(
+            config.maximum_batch_lanes,
+            config.batch_collection_delay,
+        );
+        let admission =
+            pathhydra_cuda::CudaAdmissionController::new(pathhydra_cuda::CudaMemoryLimits {
+                maximum_search_bytes: config.maximum_reserved_search_bytes,
+                maximum_concurrent_searches: config.maximum_concurrent_searches,
+            });
+        Ok(Self {
+            context,
+            worker,
+            config,
+            admission,
+            healthy: AtomicBool::new(true),
+            last_failure: Mutex::new(None),
+        })
+    }
+
+    fn upload(
+        &self,
+        image: Arc<RoutingImage>,
+    ) -> Result<Arc<pathhydra_cuda::CudaResidentImage>, pathhydra_cuda::CudaError> {
+        pathhydra_cuda::CudaResidentImage::upload(
+            Arc::clone(&self.context),
+            image,
+            self.config.maximum_topology_bytes,
+            self.config.minimum_free_memory_headroom,
+        )
+    }
+
+    fn algorithm(&self) -> pathhydra_cuda::CudaAlgorithm {
+        match self.config.algorithm {
+            CudaAlgorithmSelection::Frontier | CudaAlgorithmSelection::Automatic => {
+                pathhydra_cuda::CudaAlgorithm::Frontier
+            }
+            CudaAlgorithmSelection::DeltaStepping { delta } => {
+                pathhydra_cuda::CudaAlgorithm::DeltaStepping(
+                    pathhydra_cuda::DeltaConfiguration::new(delta)
+                        .expect("validated engine CUDA delta remains positive and finite"),
+                )
+            }
+        }
+    }
+
+    fn failure(&self, error: &pathhydra_cuda::CudaError) {
+        if error.poisons_context() {
+            self.healthy.store(false, Ordering::Release);
+        }
+        if let Ok(mut failure) = self.last_failure.lock() {
+            *failure = Some(error.to_string());
+        }
+    }
+
+    fn healthy(&self) -> Result<(), CudaIneligibility> {
+        if self.healthy.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            let reason = self
+                .last_failure
+                .lock()
+                .ok()
+                .and_then(|failure| failure.clone())
+                .unwrap_or_else(|| "CUDA context is poisoned".to_owned());
+            Err(CudaIneligibility::Unhealthy(reason))
+        }
+    }
+}
 
 pub const DEFAULT_MAX_ACTIVE_IMAGE_BYTES: usize = 512 * 1024 * 1024;
 pub const DEFAULT_MAX_CONCURRENT_ROUTES: usize = 8;
@@ -28,13 +116,14 @@ pub const DEFAULT_MAX_RESERVED_ROUTE_BYTES: usize = 512 * 1024 * 1024;
 pub const DEFAULT_MAX_DESTINATIONS_PER_REQUEST: usize = 16_384;
 pub const DEFAULT_MAX_HYDRATION_HANDLES_PER_REQUEST: usize = 65_536;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EngineConfig {
     pub max_active_image_bytes: usize,
     pub max_concurrent_routes: usize,
     pub max_reserved_route_bytes: usize,
     pub max_destinations_per_request: usize,
     pub max_hydration_handles_per_request: usize,
+    pub cuda: CudaConfig,
 }
 
 impl Default for EngineConfig {
@@ -45,6 +134,7 @@ impl Default for EngineConfig {
             max_reserved_route_bytes: DEFAULT_MAX_RESERVED_ROUTE_BYTES,
             max_destinations_per_request: DEFAULT_MAX_DESTINATIONS_PER_REQUEST,
             max_hydration_handles_per_request: DEFAULT_MAX_HYDRATION_HANDLES_PER_REQUEST,
+            cuda: CudaConfig::default(),
         }
     }
 }
@@ -67,6 +157,56 @@ impl EngineConfig {
                 return Err(EngineConfigError::ZeroLimit { limit: name });
             }
         }
+        if self.cuda.maximum_topology_bytes == 0 {
+            return Err(EngineConfigError::ZeroLimit {
+                limit: "cuda.maximum_topology_bytes",
+            });
+        }
+        for (name, value) in [
+            (
+                "cuda.maximum_concurrent_searches",
+                self.cuda.maximum_concurrent_searches,
+            ),
+            ("cuda.maximum_batch_lanes", self.cuda.maximum_batch_lanes),
+            (
+                "cuda.maximum_reserved_search_bytes",
+                self.cuda.maximum_reserved_search_bytes,
+            ),
+        ] {
+            if value == 0 {
+                return Err(EngineConfigError::ZeroLimit { limit: name });
+            }
+        }
+        if self.cuda.maximum_batch_lanes > self.cuda.maximum_concurrent_searches {
+            return Err(EngineConfigError::InvalidCudaValue {
+                field: "maximum_batch_lanes",
+                reason: "cannot exceed maximum_concurrent_searches",
+            });
+        }
+        if self.cuda.delta_candidate_count > self.cuda.delta_candidates.len() {
+            return Err(EngineConfigError::InvalidCudaValue {
+                field: "delta_candidate_count",
+                reason: "exceeds the fixed candidate array",
+            });
+        }
+        let selected_delta = match self.cuda.algorithm {
+            CudaAlgorithmSelection::DeltaStepping { delta } => Some(delta),
+            _ => None,
+        };
+        if selected_delta
+            .into_iter()
+            .chain(
+                self.cuda.delta_candidates[..self.cuda.delta_candidate_count]
+                    .iter()
+                    .copied(),
+            )
+            .any(|delta| !delta.is_finite() || delta <= 0.0)
+        {
+            return Err(EngineConfigError::InvalidCudaValue {
+                field: "delta",
+                reason: "must be positive and finite",
+            });
+        }
         Ok(self)
     }
 }
@@ -74,12 +214,16 @@ impl EngineConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Executor {
     CpuReference,
+    NvidiaCuda,
 }
 
 #[derive(Clone, Debug)]
 pub struct RuntimeDiagnostics {
     pub request_id: RequestId,
     pub executor: Executor,
+    pub selection_reason: ExecutorSelectionReason,
+    pub attempted_cuda: bool,
+    pub cuda_fallback_reason: Option<CudaIneligibility>,
     pub numeric_policy: NumericPolicy,
     pub tie_policy: TiePolicy,
     pub image_node_count: usize,
@@ -90,6 +234,7 @@ pub struct RuntimeDiagnostics {
     pub execution_duration: Duration,
     pub completion_reason: CompletionReason,
     pub search: CpuSearchDiagnostics,
+    pub cuda: Option<CudaRequestDiagnostics>,
 }
 
 #[derive(Clone, Debug)]
@@ -108,6 +253,70 @@ pub struct EngineRoutingResponse {
 /// let engine = GraphEngine::open("graph.db", EngineConfig::default())?;
 /// assert!(engine.capabilities().cpu_reference_routing);
 /// assert!(!engine.capabilities().gpu_routing);
+/// # Ok(()) }
+/// ```
+///
+/// Prefer CUDA and inspect runtime capability after opening:
+///
+/// ```no_run
+/// use pathhydra_engine::{CudaConfig, CudaExecutorPolicy, EngineConfig, GraphEngine};
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = EngineConfig {
+///     cuda: CudaConfig { enabled: true, executor_policy: CudaExecutorPolicy::PreferCuda, ..CudaConfig::default() },
+///     ..EngineConfig::default()
+/// };
+/// let engine = GraphEngine::open("graph.db", config)?;
+/// println!("{:?}", engine.capabilities().cuda_runtime);
+/// # Ok(()) }
+/// ```
+///
+/// An eligible distance-only request preserves the common routing response:
+///
+/// ```no_run
+/// # use pathhydra_engine::{CudaConfig, CudaExecutorPolicy, EngineConfig, GraphEngine, RequestId};
+/// # use pathhydra_routing::RoutingRequest;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let config = EngineConfig { cuda: CudaConfig { enabled: true, executor_policy: CudaExecutorPolicy::PreferCuda, ..CudaConfig::default() }, ..EngineConfig::default() };
+/// # let engine = GraphEngine::open("graph.db", config)?;
+/// # let request: RoutingRequest = unimplemented!();
+/// let routed = engine.route(RequestId::new(1), &request)?;
+/// println!("{:?}", routed.diagnostics.executor);
+/// # Ok(()) }
+/// ```
+///
+/// Path requests under a permissive policy execute on the CPU oracle:
+///
+/// ```no_run
+/// # use pathhydra_engine::{CudaConfig, CudaExecutorPolicy, EngineConfig, Executor, GraphEngine, RequestId};
+/// # use pathhydra_routing::RoutingRequest;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let engine = GraphEngine::open("graph.db", EngineConfig { cuda: CudaConfig { enabled: true, executor_policy: CudaExecutorPolicy::PreferCuda, ..CudaConfig::default() }, ..EngineConfig::default() })?;
+/// # let path_request: RoutingRequest = unimplemented!();
+/// let routed = engine.route(RequestId::new(2), &path_request)?;
+/// assert_eq!(routed.diagnostics.executor, Executor::CpuReference);
+/// # Ok(()) }
+/// ```
+///
+/// Required CUDA returns typed ineligibility instead of changing semantics:
+///
+/// ```no_run
+/// # use pathhydra_engine::{CudaConfig, CudaExecutorPolicy, EngineConfig, EngineError, GraphEngine, RequestId};
+/// # use pathhydra_routing::RoutingRequest;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let engine = GraphEngine::open("graph.db", EngineConfig { cuda: CudaConfig { enabled: true, executor_policy: CudaExecutorPolicy::RequireCuda, ..CudaConfig::default() }, ..EngineConfig::default() })?;
+/// # let unsupported_request: RoutingRequest = unimplemented!();
+/// assert!(matches!(engine.route(RequestId::new(3), &unsupported_request), Err(EngineError::CudaIneligible(_))));
+/// # Ok(()) }
+/// ```
+///
+/// After device loss, permissive calls use CPU and recovery is explicit:
+///
+/// ```no_run
+/// # use pathhydra_engine::{CudaConfig, CudaExecutorPolicy, EngineConfig, GraphEngine};
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let engine = GraphEngine::open("graph.db", EngineConfig { cuda: CudaConfig { enabled: true, executor_policy: CudaExecutorPolicy::PreferCuda, ..CudaConfig::default() }, ..EngineConfig::default() })?;
+/// // After health reports a poisoned/lost context:
+/// engine.reinitialize_cuda()?;
 /// # Ok(()) }
 /// ```
 ///
@@ -184,6 +393,13 @@ pub struct GraphEngine {
     requests: RequestRegistry,
     cancellations: AtomicU64,
     image_build_failures: AtomicU64,
+    cuda_availability: RwLock<CudaAvailability>,
+    cuda_uploads: AtomicU64,
+    cuda_upload_failures: AtomicU64,
+    cuda_fallbacks: AtomicU64,
+    cuda_context_reinitializations: AtomicU64,
+    #[cfg(feature = "cuda")]
+    cuda_runtime: RwLock<Option<Arc<CudaRuntime>>>,
 }
 
 impl GraphEngine {
@@ -192,7 +408,14 @@ impl GraphEngine {
         let catalog = Catalog::open(path)?;
         let (routing, failed) =
             Self::initial_routing_state(&catalog, config.max_active_image_bytes)?;
-        Ok(Self {
+        let initial_cuda_availability = if !config.cuda.enabled {
+            CudaAvailability::Disabled
+        } else if cfg!(feature = "cuda") {
+            CudaAvailability::Unavailable("CUDA initialization has not completed".to_owned())
+        } else {
+            CudaAvailability::SupportNotCompiled
+        };
+        let engine = Self {
             catalog,
             config,
             routing: RwLock::new(routing),
@@ -203,12 +426,27 @@ impl GraphEngine {
             requests: RequestRegistry::new(),
             cancellations: AtomicU64::new(0),
             image_build_failures: AtomicU64::new(u64::from(failed)),
-        })
+            cuda_availability: RwLock::new(initial_cuda_availability),
+            cuda_uploads: AtomicU64::new(0),
+            cuda_upload_failures: AtomicU64::new(0),
+            cuda_fallbacks: AtomicU64::new(0),
+            cuda_context_reinitializations: AtomicU64::new(0),
+            #[cfg(feature = "cuda")]
+            cuda_runtime: RwLock::new(None),
+        };
+        if config.cuda.enabled {
+            engine.initialize_cuda_for_current();
+        }
+        Ok(engine)
     }
 
     #[must_use]
     pub fn capabilities(&self) -> EngineCapabilities {
-        EngineCapabilities::new(self.config)
+        let availability = self.cuda_availability.read().map_or(
+            CudaAvailability::Unavailable("CUDA health lock is poisoned".to_owned()),
+            |value| value.clone(),
+        );
+        EngineCapabilities::new(self.config, availability, self.cuda_device_summary())
     }
 
     pub fn health(&self) -> Result<EngineHealth, EngineError> {
@@ -216,6 +454,7 @@ impl GraphEngine {
             lock: "published routing state",
         })?;
         let admission = self.admission.snapshot()?;
+        let cuda = self.cuda_health(&routing)?;
         Ok(EngineHealth {
             durable_catalog_available: true,
             routing: routing
@@ -233,6 +472,7 @@ impl GraphEngine {
             cumulative_admission_rejections: admission.rejections,
             cumulative_cancellations: self.cancellations.load(Ordering::Relaxed),
             cumulative_image_build_failures: self.image_build_failures.load(Ordering::Relaxed),
+            cuda,
         })
     }
 
@@ -246,8 +486,10 @@ impl GraphEngine {
         let (result, report) = self.compile_current_image();
         match result {
             Ok(image) => {
+                let image = Arc::new(image);
+                let execution = self.execution_image(image);
                 *state = RoutingState::Available {
-                    image: Arc::new(image),
+                    image: Arc::new(execution),
                     published_at: Instant::now(),
                     last_build: report.clone(),
                 }
@@ -269,6 +511,124 @@ impl GraphEngine {
         Ok(report)
     }
 
+    /// Re-uploads only the current CPU image to the existing healthy CUDA context.
+    pub fn rebuild_cuda_residency(&self) -> Result<(), EngineError> {
+        if !self.config.cuda.enabled {
+            return Err(EngineError::CudaIneligible(CudaIneligibility::Disabled));
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let mut state = self
+                .routing
+                .write()
+                .map_err(|_| EngineError::LockPoisoned {
+                    lock: "published routing state",
+                })?;
+            let image = state.image().map_err(EngineError::RoutingUnavailable)?;
+            let runtime = self
+                .cuda_runtime
+                .read()
+                .map_err(|_| EngineError::LockPoisoned {
+                    lock: "CUDA runtime",
+                })?
+                .clone()
+                .ok_or_else(|| {
+                    EngineError::CudaIneligible(CudaIneligibility::NoResidentImage(
+                        "CUDA runtime is absent; use reinitialize_cuda".to_owned(),
+                    ))
+                })?;
+            let last_build = state.last_build().clone();
+            let resident = match runtime.upload(Arc::clone(&image)) {
+                Ok(resident) => resident,
+                Err(error) => {
+                    let reason = CudaAvailability::Degraded(error.to_string());
+                    *state = RoutingState::Available {
+                        image: Arc::new(PublishedExecutionImage::cpu_only(image, reason.clone())),
+                        published_at: Instant::now(),
+                        last_build,
+                    };
+                    self.set_cuda_availability(reason);
+                    saturating_increment(&self.cuda_upload_failures);
+                    return Err(EngineError::CudaFailure(error.to_string()));
+                }
+            };
+            *state = RoutingState::Available {
+                image: Arc::new(PublishedExecutionImage::with_cuda(image, resident)),
+                published_at: Instant::now(),
+                last_build,
+            };
+            self.set_cuda_availability(CudaAvailability::Available);
+            saturating_increment(&self.cuda_uploads);
+            Ok(())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Err(EngineError::CudaIneligible(
+                CudaIneligibility::SupportNotCompiled,
+            ))
+        }
+    }
+
+    /// Creates a fresh CUDA context and restores residency from the current CPU image.
+    pub fn reinitialize_cuda(&self) -> Result<(), EngineError> {
+        if !self.config.cuda.enabled {
+            return Err(EngineError::CudaIneligible(CudaIneligibility::Disabled));
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let runtime = Arc::new(
+                CudaRuntime::initialize(self.config.cuda)
+                    .map_err(|error| EngineError::CudaFailure(error.to_string()))?,
+            );
+            let mut state = self
+                .routing
+                .write()
+                .map_err(|_| EngineError::LockPoisoned {
+                    lock: "published routing state",
+                })?;
+            let image = state.image().map_err(EngineError::RoutingUnavailable)?;
+            let last_build = state.last_build().clone();
+            let resident = match runtime.upload(Arc::clone(&image)) {
+                Ok(resident) => resident,
+                Err(error) => {
+                    let reason = CudaAvailability::Degraded(error.to_string());
+                    *state = RoutingState::Available {
+                        image: Arc::new(PublishedExecutionImage::cpu_only(image, reason.clone())),
+                        published_at: Instant::now(),
+                        last_build,
+                    };
+                    self.set_cuda_availability(reason);
+                    saturating_increment(&self.cuda_upload_failures);
+                    return Err(EngineError::CudaFailure(error.to_string()));
+                }
+            };
+            {
+                let mut slot =
+                    self.cuda_runtime
+                        .write()
+                        .map_err(|_| EngineError::LockPoisoned {
+                            lock: "CUDA runtime",
+                        })?;
+                *slot = Some(runtime);
+            }
+            *state = RoutingState::Available {
+                image: Arc::new(PublishedExecutionImage::with_cuda(image, resident)),
+                published_at: Instant::now(),
+                last_build,
+            };
+            self.set_cuda_availability(CudaAvailability::Available);
+            saturating_increment(&self.cuda_uploads);
+            saturating_increment(&self.cuda_context_reinitializations);
+            Ok(())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Err(EngineError::CudaIneligible(
+                CudaIneligibility::SupportNotCompiled,
+            ))
+        }
+    }
+
     pub fn route(
         &self,
         request_id: RequestId,
@@ -283,12 +643,213 @@ impl GraphEngine {
         let registration = self.requests.register(request_id)?;
         let admission_started = Instant::now();
         let mut permit = self.admission.acquire_slot()?;
-        let image = {
+        let execution = {
             let state = self.routing.read().map_err(|_| EngineError::LockPoisoned {
                 lock: "published routing state",
             })?;
-            state.image().map_err(EngineError::RoutingUnavailable)?
+            state.execution().map_err(EngineError::RoutingUnavailable)?
         };
+        let image = Arc::clone(&execution.cpu);
+        if image.dense_node_id(request.origin()).is_none() {
+            return Err(pathhydra_routing::RoutingError::MissingOrigin(request.origin()).into());
+        }
+        request
+            .profile()
+            .pack(&image)
+            .map_err(pathhydra_routing::RoutingError::from)?;
+
+        let policy = self.config.cuda.executor_policy;
+        let cuda_shape_refusal = if !self.config.cuda.enabled {
+            Some(CudaIneligibility::Disabled)
+        } else if request.return_paths() {
+            Some(CudaIneligibility::PathsUnsupportedByCuda)
+        } else if request.budget() != pathhydra_routing::SearchBudget::Unlimited {
+            Some(CudaIneligibility::FiniteEdgeBudgetUnsupportedByCuda)
+        } else {
+            None
+        };
+        let mut fallback_reason = cuda_shape_refusal;
+        let try_cuda = match policy {
+            CudaExecutorPolicy::CpuOnly => false,
+            CudaExecutorPolicy::Auto => {
+                fallback_reason = Some(CudaIneligibility::AutomaticPolicySelectedCpu);
+                false
+            }
+            CudaExecutorPolicy::PreferCuda | CudaExecutorPolicy::RequireCuda => {
+                fallback_reason.is_none()
+            }
+        };
+
+        if try_cuda {
+            #[cfg(feature = "cuda")]
+            'cuda_attempt: {
+                let resident = execution.cuda.clone().ok_or_else(|| {
+                    CudaIneligibility::NoResidentImage(format!(
+                        "{:?}",
+                        execution.cuda_unavailable_reason
+                    ))
+                });
+                let runtime = self
+                    .cuda_runtime
+                    .read()
+                    .map_err(|_| EngineError::LockPoisoned {
+                        lock: "CUDA runtime",
+                    })?
+                    .clone()
+                    .ok_or_else(|| {
+                        CudaIneligibility::NoResidentImage("runtime is absent".to_owned())
+                    });
+                match resident.and_then(|resident| runtime.map(|runtime| (resident, runtime))) {
+                    Ok((resident, runtime)) => {
+                        if let Err(reason) = runtime.healthy() {
+                            if policy == CudaExecutorPolicy::RequireCuda {
+                                return Err(EngineError::CudaIneligible(reason));
+                            }
+                            fallback_reason = Some(reason);
+                            break 'cuda_attempt;
+                        }
+                        let algorithm = runtime.algorithm();
+                        let search_bytes = pathhydra_cuda::estimate_search_bytes(
+                            image.node_count(),
+                            image.relation_kind_count(),
+                            request.destinations().len(),
+                            algorithm,
+                        )
+                        .map_err(|error| {
+                            EngineError::CudaIneligible(CudaIneligibility::ResourceRefusal(
+                                error.to_string(),
+                            ))
+                        })?;
+                        let reservation = runtime.admission.reserve(search_bytes);
+                        match reservation {
+                            Ok(reservation) => {
+                                let admission_duration = admission_started.elapsed();
+                                let execution_started = Instant::now();
+                                match runtime.worker.submit(
+                                    resident.clone(),
+                                    request,
+                                    algorithm,
+                                    registration.flag_arc(),
+                                    reservation.bytes(),
+                                ) {
+                                    Ok(output) => {
+                                        let execution_duration = execution_started.elapsed();
+                                        let manifest = image.manifest();
+                                        let device = runtime.context.capabilities();
+                                        let algorithm_name = match algorithm {
+                                            pathhydra_cuda::CudaAlgorithm::Frontier => "frontier",
+                                            pathhydra_cuda::CudaAlgorithm::DeltaStepping(_) => {
+                                                "delta-stepping"
+                                            }
+                                        };
+                                        let delta = match algorithm {
+                                            pathhydra_cuda::CudaAlgorithm::Frontier => None,
+                                            pathhydra_cuda::CudaAlgorithm::DeltaStepping(delta) => {
+                                                Some(delta.delta())
+                                            }
+                                        };
+                                        let cuda = output.diagnostics;
+                                        let diagnostics = RuntimeDiagnostics {
+                                            request_id,
+                                            executor: Executor::NvidiaCuda,
+                                            selection_reason: if policy
+                                                == CudaExecutorPolicy::RequireCuda
+                                            {
+                                                ExecutorSelectionReason::RequiredCudaEligible
+                                            } else {
+                                                ExecutorSelectionReason::PreferredCudaEligible
+                                            },
+                                            attempted_cuda: true,
+                                            cuda_fallback_reason: None,
+                                            numeric_policy: output.response.numeric_policy(),
+                                            tie_policy: output.response.tie_policy(),
+                                            image_node_count: manifest.node_count(),
+                                            image_relation_kind_count: manifest
+                                                .relation_kind_count(),
+                                            image_adjacency_count: manifest.adjacency_count(),
+                                            reserved_working_bytes: reservation.bytes(),
+                                            admission_duration,
+                                            execution_duration,
+                                            completion_reason: output.response.completion_reason(),
+                                            search: CpuSearchDiagnostics::default(),
+                                            cuda: Some(CudaRequestDiagnostics {
+                                                algorithm: algorithm_name,
+                                                delta,
+                                                device_ordinal: device.device_ordinal,
+                                                device_name: device.device_name.clone(),
+                                                queue_duration: cuda.queue_duration,
+                                                batch_collection_duration: cuda
+                                                    .batch_collection_duration,
+                                                batch_width: cuda.batch_width,
+                                                lane_index: cuda.lane_index,
+                                                topology_bytes: resident.allocated_bytes(),
+                                                search_bytes: cuda.reserved_search_bytes,
+                                                host_to_device_bytes: cuda.host_to_device_bytes,
+                                                device_to_host_bytes: cuda.device_to_host_bytes,
+                                                kernel_launches: cuda.kernel_launches,
+                                                synchronized_execution_duration: cuda
+                                                    .synchronized_execution_duration,
+                                                examined_edges: cuda.examined_edges,
+                                                relaxation_attempts: cuda.relaxation_attempts,
+                                                relaxation_updates: cuda.relaxation_updates,
+                                                phases: cuda.phases,
+                                                frontier_high_water: cuda.frontier_high_water,
+                                            }),
+                                        };
+                                        return Ok(EngineRoutingResponse {
+                                            response: output.response,
+                                            diagnostics,
+                                        });
+                                    }
+                                    Err(error) => {
+                                        runtime.failure(&error);
+                                        if policy == CudaExecutorPolicy::RequireCuda {
+                                            return Err(EngineError::CudaFailure(
+                                                error.to_string(),
+                                            ));
+                                        }
+                                        fallback_reason =
+                                            Some(CudaIneligibility::Unhealthy(error.to_string()));
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                if policy == CudaExecutorPolicy::RequireCuda {
+                                    return Err(EngineError::CudaIneligible(
+                                        CudaIneligibility::ResourceRefusal(error.to_string()),
+                                    ));
+                                }
+                                fallback_reason =
+                                    Some(CudaIneligibility::ResourceRefusal(error.to_string()));
+                            }
+                        }
+                    }
+                    Err(reason) => {
+                        if policy == CudaExecutorPolicy::RequireCuda {
+                            return Err(EngineError::CudaIneligible(reason));
+                        }
+                        fallback_reason = Some(reason);
+                    }
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                if policy == CudaExecutorPolicy::RequireCuda {
+                    return Err(EngineError::CudaIneligible(
+                        CudaIneligibility::SupportNotCompiled,
+                    ));
+                }
+                fallback_reason = Some(CudaIneligibility::SupportNotCompiled);
+            }
+        } else if policy == CudaExecutorPolicy::RequireCuda {
+            return Err(EngineError::CudaIneligible(
+                fallback_reason.unwrap_or(CudaIneligibility::Disabled),
+            ));
+        }
+
+        if fallback_reason.is_some() && policy != CudaExecutorPolicy::CpuOnly {
+            saturating_increment(&self.cuda_fallbacks);
+        }
         let estimate = estimate_cpu_working_set(&image, request)?;
         permit.reserve(estimate.bytes())?;
         let admission_duration = admission_started.elapsed();
@@ -299,6 +860,15 @@ impl GraphEngine {
         let diagnostics = RuntimeDiagnostics {
             request_id,
             executor: Executor::CpuReference,
+            selection_reason: if policy == CudaExecutorPolicy::Auto {
+                ExecutorSelectionReason::AutomaticPolicySelectedCpu
+            } else if fallback_reason.is_some() {
+                ExecutorSelectionReason::CpuFallback
+            } else {
+                ExecutorSelectionReason::CpuOnlyPolicy
+            },
+            attempted_cuda: try_cuda,
+            cuda_fallback_reason: fallback_reason,
             numeric_policy: response.numeric_policy(),
             tie_policy: response.tie_policy(),
             image_node_count: manifest.node_count(),
@@ -309,6 +879,7 @@ impl GraphEngine {
             execution_duration,
             completion_reason: response.completion_reason(),
             search,
+            cuda: None,
         };
         Ok(EngineRoutingResponse {
             response,
@@ -416,8 +987,10 @@ impl GraphEngine {
         let (compiled, report) = self.compile_current_image();
         let publication = match compiled {
             Ok(image) => {
+                let image = Arc::new(image);
+                let execution = self.execution_image(image);
                 *state = RoutingState::Available {
-                    image: Arc::new(image),
+                    image: Arc::new(execution),
                     published_at: Instant::now(),
                     last_build: report.clone(),
                 };
@@ -452,7 +1025,10 @@ impl GraphEngine {
                     ImageBuildReport::new(started.elapsed(), ImageBuildOutcome::Published, counts);
                 Ok((
                     RoutingState::Available {
-                        image: Arc::new(image),
+                        image: Arc::new(PublishedExecutionImage::cpu_only(
+                            Arc::new(image),
+                            CudaAvailability::Disabled,
+                        )),
                         published_at: Instant::now(),
                         last_build: report,
                     },
@@ -511,6 +1087,181 @@ impl GraphEngine {
             .unwrap_or_else(|reason| ImageBuildOutcome::Failed(reason.clone()));
         let report = ImageBuildReport::new(started.elapsed(), outcome, counts);
         (result, report)
+    }
+
+    fn initialize_cuda_for_current(&self) {
+        #[cfg(feature = "cuda")]
+        {
+            match CudaRuntime::initialize(self.config.cuda) {
+                Ok(runtime) => {
+                    if let Ok(mut slot) = self.cuda_runtime.write() {
+                        *slot = Some(Arc::new(runtime));
+                    } else {
+                        self.set_cuda_availability(CudaAvailability::Unavailable(
+                            "CUDA runtime lock is poisoned".to_owned(),
+                        ));
+                        return;
+                    }
+                    if let Err(error) = self.rebuild_cuda_residency() {
+                        self.set_cuda_availability(CudaAvailability::Degraded(error.to_string()));
+                    }
+                }
+                Err(error) => {
+                    self.set_cuda_availability(CudaAvailability::Unavailable(error.to_string()));
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        self.set_cuda_availability(CudaAvailability::SupportNotCompiled);
+    }
+
+    fn execution_image(&self, image: Arc<RoutingImage>) -> PublishedExecutionImage {
+        if !self.config.cuda.enabled {
+            return PublishedExecutionImage::cpu_only(image, CudaAvailability::Disabled);
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let runtime = self
+                .cuda_runtime
+                .read()
+                .ok()
+                .and_then(|runtime| runtime.clone());
+            let Some(runtime) = runtime else {
+                return PublishedExecutionImage::cpu_only(
+                    image,
+                    CudaAvailability::Unavailable("CUDA runtime is absent".to_owned()),
+                );
+            };
+            match runtime.upload(Arc::clone(&image)) {
+                Ok(resident) => {
+                    saturating_increment(&self.cuda_uploads);
+                    self.set_cuda_availability(CudaAvailability::Available);
+                    PublishedExecutionImage::with_cuda(image, resident)
+                }
+                Err(error) => {
+                    saturating_increment(&self.cuda_upload_failures);
+                    let availability = CudaAvailability::Degraded(error.to_string());
+                    self.set_cuda_availability(availability.clone());
+                    PublishedExecutionImage::cpu_only(image, availability)
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            PublishedExecutionImage::cpu_only(image, CudaAvailability::SupportNotCompiled)
+        }
+    }
+
+    fn set_cuda_availability(&self, availability: CudaAvailability) {
+        if let Ok(mut current) = self.cuda_availability.write() {
+            *current = availability;
+        }
+    }
+
+    fn cuda_device_summary(&self) -> Option<CudaDeviceSummary> {
+        #[cfg(feature = "cuda")]
+        {
+            let runtime = self.cuda_runtime.read().ok()?.clone()?;
+            let capabilities = runtime.context.capabilities();
+            let (free, total) = runtime.context.current_memory().ok()?;
+            Some(CudaDeviceSummary {
+                ordinal: capabilities.device_ordinal,
+                name: capabilities.device_name.clone(),
+                compute_capability: capabilities.compute_capability,
+                driver_version: capabilities.driver_version,
+                total_memory_bytes: total,
+                free_memory_bytes: free,
+                kernel_ptx_target: capabilities.kernel_ptx_target,
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
+    fn cuda_health(&self, routing: &RoutingState) -> Result<CudaHealth, EngineError> {
+        let configured = self
+            .cuda_availability
+            .read()
+            .map_err(|_| EngineError::LockPoisoned {
+                lock: "CUDA health",
+            })?
+            .clone();
+        let snapshot_availability = routing
+            .execution()
+            .ok()
+            .and_then(|execution| execution.cuda_unavailable_reason.clone());
+        let availability = snapshot_availability.unwrap_or(configured);
+        #[cfg(feature = "cuda")]
+        {
+            let execution = routing.execution().ok();
+            let resident = execution
+                .as_ref()
+                .and_then(|execution| execution.cuda.as_ref());
+            let runtime = self
+                .cuda_runtime
+                .read()
+                .ok()
+                .and_then(|runtime| runtime.clone());
+            let worker = runtime
+                .as_ref()
+                .map(|runtime| runtime.worker.snapshot())
+                .unwrap_or_default();
+            let cuda_admission = runtime
+                .as_ref()
+                .and_then(|runtime| runtime.admission.snapshot().ok())
+                .unwrap_or_default();
+            Ok(CudaHealth {
+                availability,
+                device: self.cuda_device_summary(),
+                resident_node_count: resident.map_or(0, |resident| resident.node_count()),
+                resident_adjacency_count: resident.map_or(0, |resident| resident.adjacency_count()),
+                resident_topology_bytes: resident.map_or(0, |resident| resident.allocated_bytes()),
+                queued_lanes: worker.queued_lanes,
+                active_lanes: worker.active_lanes,
+                peak_active_lanes: worker.peak_active_lanes,
+                reserved_search_bytes: cuda_admission.reserved_bytes,
+                peak_reserved_search_bytes: cuda_admission.peak_reserved_bytes,
+                cumulative_admission_rejections: cuda_admission.rejections,
+                worker_running: worker.running,
+                cumulative_uploads: self.cuda_uploads.load(Ordering::Relaxed),
+                cumulative_upload_failures: self.cuda_upload_failures.load(Ordering::Relaxed),
+                cumulative_launches: worker.cumulative_launches,
+                cumulative_launch_failures: worker.cumulative_failures,
+                cumulative_fallbacks: self.cuda_fallbacks.load(Ordering::Relaxed),
+                cumulative_cancellations: worker.cumulative_cancellations,
+                cumulative_context_reinitializations: self
+                    .cuda_context_reinitializations
+                    .load(Ordering::Relaxed),
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Ok(CudaHealth {
+                availability,
+                device: None,
+                resident_node_count: 0,
+                resident_adjacency_count: 0,
+                resident_topology_bytes: 0,
+                queued_lanes: 0,
+                active_lanes: 0,
+                peak_active_lanes: 0,
+                reserved_search_bytes: 0,
+                peak_reserved_search_bytes: 0,
+                cumulative_admission_rejections: 0,
+                worker_running: false,
+                cumulative_uploads: self.cuda_uploads.load(Ordering::Relaxed),
+                cumulative_upload_failures: self.cuda_upload_failures.load(Ordering::Relaxed),
+                cumulative_launches: 0,
+                cumulative_launch_failures: 0,
+                cumulative_fallbacks: self.cuda_fallbacks.load(Ordering::Relaxed),
+                cumulative_cancellations: 0,
+                cumulative_context_reinitializations: self
+                    .cuda_context_reinitializations
+                    .load(Ordering::Relaxed),
+            })
+        }
     }
 }
 

@@ -140,12 +140,24 @@ fn compile_routing_image_impl(
 
     let mut destinations = try_vec(adjacency_count, "adjacency destinations")?;
     let mut adjacency_relations = try_vec(adjacency_count, "adjacency relation IDs")?;
-    let mut base_weights = try_vec(adjacency_count, "adjacency base weights")?;
+    let mut relation_indexes = try_vec(adjacency_count, "adjacency relation indexes")?;
+    let mut base_weight_bits = try_vec(adjacency_count, "adjacency base weights")?;
     let mut adjacency_edge_ids = try_vec(adjacency_count, "adjacency edge IDs")?;
     for edge in outgoing.into_iter().flatten() {
-        destinations.push(edge.destination);
+        destinations.push(edge.destination.as_u32());
         adjacency_relations.push(edge.relation);
-        base_weights.push(edge.base_weight);
+        let relation_index =
+            relation_ids
+                .binary_search(&edge.relation)
+                .map_err(|_| CompileError::InvalidImage {
+                    reason: "compiled relation is absent from the dense relation table",
+                })?;
+        relation_indexes.push(u32::try_from(relation_index).map_err(|_| {
+            CompileError::CountOverflow {
+                structure: "relation index",
+            }
+        })?);
+        base_weight_bits.push(edge.base_weight.to_bits());
         adjacency_edge_ids.push(edge.edge);
     }
     if destinations.len() != adjacency_count || offsets.len() != node_count + 1 {
@@ -165,7 +177,8 @@ fn compile_routing_image_impl(
         offsets: offsets.into_boxed_slice(),
         destinations: destinations.into_boxed_slice(),
         relation_ids: adjacency_relations.into_boxed_slice(),
-        base_weights: base_weights.into_boxed_slice(),
+        relation_indexes: relation_indexes.into_boxed_slice(),
+        base_weight_bits: base_weight_bits.into_boxed_slice(),
         edge_ids: adjacency_edge_ids.into_boxed_slice(),
         confirmed_relation_ids: relation_ids.into_boxed_slice(),
         manifest: topology_manifest,
@@ -200,7 +213,8 @@ fn validate_completed_image(image: &RoutingImage) -> Result<(), CompileError> {
         || image.offsets.len() != offset_count
         || image.destinations.len() != adjacency_count
         || image.relation_ids.len() != adjacency_count
-        || image.base_weights.len() != adjacency_count
+        || image.relation_indexes.len() != adjacency_count
+        || image.base_weight_bits.len() != adjacency_count
     {
         return Err(CompileError::InvalidImage {
             reason: "completed array lengths disagree",
@@ -244,12 +258,15 @@ fn validate_completed_image(image: &RoutingImage) -> Result<(), CompileError> {
         }
     }
     for index in 0..adjacency_count {
-        if image.destinations[index].as_usize() >= node_count
+        if usize::try_from(image.destinations[index]).map_or(true, |value| value >= node_count)
             || image
                 .confirmed_relation_ids
                 .binary_search(&image.relation_ids[index])
                 .is_err()
-            || BaseWeight::from_bits(image.base_weights[index].to_bits()).is_err()
+            || usize::try_from(image.relation_indexes[index]).map_or(true, |relation_index| {
+                image.confirmed_relation_ids.get(relation_index) != Some(&image.relation_ids[index])
+            })
+            || BaseWeight::from_bits(image.base_weight_bits[index]).is_err()
         {
             return Err(CompileError::InvalidImage {
                 reason: "adjacency entry contains an invalid node, relation, or weight",

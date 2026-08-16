@@ -1,0 +1,26 @@
+[package]
+name = "pathhydra-cuda"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
+[dependencies]
+pathhydra-core = { path = "../pathhydra-core" }
+pathhydra-routing = { path = "../pathhydra-routing" }
+cudarc = { version = "=0.19.8", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13030"] }
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[dev-dependencies]
+pathhydra-store = { path = "../pathhydra-store" }
+tempfile = "3.27.0"
