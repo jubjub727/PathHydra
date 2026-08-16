@@ -1,5 +1,7 @@
 # Immutable routing image and CPU routing
 
+The low-level `RoutingImage` remains a caller-owned point-in-time value for deterministic tests and backend comparison. `GraphEngine` separately owns and publishes the one current CPU image used by its admitted routes; callers cannot replace that image or mutate its catalog outside publication coordination.
+
 PathHydra compiles a self-contained read of the confirmed durable graph into
 an immutable, in-memory routing image. The catalog holds its mutation mutex
 across the complete node, relation-kind, and canonical-edge scan. The returned

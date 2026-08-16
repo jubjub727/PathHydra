@@ -12,6 +12,8 @@ pub enum CompileError {
     MissingRelationKind { edge: EdgeId, relation: RelationId },
     InvalidBaseWeight { edge: EdgeId },
     CountOverflow { structure: &'static str },
+    TopologyLimitExceeded { required: usize, limit: usize },
+    AllocationFailed { structure: &'static str },
     InvalidImage { reason: &'static str },
 }
 
@@ -40,6 +42,13 @@ impl fmt::Display for CompileError {
             Self::CountOverflow { structure } => {
                 write!(formatter, "routing image {structure} count overflow")
             }
+            Self::TopologyLimitExceeded { required, limit } => write!(
+                formatter,
+                "routing image requires {required} logical payload bytes; limit is {limit}"
+            ),
+            Self::AllocationFailed { structure } => {
+                write!(formatter, "routing image could not reserve {structure}")
+            }
             Self::InvalidImage { reason } => write!(formatter, "invalid routing image: {reason}"),
         }
     }
@@ -52,6 +61,7 @@ pub enum ProfileError {
     DuplicateRelation(RelationId),
     MissingRelation(RelationId),
     UnknownRelation(RelationId),
+    AllocationFailed,
 }
 
 impl fmt::Display for ProfileError {
@@ -62,6 +72,7 @@ impl fmt::Display for ProfileError {
             Self::UnknownRelation(id) => {
                 write!(formatter, "profile names unconfirmed relation {id}")
             }
+            Self::AllocationFailed => formatter.write_str("profile allocation failed"),
         }
     }
 }
@@ -107,6 +118,8 @@ pub enum RoutingError {
     MissingOrigin(NodeId),
     InvalidProfile(ProfileError),
     Arithmetic(ArithmeticError),
+    ResourceEstimateOverflow,
+    AllocationFailed { structure: &'static str },
     InternalInvariant { reason: &'static str },
 }
 
@@ -116,6 +129,12 @@ impl fmt::Display for RoutingError {
             Self::MissingOrigin(id) => write!(formatter, "origin node {id} is not in the image"),
             Self::InvalidProfile(error) => error.fmt(formatter),
             Self::Arithmetic(error) => error.fmt(formatter),
+            Self::ResourceEstimateOverflow => {
+                formatter.write_str("CPU routing working-set estimate overflow")
+            }
+            Self::AllocationFailed { structure } => {
+                write!(formatter, "CPU routing could not reserve {structure}")
+            }
             Self::InternalInvariant { reason } => {
                 write!(formatter, "routing internal invariant failed: {reason}")
             }

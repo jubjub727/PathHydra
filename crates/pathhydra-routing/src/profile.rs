@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{error::Error, fmt};
 
 use pathhydra_core::RelationId;
 
@@ -94,22 +94,29 @@ impl RelationProfile {
     }
 
     pub fn pack(&self, image: &RoutingImage) -> Result<PackedRelationProfile, ProfileError> {
-        let mut by_id = BTreeMap::new();
+        let mut by_index = Vec::new();
+        by_index
+            .try_reserve_exact(image.relation_kind_count())
+            .map_err(|_| ProfileError::AllocationFailed)?;
+        by_index.resize(image.relation_kind_count(), None);
         for &(id, relation_use) in &self.entries {
-            if image.relation_index(id).is_none() {
-                return Err(ProfileError::UnknownRelation(id));
-            }
-            if by_id.insert(id, relation_use).is_some() {
+            let index = image
+                .relation_index(id)
+                .ok_or(ProfileError::UnknownRelation(id))?;
+            if by_index[index].replace(relation_use).is_some() {
                 return Err(ProfileError::DuplicateRelation(id));
             }
         }
-        let mut packed = Vec::with_capacity(image.relation_kind_count());
-        let mut canonical = Vec::with_capacity(image.relation_kind_count());
-        for &id in image.confirmed_relation_ids() {
-            let relation_use = by_id
-                .get(&id)
-                .copied()
-                .ok_or(ProfileError::MissingRelation(id))?;
+        let mut packed = Vec::new();
+        packed
+            .try_reserve_exact(image.relation_kind_count())
+            .map_err(|_| ProfileError::AllocationFailed)?;
+        let mut canonical = Vec::new();
+        canonical
+            .try_reserve_exact(image.relation_kind_count())
+            .map_err(|_| ProfileError::AllocationFailed)?;
+        for (index, &id) in image.confirmed_relation_ids().iter().enumerate() {
+            let relation_use = by_index[index].ok_or(ProfileError::MissingRelation(id))?;
             packed.push(relation_use);
             canonical.push((id, relation_use));
         }

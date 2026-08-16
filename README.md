@@ -44,7 +44,7 @@ The project is in its early design stage. Interfaces and storage formats are not
 
 ## Implementation status
 
-The Rust core now provides a durable graph store. It preserves
+The complete CPU-side Rust engine now provides a durable graph store. It preserves
 opaque node payloads; exact node and relation-kind names; provisional node,
 relation-kind, and edge candidates; and confirmed typed, directed, normalized
 weighted edges. Promotion and deletion are atomic, parallel and self-edges
@@ -56,13 +56,16 @@ immutable in-memory CSR image and performs deterministic exact CPU routing.
 Explicit relation profiles can disable relation kinds or adjust their logical
 weights, one search serves many destinations, budgets produce inspectable
 incomplete results, and optional paths preserve stable edge identities and
-weight evidence. The current boundaries are documented in
+weight evidence. `GraphEngine` owns current-image publication, bounded and
+cancellable synchronous CPU execution, current-record and exact-path hydration,
+caller-owned deterministic subgraphs, capabilities, health, and recovery from
+post-commit image-build failure. The current boundaries are documented in
 [the storage-format reference](docs/storage-format.md) and
-[the routing-image reference](docs/routing-image.md).
+[the routing-image reference](docs/routing-image.md), with engine behavior in
+[the CPU-engine reference](docs/cpu-engine.md).
 
-Active-image publication, a durable image format, GPU acceleration, hydration,
-caller-owned subgraph composition, and BAML integration are not implemented
-yet.
+GPU acceleration, durable routing-image files, BAML/bindings, and a transport
+are not implemented yet.
 
 ## Development
 

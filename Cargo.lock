@@ -215,6 +215,17 @@ name = "pathhydra-core"
 version = "0.1.0"
 
 [[package]]
+name = "pathhydra-engine"
+version = "0.1.0"
+dependencies = [
+ "pathhydra-core",
+ "pathhydra-routing",
+ "pathhydra-store",
+ "pathhydra-subgraph",
+ "tempfile",
+]
+
+[[package]]
 name = "pathhydra-routing"
 version = "0.1.0"
 dependencies = [
@@ -230,6 +241,15 @@ dependencies = [
  "pathhydra-core",
  "rocksdb",
  "tempfile",
+]
+
+[[package]]
+name = "pathhydra-subgraph"
+version = "0.1.0"
+dependencies = [
+ "pathhydra-core",
+ "pathhydra-routing",
+ "pathhydra-store",
 ]
 
 [[package]]

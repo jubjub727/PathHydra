@@ -56,8 +56,11 @@ mod image;
 mod profile;
 mod request;
 
-pub use compile::compile_routing_image;
-pub use cpu::{accumulate_distance, effective_weight, route};
+pub use compile::{compile_routing_image, compile_routing_image_with_limit};
+pub use cpu::{
+    CancellationSignal, CpuSearchDiagnostics, CpuWorkingSetEstimate, NeverCancelled,
+    accumulate_distance, effective_weight, estimate_cpu_working_set, route, route_controlled,
+};
 pub use error::{ArithmeticError, ArithmeticOperation, CompileError, ProfileError, RoutingError};
 pub use image::{
     DenseNodeId, ElementWidths, ImageByteCounts, NUMERIC_POLICY_ID, OutgoingEdge, RoutingImage,

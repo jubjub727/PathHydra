@@ -14,35 +14,61 @@ struct CompiledEdge {
 pub fn compile_routing_image(
     records: &ConfirmedGraphRecords,
 ) -> Result<RoutingImage, CompileError> {
+    compile_routing_image_impl(records, None)
+}
+
+pub fn compile_routing_image_with_limit(
+    records: &ConfirmedGraphRecords,
+    maximum_bytes: usize,
+) -> Result<RoutingImage, CompileError> {
+    compile_routing_image_impl(records, Some(maximum_bytes))
+}
+
+fn compile_routing_image_impl(
+    records: &ConfirmedGraphRecords,
+    maximum_bytes: Option<usize>,
+) -> Result<RoutingImage, CompileError> {
     let node_count = records.nodes().len();
     validate_node_count(node_count)?;
+    let topology_manifest = manifest(
+        node_count,
+        records.relation_kinds().len(),
+        records.edges().len(),
+    )?;
+    let required =
+        topology_manifest
+            .byte_counts()
+            .checked_total()
+            .ok_or(CompileError::CountOverflow {
+                structure: "byte total",
+            })?;
+    if let Some(limit) = maximum_bytes.filter(|limit| required > *limit) {
+        return Err(CompileError::TopologyLimitExceeded { required, limit });
+    }
 
-    let mut node_ids: Vec<NodeId> = records.nodes().iter().map(|record| record.id()).collect();
+    let mut node_ids = try_vec(records.nodes().len(), "node IDs")?;
+    node_ids.extend(records.nodes().iter().map(|record| record.id()));
     node_ids.sort_unstable();
     reject_duplicate(&node_ids, CompileError::DuplicateNodeId)?;
-    let external_to_dense: Vec<_> = node_ids
-        .iter()
-        .enumerate()
-        .map(|(dense, external)| {
-            let dense = u32::try_from(dense)
-                .map_err(|_| CompileError::TooManyNodes { count: node_count })?;
-            Ok((*external, DenseNodeId::from_u32(dense)))
-        })
-        .collect::<Result<_, CompileError>>()?;
+    let mut external_to_dense = try_vec(node_count, "external node mapping")?;
+    for (dense, external) in node_ids.iter().enumerate() {
+        let dense =
+            u32::try_from(dense).map_err(|_| CompileError::TooManyNodes { count: node_count })?;
+        external_to_dense.push((*external, DenseNodeId::from_u32(dense)));
+    }
 
-    let mut relation_ids: Vec<RelationId> = records
-        .relation_kinds()
-        .iter()
-        .map(|record| record.id())
-        .collect();
+    let mut relation_ids = try_vec(records.relation_kinds().len(), "relation IDs")?;
+    relation_ids.extend(records.relation_kinds().iter().map(|record| record.id()));
     relation_ids.sort_unstable();
     reject_duplicate(&relation_ids, CompileError::DuplicateRelationId)?;
 
-    let mut edge_ids: Vec<EdgeId> = records.edges().iter().map(|record| record.id()).collect();
+    let mut edge_ids = try_vec(records.edges().len(), "edge IDs")?;
+    edge_ids.extend(records.edges().iter().map(|record| record.id()));
     edge_ids.sort_unstable();
     reject_duplicate(&edge_ids, CompileError::DuplicateEdgeId)?;
 
-    let mut outgoing = vec![Vec::<CompiledEdge>::new(); node_count];
+    let mut outgoing = try_vec(node_count, "outgoing compiler buckets")?;
+    outgoing.resize_with(node_count, Vec::new);
     let mut counted_edges = 0_u64;
     for edge in records.edges() {
         let source =
@@ -69,6 +95,11 @@ pub fn compile_routing_image(
             .ok_or(CompileError::CountOverflow {
                 structure: "adjacency",
             })?;
+        outgoing[source.as_usize()]
+            .try_reserve(1)
+            .map_err(|_| CompileError::AllocationFailed {
+                structure: "outgoing compiler bucket",
+            })?;
         outgoing[source.as_usize()].push(CompiledEdge {
             destination,
             relation: edge.relation_kind(),
@@ -84,11 +115,12 @@ pub fn compile_routing_image(
         usize::try_from(counted_edges).map_err(|_| CompileError::CountOverflow {
             structure: "adjacency",
         })?;
-    let mut offsets = Vec::with_capacity(node_count.checked_add(1).ok_or(
-        CompileError::CountOverflow {
+    let offset_count = node_count
+        .checked_add(1)
+        .ok_or(CompileError::CountOverflow {
             structure: "offset",
-        },
-    )?);
+        })?;
+    let mut offsets = try_vec(offset_count, "CSR offsets")?;
     offsets.push(0_u64);
     for edges in &outgoing {
         let next = offsets
@@ -106,10 +138,10 @@ pub fn compile_routing_image(
         offsets.push(next);
     }
 
-    let mut destinations = Vec::with_capacity(adjacency_count);
-    let mut adjacency_relations = Vec::with_capacity(adjacency_count);
-    let mut base_weights = Vec::with_capacity(adjacency_count);
-    let mut adjacency_edge_ids = Vec::with_capacity(adjacency_count);
+    let mut destinations = try_vec(adjacency_count, "adjacency destinations")?;
+    let mut adjacency_relations = try_vec(adjacency_count, "adjacency relation IDs")?;
+    let mut base_weights = try_vec(adjacency_count, "adjacency base weights")?;
+    let mut adjacency_edge_ids = try_vec(adjacency_count, "adjacency edge IDs")?;
     for edge in outgoing.into_iter().flatten() {
         destinations.push(edge.destination);
         adjacency_relations.push(edge.relation);
@@ -136,10 +168,18 @@ pub fn compile_routing_image(
         base_weights: base_weights.into_boxed_slice(),
         edge_ids: adjacency_edge_ids.into_boxed_slice(),
         confirmed_relation_ids: relation_ids.into_boxed_slice(),
-        manifest: manifest(node_count, records.relation_kinds().len(), adjacency_count)?,
+        manifest: topology_manifest,
     };
     validate_completed_image(&image)?;
     Ok(image)
+}
+
+fn try_vec<T>(capacity: usize, structure: &'static str) -> Result<Vec<T>, CompileError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|_| CompileError::AllocationFailed { structure })?;
+    Ok(values)
 }
 
 fn validate_node_count(count: usize) -> Result<(), CompileError> {

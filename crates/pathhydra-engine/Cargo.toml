@@ -1,0 +1,17 @@
+[package]
+name = "pathhydra-engine"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+pathhydra-core = { path = "../pathhydra-core" }
+pathhydra-routing = { path = "../pathhydra-routing" }
+pathhydra-store = { path = "../pathhydra-store" }
+pathhydra-subgraph = { path = "../pathhydra-subgraph" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

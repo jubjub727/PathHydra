@@ -3,7 +3,10 @@ use std::{mem::size_of, ops::Range};
 use pathhydra_core::{BaseWeight, EdgeId, NodeId, RelationId};
 use pathhydra_store::ConfirmedGraphRecords;
 
-use crate::{CompileError, compile::compile_routing_image};
+use crate::{
+    CompileError,
+    compile::{compile_routing_image, compile_routing_image_with_limit},
+};
 
 pub const NUMERIC_POLICY_ID: &str = "binary32-operands-separate-binary64-v1";
 pub const TIE_POLICY_ID: &str = "distance-dense-node-stable-predecessor-v1";
@@ -50,15 +53,34 @@ pub struct ImageByteCounts {
 
 impl ImageByteCounts {
     #[must_use]
+    pub const fn checked_total(self) -> Option<usize> {
+        let Some(total) = self.external_to_dense.checked_add(self.dense_to_external) else {
+            return None;
+        };
+        let Some(total) = total.checked_add(self.offsets) else {
+            return None;
+        };
+        let Some(total) = total.checked_add(self.destinations) else {
+            return None;
+        };
+        let Some(total) = total.checked_add(self.relation_ids) else {
+            return None;
+        };
+        let Some(total) = total.checked_add(self.base_weights) else {
+            return None;
+        };
+        let Some(total) = total.checked_add(self.edge_ids) else {
+            return None;
+        };
+        total.checked_add(self.confirmed_relation_ids)
+    }
+
+    #[must_use]
     pub const fn total(self) -> usize {
-        self.external_to_dense
-            + self.dense_to_external
-            + self.offsets
-            + self.destinations
-            + self.relation_ids
-            + self.base_weights
-            + self.edge_ids
-            + self.confirmed_relation_ids
+        match self.checked_total() {
+            Some(total) => total,
+            None => usize::MAX,
+        }
     }
 }
 
@@ -152,6 +174,14 @@ pub struct RoutingImage {
 impl RoutingImage {
     pub fn compile(records: &ConfirmedGraphRecords) -> Result<Self, CompileError> {
         compile_routing_image(records)
+    }
+
+    /// Compiles only when the checked logical topology payload fits `maximum_bytes`.
+    pub fn compile_with_limit(
+        records: &ConfirmedGraphRecords,
+        maximum_bytes: usize,
+    ) -> Result<Self, CompileError> {
+        compile_routing_image_with_limit(records, maximum_bytes)
     }
 
     #[must_use]

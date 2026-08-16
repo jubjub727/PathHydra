@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
     sync::{Mutex, MutexGuard, RwLock, RwLockWriteGuard},
 };
@@ -39,6 +39,38 @@ pub struct ConfirmedGraphRecords {
     nodes: Vec<NodeRecord>,
     relation_kinds: Vec<RelationRecord>,
     edges: Vec<EdgeRecord>,
+}
+
+/// Deduplicated current confirmed records returned by one catalog batch read.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ConfirmedRecordBatch {
+    nodes: BTreeMap<NodeId, NodeRecord>,
+    edges: BTreeMap<EdgeId, EdgeRecord>,
+    relation_kinds: BTreeMap<RelationId, RelationRecord>,
+}
+
+impl ConfirmedRecordBatch {
+    #[must_use]
+    pub fn node(&self, id: NodeId) -> Option<&NodeRecord> {
+        self.nodes.get(&id)
+    }
+    #[must_use]
+    pub fn edge(&self, id: EdgeId) -> Option<&EdgeRecord> {
+        self.edges.get(&id)
+    }
+    #[must_use]
+    pub fn relation_kind(&self, id: RelationId) -> Option<&RelationRecord> {
+        self.relation_kinds.get(&id)
+    }
+    pub fn nodes(&self) -> impl ExactSizeIterator<Item = &NodeRecord> {
+        self.nodes.values()
+    }
+    pub fn edges(&self) -> impl ExactSizeIterator<Item = &EdgeRecord> {
+        self.edges.values()
+    }
+    pub fn relation_kinds(&self) -> impl ExactSizeIterator<Item = &RelationRecord> {
+        self.relation_kinds.values()
+    }
 }
 
 impl ConfirmedGraphRecords {
@@ -282,6 +314,68 @@ impl Catalog {
         relation_kinds.sort_unstable_by_key(RelationRecord::id);
         edges.sort_unstable_by_key(EdgeRecord::id);
         Ok(ConfirmedGraphRecords::new(nodes, relation_kinds, edges))
+    }
+
+    /// Reads requested confirmed records once while preventing graph mutation.
+    ///
+    /// Ordinary absent IDs are omitted. Every found edge is structurally
+    /// checked against its current endpoint and relation-kind records.
+    pub fn confirmed_records_by_id(
+        &self,
+        node_ids: &[NodeId],
+        edge_ids: &[EdgeId],
+    ) -> Result<ConfirmedRecordBatch, CatalogError> {
+        let _write = self.write_guard()?;
+        let mut batch = ConfirmedRecordBatch::default();
+        for id in node_ids.iter().copied().collect::<BTreeSet<_>>() {
+            match get_node_from_db(&self.db, id) {
+                Ok(record) => {
+                    batch.nodes.insert(id, record);
+                }
+                Err(CatalogError::NotFound {
+                    kind: RecordKind::Node,
+                    ..
+                }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let mut relation_ids = BTreeSet::new();
+        for id in edge_ids.iter().copied().collect::<BTreeSet<_>>() {
+            let edge = match get_edge_from_db(&self.db, id) {
+                Ok(record) => record,
+                Err(CatalogError::NotFound {
+                    kind: RecordKind::Edge,
+                    ..
+                }) => continue,
+                Err(error) => return Err(error),
+            };
+            for endpoint in [edge.source(), edge.destination()] {
+                if let Err(error) = get_node_from_db(&self.db, endpoint) {
+                    return Err(match error {
+                        CatalogError::NotFound { .. } => corrupt(
+                            column_families::EDGES,
+                            id.to_string(),
+                            format!("endpoint node {endpoint} is absent"),
+                        ),
+                        other => other,
+                    });
+                }
+            }
+            relation_ids.insert(edge.relation_kind());
+            batch.edges.insert(id, edge);
+        }
+        for id in relation_ids {
+            let relation = get_relation_from_db(&self.db, id).map_err(|error| match error {
+                CatalogError::NotFound { .. } => corrupt(
+                    column_families::EDGES,
+                    id.to_string(),
+                    "edge relation kind is absent",
+                ),
+                other => other,
+            })?;
+            batch.relation_kinds.insert(id, relation);
+        }
+        Ok(batch)
     }
 
     /// Reads only confirmed outgoing edges through the source-prefix index.

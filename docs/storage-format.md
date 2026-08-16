@@ -1,5 +1,9 @@
 # Durable Graph Store Layout
 
+## Batched confirmed-record reads
+
+`Catalog::confirmed_records_by_id` adds no durable key space. It holds the existing catalog write mutex for one batch, deduplicates requested physical node and edge reads, and fetches the exact confirmed relation-kind record for every found edge. Missing requested IDs are ordinary missing results. A found edge with a missing endpoint or relation kind is corruption. Provisional candidates are never consulted.
+
 This document describes the current RocksDB layout for exact node and
 relation-kind identities, opaque node payloads, provisional candidates,
 confirmed directed edges, and adjacency indexes. PathHydra is unreleased, so

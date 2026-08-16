@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use pathhydra_core::{BaseWeight, EdgeId, NodeId, RelationId};
 
 use crate::{RelationMultiplier, RelationProfile};
@@ -92,6 +94,7 @@ pub enum CompletionReason {
     AllDestinationsFinalized,
     FrontierExhausted,
     BudgetExhausted,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -200,7 +203,7 @@ impl RoutePath {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExactRoute {
     logical_distance: f64,
-    path: Option<RoutePath>,
+    path: Option<Arc<RoutePath>>,
 }
 
 impl ExactRoute {
@@ -209,11 +212,11 @@ impl ExactRoute {
         self.logical_distance
     }
     #[must_use]
-    pub const fn path(&self) -> Option<&RoutePath> {
-        self.path.as_ref()
+    pub fn path(&self) -> Option<&RoutePath> {
+        self.path.as_deref()
     }
 
-    pub(crate) const fn new(logical_distance: f64, path: Option<RoutePath>) -> Self {
+    pub(crate) const fn new(logical_distance: f64, path: Option<Arc<RoutePath>>) -> Self {
         Self {
             logical_distance,
             path,

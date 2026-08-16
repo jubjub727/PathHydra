@@ -1,0 +1,15 @@
+[package]
+name = "pathhydra-subgraph"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+pathhydra-core = { path = "../pathhydra-core" }
+pathhydra-routing = { path = "../pathhydra-routing" }
+
+[dev-dependencies]
+pathhydra-store = { path = "../pathhydra-store" }
+
+[lints]
+workspace = true
