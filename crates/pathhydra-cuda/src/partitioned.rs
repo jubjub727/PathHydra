@@ -243,12 +243,22 @@ impl CudaPartitionedImage {
                 }
                 CudaAlgorithm::DeltaStepping(delta) => {
                     let mut bucket = 0_u64;
+                    let mut current_distances = initial;
                     loop {
                         loop {
+                            let partition_ids = self.bucket_partition_ids(
+                                &current_distances,
+                                delta.delta(),
+                                bucket,
+                            )?;
+                            if partition_ids.is_empty() {
+                                break;
+                            }
                             stream
                                 .memcpy_htod(&[0_u32], &mut changed)
                                 .map_err(synchronization_error)?;
                             if !self.launch_all_delta(
+                                &partition_ids,
                                 cancellation,
                                 &enabled_device,
                                 &multiplier_device,
@@ -268,7 +278,12 @@ impl CudaPartitionedImage {
                             }
                             let changed_host =
                                 stream.clone_dtoh(&changed).map_err(synchronization_error)?;
-                            device_to_host_bytes = device_to_host_bytes.saturating_add(4);
+                            current_distances = stream
+                                .clone_dtoh(&distances)
+                                .map_err(synchronization_error)?;
+                            device_to_host_bytes = device_to_host_bytes
+                                .saturating_add(4)
+                                .saturating_add(current_distances.len().saturating_mul(8));
                             check_status(stream, &status, &mut device_to_host_bytes)?;
                             if changed_host == [0] {
                                 break;
@@ -277,7 +292,10 @@ impl CudaPartitionedImage {
                         if cancelled {
                             break;
                         }
+                        let heavy_partitions =
+                            self.bucket_partition_ids(&current_distances, delta.delta(), bucket)?;
                         if !self.launch_all_delta(
+                            &heavy_partitions,
                             cancellation,
                             &enabled_device,
                             &multiplier_device,
@@ -297,7 +315,7 @@ impl CudaPartitionedImage {
                         }
                         check_status(stream, &status, &mut device_to_host_bytes)?;
                         logical_phases = logical_phases.saturating_add(1);
-                        let current_distances = stream
+                        current_distances = stream
                             .clone_dtoh(&distances)
                             .map_err(synchronization_error)?;
                         device_to_host_bytes = device_to_host_bytes
@@ -437,18 +455,42 @@ impl CudaPartitionedImage {
         counters: &mut CudaSlice<u64>,
         launches: &mut u64,
     ) -> Result<bool, CudaError> {
+        let mut queued = false;
         for &id in partition_ids {
             if cancellation.load(Ordering::Acquire) {
+                if queued {
+                    self.synchronize_partition_work()?;
+                }
                 return Ok(false);
             }
-            let Some(partition) = self.cache.acquire(id, cancellation)? else {
-                return Ok(false);
+            let partition = match self.cache.acquire(id, cancellation) {
+                Ok(Some(partition)) => partition,
+                Ok(None) => {
+                    if queued {
+                        self.synchronize_partition_work()?;
+                    }
+                    return Ok(false);
+                }
+                Err(error) => {
+                    if queued {
+                        self.synchronize_partition_work_after_failure();
+                    }
+                    return Err(error);
+                }
             };
             if cancellation.load(Ordering::Acquire) {
+                if queued {
+                    self.synchronize_partition_work()?;
+                }
                 return Ok(false);
             }
-            self.faults.trip(CudaFaultStage::Launch)?;
-            launch::launch_partition_frontier(
+            if let Err(error) = self.faults.trip(CudaFaultStage::Launch) {
+                if queued {
+                    self.synchronize_partition_work_after_failure();
+                }
+                return Err(error);
+            }
+            if let Err(error) = launch::launch_partition_frontier(
                 &self.context,
                 &partition,
                 enabled,
@@ -461,20 +503,27 @@ impl CudaPartitionedImage {
                 changed,
                 status,
                 counters,
-            )?;
+            ) {
+                self.synchronize_partition_work_after_failure();
+                return Err(error);
+            }
+            queued = true;
             if let Err(error) = self.faults.trip(CudaFaultStage::Event) {
-                let _ = self.context.stream.synchronize();
+                self.synchronize_partition_work_after_failure();
                 return Err(error);
             }
-            if let Err(error) = self.faults.trip(CudaFaultStage::Synchronization) {
-                let _ = self.context.stream.synchronize();
+            if let Err(error) = partition.record_completion() {
+                self.synchronize_partition_work_after_failure();
                 return Err(error);
             }
-            self.context
-                .stream
-                .synchronize()
-                .map_err(synchronization_error)?;
             *launches = launches.saturating_add(1);
+        }
+        if queued {
+            if let Err(error) = self.faults.trip(CudaFaultStage::Synchronization) {
+                self.synchronize_partition_work_after_failure();
+                return Err(error);
+            }
+            self.synchronize_partition_work()?;
         }
         Ok(true)
     }
@@ -482,6 +531,7 @@ impl CudaPartitionedImage {
     #[allow(clippy::too_many_arguments)]
     fn launch_all_delta(
         &self,
+        partition_ids: &[u32],
         cancellation: &AtomicBool,
         enabled: &CudaSlice<u32>,
         multipliers: &CudaSlice<u32>,
@@ -496,18 +546,42 @@ impl CudaPartitionedImage {
         counters: &mut CudaSlice<u64>,
         launches: &mut u64,
     ) -> Result<bool, CudaError> {
-        for id in self.partition_ids() {
+        let mut queued = false;
+        for &id in partition_ids {
             if cancellation.load(Ordering::Acquire) {
+                if queued {
+                    self.synchronize_partition_work()?;
+                }
                 return Ok(false);
             }
-            let Some(partition) = self.cache.acquire(id, cancellation)? else {
-                return Ok(false);
+            let partition = match self.cache.acquire(id, cancellation) {
+                Ok(Some(partition)) => partition,
+                Ok(None) => {
+                    if queued {
+                        self.synchronize_partition_work()?;
+                    }
+                    return Ok(false);
+                }
+                Err(error) => {
+                    if queued {
+                        self.synchronize_partition_work_after_failure();
+                    }
+                    return Err(error);
+                }
             };
             if cancellation.load(Ordering::Acquire) {
+                if queued {
+                    self.synchronize_partition_work()?;
+                }
                 return Ok(false);
             }
-            self.faults.trip(CudaFaultStage::Launch)?;
-            launch::launch_partition_delta(
+            if let Err(error) = self.faults.trip(CudaFaultStage::Launch) {
+                if queued {
+                    self.synchronize_partition_work_after_failure();
+                }
+                return Err(error);
+            }
+            if let Err(error) = launch::launch_partition_delta(
                 &self.context,
                 &partition,
                 enabled,
@@ -521,31 +595,40 @@ impl CudaPartitionedImage {
                 changed,
                 status,
                 counters,
-            )?;
+            ) {
+                self.synchronize_partition_work_after_failure();
+                return Err(error);
+            }
+            queued = true;
             if let Err(error) = self.faults.trip(CudaFaultStage::Event) {
-                let _ = self.context.stream.synchronize();
+                self.synchronize_partition_work_after_failure();
                 return Err(error);
             }
-            if let Err(error) = self.faults.trip(CudaFaultStage::Synchronization) {
-                let _ = self.context.stream.synchronize();
+            if let Err(error) = partition.record_completion() {
+                self.synchronize_partition_work_after_failure();
                 return Err(error);
             }
-            self.context
-                .stream
-                .synchronize()
-                .map_err(synchronization_error)?;
             *launches = launches.saturating_add(1);
+        }
+        if queued {
+            if let Err(error) = self.faults.trip(CudaFaultStage::Synchronization) {
+                self.synchronize_partition_work_after_failure();
+                return Err(error);
+            }
+            self.synchronize_partition_work()?;
         }
         Ok(true)
     }
 
-    fn partition_ids(&self) -> Box<dyn Iterator<Item = u32>> {
-        let count = u32::try_from(self.cpu_image.partition_count()).unwrap_or(u32::MAX);
-        if self.config.reverse_partition_order {
-            Box::new((0..count).rev())
-        } else {
-            Box::new(0..count)
-        }
+    fn synchronize_partition_work(&self) -> Result<(), CudaError> {
+        self.context
+            .stream
+            .synchronize()
+            .map_err(synchronization_error)
+    }
+
+    fn synchronize_partition_work_after_failure(&self) {
+        let _ = self.context.stream.synchronize();
     }
 
     fn active_partition_ids(&self, active: &[u32]) -> Vec<u32> {
@@ -564,6 +647,36 @@ impl CudaPartitionedImage {
             partitions.reverse();
         }
         partitions
+    }
+
+    fn bucket_partition_ids(
+        &self,
+        distance_bits: &[u64],
+        delta: f64,
+        bucket: u64,
+    ) -> Result<Vec<u32>, CudaError> {
+        let mut partitions = std::collections::BTreeSet::new();
+        for (source, &bits) in distance_bits.iter().enumerate() {
+            let distance = f64::from_bits(bits);
+            if !distance.is_finite() {
+                continue;
+            }
+            let quotient = distance / delta;
+            if quotient >= u64::MAX as f64 {
+                return Err(invariant("delta bucket index overflow"));
+            }
+            if quotient as u64 != bucket {
+                continue;
+            }
+            let source = u32::try_from(source)
+                .map_err(|_| invariant("dense source does not fit the CUDA ABI"))?;
+            partitions.extend(self.cpu_image.source_partition_ids(source));
+        }
+        let mut partitions: Vec<_> = partitions.into_iter().collect();
+        if self.config.reverse_partition_order {
+            partitions.reverse();
+        }
+        Ok(partitions)
     }
 }
 

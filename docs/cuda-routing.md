@@ -18,9 +18,11 @@ Queued lanes remain separate in profile, origin, status, and counters. Zero
 cycles terminate because equal distances do not update.
 
 Partitioned delta-stepping scans sparse logical buckets, repeatedly processes
-all light-edge partitions until same-bucket closure, then processes every heavy
-partition for the bucket's final removed set. Host reads/copies are pending
-bucket work. Bucket indexes must fit `u64`; there is no clamp or approximation.
+the partitions named by the current bucket's source segments until same-bucket
+light closure, then processes the partitions named by the bucket's final
+removed set for heavy edges. It does not scan unrelated partitions. Host
+reads/copies are pending bucket work. Bucket indexes must fit `u64`; there is no
+clamp or approximation.
 
 Both algorithms use the CPU numeric policy: convert binary32 base weight and
 multiplier separately to binary64, multiply, then add. The PTX audit rejects a

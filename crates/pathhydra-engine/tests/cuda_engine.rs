@@ -381,10 +381,19 @@ fn require_cuda_refuses_unsupported_request_shapes_before_allocation() {
 fn concurrent_origins_collect_as_independent_cuda_lanes() {
     let directory = tempfile::tempdir().unwrap();
     let config = EngineConfig {
+        max_active_image_bytes: 8,
+        target_partition_topology_bytes: 48,
+        hard_maximum_partition_topology_bytes: 48,
+        host_partition_cache_bytes: 112,
+        host_partition_cache_entries: 1,
+        routing_io_staging_bytes: 56,
         cuda: CudaConfig {
             enabled: true,
             executor_policy: CudaExecutorPolicy::PreferCuda,
             minimum_free_memory_headroom: 0,
+            maximum_partitioned_topology_cache_bytes: 64,
+            maximum_partitioned_topology_cache_slots: 1,
+            maximum_partitioned_host_staging_bytes: 64,
             batch_collection_delay: std::time::Duration::from_millis(20),
             ..CudaConfig::default()
         },
@@ -392,6 +401,10 @@ fn concurrent_origins_collect_as_independent_cuda_lanes() {
     };
     let engine = std::sync::Arc::new(GraphEngine::open(directory.path(), config).unwrap());
     let (source, destination, relation) = populate(&engine);
+    engine
+        .routing_bundle_fault_injection()
+        .unwrap()
+        .delay_reads(std::time::Duration::from_millis(50));
     let route = request(
         source,
         destination,
@@ -427,4 +440,7 @@ fn concurrent_origins_collect_as_independent_cuda_lanes() {
         ));
         assert_eq!(output.response.origin(), route.origin(), "lane {lane}");
     }
+    let health = engine.health().unwrap();
+    assert!(health.cuda.partitioned_topology);
+    assert!(health.cuda.device_topology_cache.unwrap().coalesced_waits > 0);
 }

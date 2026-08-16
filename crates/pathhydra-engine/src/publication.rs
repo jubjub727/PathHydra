@@ -315,6 +315,12 @@ impl RoutingState {
             Self::Unavailable { reason, .. } => Err(reason.clone()),
         }
     }
+    pub fn execution_lease_count(&self) -> usize {
+        match self {
+            Self::Available { image, .. } => Arc::strong_count(image),
+            Self::Unavailable { .. } => 0,
+        }
+    }
     pub fn age(&self) -> Option<Duration> {
         match self {
             Self::Available { published_at, .. } => Some(published_at.elapsed()),

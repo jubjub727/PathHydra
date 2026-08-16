@@ -34,7 +34,10 @@ cancellation, and path reconstruction code as resident search. Stable path
 evidence is copied at relaxation time, so cache eviction cannot alter a result.
 An execution image owns an immutable bundle lease; old requests can finish
 after publication, and the reaper deletes an exact retired child only after all
-request, cache, I/O, and CUDA references release it.
+request, cache, I/O, and CUDA references release it. The configured retirement
+count and byte limits apply publication backpressure while an externally leased
+replacement would exceed either bound; health reports cumulative wait count
+and duration, and the queue does not operate as an alert-only overrun.
 
 ## Topology
 

@@ -714,6 +714,7 @@ impl GraphEngine {
             .map_err(|_| EngineError::LockPoisoned {
                 lock: "published routing state",
             })?;
+        self.await_retirement_capacity(&state);
         let (result, report) = self.compile_current_image();
         match result {
             Ok(image) => {
@@ -1318,6 +1319,7 @@ impl GraphEngine {
             .map_err(|_| EngineError::LockPoisoned {
                 lock: "published routing state",
             })?;
+        self.await_retirement_capacity(&state);
         let durable_result = mutation(&self.catalog)?;
         let (compiled, report) = self.compile_current_image();
         let publication = match compiled {
@@ -1587,6 +1589,20 @@ impl GraphEngine {
         }
     }
 
+    fn await_retirement_capacity(&self, state: &RoutingState) {
+        let Ok(execution) = state.execution() else {
+            return;
+        };
+        let bundle_bytes = execution.cpu.bundle().total_bytes();
+        drop(execution);
+        while state.execution_lease_count() > 1 && !self.retirement.capacity_available(bundle_bytes)
+        {
+            let waited = Duration::from_millis(5);
+            std::thread::sleep(waited);
+            self.retirement.record_backpressure_wait(waited);
+        }
+    }
+
     fn cuda_device_summary(&self) -> Option<CudaDeviceSummary> {
         #[cfg(feature = "cuda")]
         {
@@ -1655,11 +1671,18 @@ impl GraphEngine {
                         current_bytes: cache.current_bytes,
                         high_water_bytes: cache.high_water_bytes,
                         entries: cache.entries,
+                        host_loading_entries: cache.host_loading_entries,
+                        copying_entries: cache.copying_entries,
+                        evicting_entries: cache.evicting_entries,
+                        ready_entries: cache.ready_entries,
+                        failed_entries: cache.failed_entries,
                         hits: cache.hits,
                         misses: cache.misses,
+                        coalesced_waits: cache.coalesced_waits,
                         copies: cache.copies,
                         evictions: cache.evictions,
                         slot_waits: cache.slot_waits,
+                        completion_waits: cache.completion_waits,
                         in_use_slots: cache.in_use_slots,
                         transfer_bytes: cache.transfer_bytes,
                     }
@@ -1786,9 +1809,10 @@ fn retire_available_state(
     let Ok(execution) = state.execution() else {
         return;
     };
+    let externally_leased = state.execution_lease_count() > 2;
     let current = execution.cpu.bundle();
     if !Arc::ptr_eq(&current, &replacement) && current.root() != replacement.root() {
-        retirement.retire(&current);
+        retirement.retire(&current, externally_leased);
     }
 }
 
@@ -2146,5 +2170,76 @@ mod tests {
         let recovered = engine.health().unwrap().retired_bundles;
         assert!(!old_path.exists());
         assert!(recovered.last_cleanup_failure.is_none());
+    }
+
+    #[test]
+    fn retirement_count_limit_backpressures_publication_without_overrun() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            GraphEngine::open(
+                directory.path(),
+                EngineConfig {
+                    maximum_retired_bundle_count: 1,
+                    maximum_retired_bundle_bytes: u64::MAX,
+                    ..EngineConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let first_lease = engine.routing.read().unwrap().execution().unwrap();
+        confirm_node(&engine, "first replacement");
+        assert_eq!(engine.health().unwrap().retired_bundles.bundle_count, 1);
+
+        let second_lease = engine.routing.read().unwrap().execution().unwrap();
+        let candidate = engine.insert_node_candidate("second replacement").unwrap();
+        let worker = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || engine.confirm_validated_candidate(candidate).unwrap())
+        };
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!worker.is_finished(), "publication must wait at the limit");
+        assert_eq!(engine.retirement.snapshot().bundle_count, 1);
+        drop(first_lease);
+        worker.join().unwrap();
+
+        let pressured = engine.health().unwrap().retired_bundles;
+        assert_eq!(pressured.bundle_count, 1);
+        assert!(!pressured.limit_exceeded);
+        assert!(pressured.cumulative_backpressure_waits > 0);
+        drop(second_lease);
+        assert_eq!(engine.health().unwrap().retired_bundles.bundle_count, 0);
+    }
+
+    #[test]
+    fn retirement_byte_limit_waits_for_the_current_external_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            GraphEngine::open(
+                directory.path(),
+                EngineConfig {
+                    maximum_retired_bundle_count: 8,
+                    maximum_retired_bundle_bytes: 1,
+                    ..EngineConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let lease = engine.routing.read().unwrap().execution().unwrap();
+        let candidate = engine.insert_node_candidate("replacement").unwrap();
+        let worker = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || engine.confirm_validated_candidate(candidate).unwrap())
+        };
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            !worker.is_finished(),
+            "oversized retirement must backpressure"
+        );
+        drop(lease);
+        worker.join().unwrap();
+        let snapshot = engine.health().unwrap().retired_bundles;
+        assert_eq!(snapshot.bundle_count, 0);
+        assert!(!snapshot.limit_exceeded);
+        assert!(snapshot.cumulative_backpressure_waits > 0);
     }
 }

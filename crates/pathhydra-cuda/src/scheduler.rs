@@ -301,34 +301,39 @@ fn worker_loop(
                 Some(peak.max(batch.len()))
             });
         let width = batch.len();
-        for (lane_index, job) in batch.into_iter().enumerate() {
-            counters.queued.fetch_sub(1, Ordering::Relaxed);
-            let queue_duration = job.enqueued_at.elapsed();
-            let mut output = job.image.route(
-                &job.request,
-                job.algorithm,
-                &job.cancellation,
-                job.reserved_search_bytes,
-            );
-            match &mut output {
-                Ok(output) => {
-                    output.diagnostics.queue_duration = queue_duration;
-                    output.diagnostics.batch_collection_duration = collected_at.elapsed();
-                    output.diagnostics.batch_width = width;
-                    output.diagnostics.lane_index = lane_index;
-                    counters
-                        .launches
-                        .fetch_add(output.diagnostics.kernel_launches, Ordering::Relaxed);
-                    if job.cancellation.load(Ordering::Acquire) {
-                        counters.cancellations.fetch_add(1, Ordering::Relaxed);
+        std::thread::scope(|scope| {
+            for (lane_index, job) in batch.into_iter().enumerate() {
+                let counters = Arc::clone(&counters);
+                scope.spawn(move || {
+                    counters.queued.fetch_sub(1, Ordering::Relaxed);
+                    let queue_duration = job.enqueued_at.elapsed();
+                    let mut output = job.image.route(
+                        &job.request,
+                        job.algorithm,
+                        &job.cancellation,
+                        job.reserved_search_bytes,
+                    );
+                    match &mut output {
+                        Ok(output) => {
+                            output.diagnostics.queue_duration = queue_duration;
+                            output.diagnostics.batch_collection_duration = collected_at.elapsed();
+                            output.diagnostics.batch_width = width;
+                            output.diagnostics.lane_index = lane_index;
+                            counters
+                                .launches
+                                .fetch_add(output.diagnostics.kernel_launches, Ordering::Relaxed);
+                            if job.cancellation.load(Ordering::Acquire) {
+                                counters.cancellations.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(_) => {
+                            counters.failures.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
-                }
-                Err(_) => {
-                    counters.failures.fetch_add(1, Ordering::Relaxed);
-                }
+                    let _ = job.reply.send(output);
+                });
             }
-            let _ = job.reply.send(output);
-        }
+        });
         counters.active.store(0, Ordering::Relaxed);
     }
 }

@@ -247,23 +247,23 @@ fn one_edge_partitions_cache_thrash_and_reverse_group_order_match_cpu() {
     let cpu = route(&resident, &request).unwrap();
     let context = CudaContextOwner::initialize(0).unwrap();
     for reverse in [false, true] {
-        let partitioned = CudaPartitionedImage::upload(
-            Arc::clone(&context),
-            Arc::clone(&chunked),
-            CudaPartitionedConfig {
-                maximum_topology_cache_bytes: 48,
-                maximum_topology_cache_slots: 1,
-                maximum_host_staging_bytes: 48,
-                minimum_free_memory_headroom: 0,
-                reserved_concurrent_search_bytes: 1024 * 1024,
-                reverse_partition_order: reverse,
-            },
-        )
-        .unwrap();
         for algorithm in [
             CudaAlgorithm::Frontier,
             CudaAlgorithm::DeltaStepping(DeltaConfiguration::new(0.1).unwrap()),
         ] {
+            let partitioned = CudaPartitionedImage::upload(
+                Arc::clone(&context),
+                Arc::clone(&chunked),
+                CudaPartitionedConfig {
+                    maximum_topology_cache_bytes: 48,
+                    maximum_topology_cache_slots: 1,
+                    maximum_host_staging_bytes: 48,
+                    minimum_free_memory_headroom: 0,
+                    reserved_concurrent_search_bytes: 1024 * 1024,
+                    reverse_partition_order: reverse,
+                },
+            )
+            .unwrap();
             let reserved = estimate_search_bytes(
                 chunked.node_count(),
                 chunked.relation_kind_count(),
@@ -271,12 +271,39 @@ fn one_edge_partitions_cache_thrash_and_reverse_group_order_match_cpu() {
                 algorithm,
             )
             .unwrap();
-            let cuda = partitioned
-                .route(&request, algorithm, &AtomicBool::new(false), reserved)
-                .unwrap();
+            let cancellation = AtomicBool::new(false);
+            let cuda = if !reverse && matches!(algorithm, CudaAlgorithm::Frontier) {
+                partitioned.fault_injection().hold_completion_events(true);
+                std::thread::scope(|scope| {
+                    let route = scope
+                        .spawn(|| partitioned.route(&request, algorithm, &cancellation, reserved));
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    let observed_wait = loop {
+                        if partitioned.topology_cache_snapshot().completion_waits > 0 {
+                            break true;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            break false;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    };
+                    partitioned.fault_injection().hold_completion_events(false);
+                    let result = route.join().expect("partitioned route thread").unwrap();
+                    assert!(
+                        observed_wait,
+                        "one-slot cache must wait while its only slot owns a completion event"
+                    );
+                    result
+                })
+            } else {
+                partitioned
+                    .route(&request, algorithm, &cancellation, reserved)
+                    .unwrap()
+            };
             assert_states_equal(cpu.results(), cuda.response.results());
             assert!(cuda.diagnostics.partitions_required > 1);
             assert!(partitioned.topology_cache_snapshot().evictions > 0);
+            assert_eq!(partitioned.topology_cache_snapshot().in_use_slots, 0);
         }
     }
 }
@@ -466,4 +493,209 @@ fn cancellation_during_partition_read_releases_cuda_and_host_cache_state() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert_eq!(chunked.cache_snapshot().pinned_entries, 0);
+}
+
+#[test]
+fn concurrent_partition_requests_coalesce_loading_and_leave_no_cache_state_in_use() {
+    let (directory, catalog, resident, request) = fixture();
+    let bundle_path = directory.path().join("coalesced-device-cache");
+    let scan = catalog.confirmed_graph_scan().unwrap();
+    compile_bundle(
+        &scan,
+        &bundle_path,
+        BundleConfig {
+            target_partition_topology_bytes: 48,
+            hard_maximum_partition_topology_bytes: 48,
+            maximum_total_bundle_bytes: 1024 * 1024,
+        },
+    )
+    .unwrap();
+    drop(scan);
+    let chunked = Arc::new(
+        ChunkedRoutingImage::open(
+            open_bundle(&bundle_path).unwrap(),
+            HostCacheConfig {
+                maximum_bytes: 112,
+                maximum_staging_bytes: 56,
+                maximum_entries: 1,
+                io_worker_count: 2,
+                maximum_queued_reads: 2,
+            },
+        )
+        .unwrap(),
+    );
+    chunked
+        .bundle()
+        .fault_injection()
+        .delay_reads(std::time::Duration::from_millis(50));
+    let partitioned = CudaPartitionedImage::upload(
+        CudaContextOwner::initialize(0).unwrap(),
+        Arc::clone(&chunked),
+        CudaPartitionedConfig {
+            maximum_topology_cache_bytes: 48,
+            maximum_topology_cache_slots: 1,
+            maximum_host_staging_bytes: 48,
+            minimum_free_memory_headroom: 0,
+            reserved_concurrent_search_bytes: 2 * 1024 * 1024,
+            reverse_partition_order: false,
+        },
+    )
+    .unwrap();
+    let reserved = estimate_search_bytes(
+        chunked.node_count(),
+        chunked.relation_kind_count(),
+        request.destinations().len(),
+        CudaAlgorithm::Frontier,
+    )
+    .unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let image = Arc::clone(&partitioned);
+            let request = request.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                image
+                    .route(
+                        &request,
+                        CudaAlgorithm::Frontier,
+                        &AtomicBool::new(false),
+                        reserved,
+                    )
+                    .unwrap()
+            })
+        })
+        .collect();
+    barrier.wait();
+    let mut observed_loading = false;
+    for _ in 0..100 {
+        if partitioned.topology_cache_snapshot().host_loading_entries != 0 {
+            observed_loading = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let cpu = route(&resident, &request).unwrap();
+    for worker in workers {
+        let output = worker.join().unwrap();
+        assert_states_equal(cpu.results(), output.response.results());
+    }
+    let cache = partitioned.topology_cache_snapshot();
+    assert!(observed_loading);
+    assert!(cache.coalesced_waits > 0);
+    assert_eq!(cache.host_loading_entries, 0);
+    assert_eq!(cache.copying_entries, 0);
+    assert_eq!(cache.evicting_entries, 0);
+    assert_eq!(cache.failed_entries, 0);
+    assert_eq!(cache.in_use_slots, 0);
+    assert!(cache.current_bytes <= cache.capacity_bytes);
+    assert!(cache.entries <= cache.capacity_slots);
+}
+
+#[test]
+fn delta_groups_only_current_bucket_source_partitions() {
+    let directory = tempfile::tempdir().unwrap();
+    let catalog = Catalog::open(directory.path().join("catalog")).unwrap();
+    let nodes: Vec<_> = (0..64)
+        .map(|index| {
+            let candidate = catalog
+                .insert_node_candidate(format!("node-{index}"))
+                .unwrap();
+            let ConfirmedRecord::Node(node) =
+                catalog.confirm_validated_candidate(candidate).unwrap()
+            else {
+                panic!()
+            };
+            node.id()
+        })
+        .collect();
+    let relation = catalog.insert_relation_candidate("road").unwrap();
+    let ConfirmedRecord::Relation(relation) =
+        catalog.confirm_validated_candidate(relation).unwrap()
+    else {
+        panic!()
+    };
+    for source in std::iter::once(0).chain(2..63) {
+        let destination = if source == 0 { 1 } else { source + 1 };
+        let edge = catalog
+            .insert_edge_candidate(nodes[source], nodes[destination], relation.id(), 1.0)
+            .unwrap();
+        catalog.confirm_validated_candidate(edge).unwrap();
+    }
+    let resident =
+        Arc::new(RoutingImage::compile(&catalog.confirmed_graph_records().unwrap()).unwrap());
+    let request = RoutingRequest::new(
+        nodes[0],
+        [nodes[1]],
+        RelationProfile::new([(
+            relation.id(),
+            RelationUse::Enabled(RelationMultiplier::new(1.0).unwrap()),
+        )]),
+        false,
+        SearchBudget::Unlimited,
+        TiePolicy::StablePredecessor,
+    );
+    let bundle_path = directory.path().join("delta-grouped");
+    let scan = catalog.confirmed_graph_scan().unwrap();
+    compile_bundle(
+        &scan,
+        &bundle_path,
+        BundleConfig {
+            target_partition_topology_bytes: 48,
+            hard_maximum_partition_topology_bytes: 48,
+            maximum_total_bundle_bytes: 1024 * 1024,
+        },
+    )
+    .unwrap();
+    drop(scan);
+    let chunked = Arc::new(
+        ChunkedRoutingImage::open(
+            open_bundle(&bundle_path).unwrap(),
+            HostCacheConfig {
+                maximum_bytes: 112,
+                maximum_staging_bytes: 56,
+                maximum_entries: 1,
+                io_worker_count: 2,
+                maximum_queued_reads: 2,
+            },
+        )
+        .unwrap(),
+    );
+    assert!(chunked.partition_count() > 32);
+    let partitioned = CudaPartitionedImage::upload(
+        CudaContextOwner::initialize(0).unwrap(),
+        Arc::clone(&chunked),
+        CudaPartitionedConfig {
+            maximum_topology_cache_bytes: 48,
+            maximum_topology_cache_slots: 1,
+            maximum_host_staging_bytes: 48,
+            minimum_free_memory_headroom: 0,
+            reserved_concurrent_search_bytes: 1024 * 1024,
+            reverse_partition_order: false,
+        },
+    )
+    .unwrap();
+    let algorithm = CudaAlgorithm::DeltaStepping(DeltaConfiguration::new(1.0e-9).unwrap());
+    let output = partitioned
+        .route(
+            &request,
+            algorithm,
+            &AtomicBool::new(false),
+            estimate_search_bytes(
+                chunked.node_count(),
+                chunked.relation_kind_count(),
+                request.destinations().len(),
+                algorithm,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_states_equal(
+        route(&resident, &request).unwrap().results(),
+        output.response.results(),
+    );
+    assert_eq!(partitioned.topology_cache_snapshot().misses, 1);
+    assert_eq!(partitioned.topology_cache_snapshot().copies, 1);
+    assert_eq!(output.diagnostics.partitions_required, 2);
 }

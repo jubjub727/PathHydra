@@ -16,13 +16,19 @@ and frontier state remain resident while topology partitions pass through
 byte- and slot-bounded device storage. Frontier completion includes every
 source segment and all pending reads, copies, launches, and synchronization.
 Delta-stepping repeats light-partition work through same-bucket closure, then
-processes every heavy partition for the completed removed set. Reversing the
-partition schedule is required to preserve exact CPU distance bits.
+processes the heavy partitions named by the completed removed set. Both phases
+derive partition groups from current-bucket sources and do not scan unrelated
+partitions. Reversing the partition schedule is required to preserve exact CPU
+distance bits.
 
-Device entries are immutable and reference-counted while used by launches. A
-slot is reusable only after its stream has synchronized; allocation, copy,
-launch, event, synchronization, and context-loss failures release host and
-device reservations through that boundary. Context loss poisons the CUDA
-runtime but not the acquired bundle. Permissive policy reruns the complete
-request on the matching CPU representation, while explicit CUDA
-reinitialization creates a fresh context and cache.
+Device entries move through explicit host-loading, copying, ready/in-use,
+evicting, and failed states. Concurrent requests coalesce on the loading/copying owner.
+Entries are immutable and reference-counted while used by launches, and every
+launch records a CUDA completion event. A slot is reusable only after all users
+release it, its events complete, and device-allocation release finishes outside
+the cache mutex; allocation, copy, launch, event,
+synchronization, and context-loss failures release host and device reservations
+through that boundary. Context loss poisons the CUDA runtime but not the
+acquired bundle. Permissive policy reruns the complete request on the matching
+CPU representation, while explicit CUDA reinitialization creates a fresh
+context and cache.

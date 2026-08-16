@@ -19,6 +19,14 @@ partition/file/staged/transfer bytes, launches, synchronized duration, phases,
 and relaxations. No names,
 payloads, complete profiles, or destinations are logged.
 
+The device cache exposes host-loading, copying, evicting, ready, in-use, and
+failed counts. One loader owns a missing partition while concurrent lanes wait
+on its state; the cache mutex is not held across the host read, CUDA copy, or
+device-allocation release. Copies use a dedicated stream. Every compute launch
+records a CUDA completion event, and a slot remains in use until its leases are
+released and all recorded events are complete. Slot pressure waits with
+cancellation checkpoints instead of reusing an in-flight allocation.
+
 Confirmed mutation publication is CPU-authoritative. A replacement CPU image
 is compiled first, then resident upload or partition-cache construction is attempted while publication is
 exclusive. Success publishes the matching pair once; failure publishes the
@@ -37,7 +45,11 @@ engine rebuilds from confirmed RocksDB records. Device loss is different: the
 bundle remains valid, `PreferCuda` may rerun the full request on matching CPU
 bytes, and `reinitialize_cuda` creates a fresh context and cache.
 
-Retired bundle count/bytes and the last cleanup failure are health fields.
+Retired bundle count/bytes, publication-backpressure waits/duration, and the
+last cleanup failure are health fields. The configured count and byte values
+are enforced limits: while an externally leased replacement would exceed one,
+publication holds its exclusive boundary until an older lease expires and its
+bundle is reaped. They are not alert-only thresholds.
 Windows sharing violations retain retryable retirement state. Backups may omit
 the routing-image root; a restored pointer whose child is absent is cleared and
 rebuilt. `StartupBundlePolicy::RequireValidBundle` can disable automatic startup
