@@ -175,6 +175,21 @@ pub struct OutgoingEdge {
 }
 
 impl OutgoingEdge {
+    pub(crate) const fn from_bundle(
+        edge_id: EdgeId,
+        destination: DenseNodeId,
+        relation_id: RelationId,
+        base_weight: BaseWeight,
+        relation_index: u32,
+    ) -> Self {
+        Self {
+            edge_id,
+            destination,
+            relation_id,
+            base_weight,
+            relation_index,
+        }
+    }
     #[must_use]
     pub const fn edge_id(self) -> EdgeId {
         self.edge_id
@@ -298,10 +313,6 @@ impl RoutingImage {
     ) -> Option<impl ExactSizeIterator<Item = OutgoingEdge> + '_> {
         let range = self.outgoing_range(source)?;
         Some(range.map(|index| self.edge_at(index)))
-    }
-
-    pub(crate) fn relation_index(&self, id: RelationId) -> Option<usize> {
-        self.confirmed_relation_ids.binary_search(&id).ok()
     }
 
     pub(crate) fn outgoing_range(&self, source: DenseNodeId) -> Option<Range<usize>> {

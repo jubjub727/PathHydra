@@ -3,6 +3,8 @@
 PathHydra is designed to store knowledge as nodes and typed, directed relations,
 then find the closest logical region of that graph for the current context.
 
+Confirmed records remain authoritative in RocksDB. The engine compiles them through a consistent streaming scan into a deterministic, checksummed five-file routing bundle. Startup validates and reuses the referenced bundle, or clears it and rebuilds when it is absent or corrupt. Small topology uses the fully resident CPU path; topology above `max_active_image_bytes` uses exact out-of-core CPU routing through bounded source-segment partitions and a shared host cache. Dense identity/directory metadata and per-search state retain separate explicit limits.
+
 Context-weighted pathfinding exposes exact distances and, when requested, the paths that produced them. Those results can support branching graph structures without the Rust engine imposing one composition strategy:
 
 ```mermaid
@@ -76,8 +78,8 @@ remains conservative and no universal speedup is claimed. See [the CUDA build
 guide](docs/cuda-build.md), [routing contract](docs/cuda-routing.md), and
 [operations guide](docs/cuda-operations.md).
 
-Durable routing-image files, BAML/bindings, and a transport are not implemented
-yet.
+BAML/bindings and a transport are not implemented yet. Durable routing bundles
+and exact partitioned CPU execution are active engine paths.
 
 ## Development
 

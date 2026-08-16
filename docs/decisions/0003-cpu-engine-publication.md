@@ -40,4 +40,4 @@ The request registry and admission mutex are never acquired while the published-
 
 ## Consequences
 
-Publication is deliberately a full deterministic rebuild. Topology memory and per-route working memory are separate limits. Process-local clocks, request IDs, and counters are diagnostics, not durable graph identity. Restart always rebuilds from validated RocksDB state.
+Publication is deliberately a full deterministic rebuild. Topology memory and per-route working memory are separate limits. Process-local clocks, request IDs, and counters are diagnostics, not durable graph identity. Decision 0007 supersedes the original restart detail: restart now reuses a fully validated current bundle and rebuilds from RocksDB when that rebuildable index is absent or invalid.

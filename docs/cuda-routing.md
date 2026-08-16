@@ -1,5 +1,7 @@
 # Exact CUDA routing
 
+CUDA full residency remains the preferred accelerator path when topology and configured headroom fit. CPU publication is independently resident or source-segment partitioned, and permissive CUDA policy falls back to the matching exact CPU image without mixing partial device distances with CPU evidence. `RequireCuda` returns a typed refusal when no admissible CUDA representation exists.
+
 CUDA residency contains CSR offsets, dense destinations, dense relation
 indexes, and canonical base-weight bits. Stable node/relation IDs remain on the
 matching CPU image for request mapping and canonical response construction.

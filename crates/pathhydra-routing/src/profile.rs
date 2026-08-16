@@ -94,28 +94,35 @@ impl RelationProfile {
     }
 
     pub fn pack(&self, image: &RoutingImage) -> Result<PackedRelationProfile, ProfileError> {
+        self.pack_relation_ids(image.confirmed_relation_ids())
+    }
+
+    pub(crate) fn pack_relation_ids(
+        &self,
+        relation_ids: &[RelationId],
+    ) -> Result<PackedRelationProfile, ProfileError> {
         let mut by_index = Vec::new();
         by_index
-            .try_reserve_exact(image.relation_kind_count())
+            .try_reserve_exact(relation_ids.len())
             .map_err(|_| ProfileError::AllocationFailed)?;
-        by_index.resize(image.relation_kind_count(), None);
+        by_index.resize(relation_ids.len(), None);
         for &(id, relation_use) in &self.entries {
-            let index = image
-                .relation_index(id)
-                .ok_or(ProfileError::UnknownRelation(id))?;
+            let index = relation_ids
+                .binary_search(&id)
+                .map_err(|_| ProfileError::UnknownRelation(id))?;
             if by_index[index].replace(relation_use).is_some() {
                 return Err(ProfileError::DuplicateRelation(id));
             }
         }
         let mut packed = Vec::new();
         packed
-            .try_reserve_exact(image.relation_kind_count())
+            .try_reserve_exact(relation_ids.len())
             .map_err(|_| ProfileError::AllocationFailed)?;
         let mut canonical = Vec::new();
         canonical
-            .try_reserve_exact(image.relation_kind_count())
+            .try_reserve_exact(relation_ids.len())
             .map_err(|_| ProfileError::AllocationFailed)?;
-        for (index, &id) in image.confirmed_relation_ids().iter().enumerate() {
+        for (index, &id) in relation_ids.iter().enumerate() {
             let relation_use = by_index[index].ok_or(ProfileError::MissingRelation(id))?;
             packed.push(relation_use);
             canonical.push((id, relation_use));
@@ -159,9 +166,9 @@ impl PackedRelationProfile {
         (enabled, multiplier_bits)
     }
 
-    pub(crate) fn relation_use(&self, image: &RoutingImage, id: RelationId) -> Option<RelationUse> {
-        image
-            .relation_index(id)
+    pub(crate) fn relation_use_index(&self, index: u32) -> Option<RelationUse> {
+        usize::try_from(index)
+            .ok()
             .and_then(|index| self.uses.get(index).copied())
     }
 }

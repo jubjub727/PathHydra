@@ -542,14 +542,14 @@ PathHydra-owned engine code is Rust. RocksDB itself is implemented in C++ and wi
 - stored and accumulated numeric types;
 - edge identity and duplicate-edge policy;
 - RocksDB column-family split and key encoding;
-- adjacency packing and high-degree representation;
+- adjacency packing and high-degree representation (fixed by Decision 0008);
 - full rebuilds, incremental images, or overlay publication;
 - snapshot retention method for hydration;
 - distance-only versus additional selection-state capture policy;
 - profile materialization threshold;
 - target-set representation;
 - batch width and lane scheduling;
-- out-of-core partitioning and I/O transport;
+- alternative out-of-core I/O transports beyond the conventional baseline;
 - in-process Rust library or separately hosted Rust API packaging;
 - request, response, and serialized subgraph encoding;
 - in-memory subgraph representation.

@@ -49,6 +49,7 @@
 //! # }
 //! ```
 
+pub mod bundle;
 mod compile;
 mod cpu;
 mod error;
@@ -56,6 +57,11 @@ mod image;
 mod profile;
 mod request;
 
+pub use bundle::{
+    BundleBuildMetrics, BundleConfig, BundleError, BundleManifest, ChunkedRoutingImage,
+    HostCacheConfig, HostCacheSnapshot, PartitionedCpuDiagnostics, RoutingBundle, compile_bundle,
+    open_bundle, route_partitioned, route_partitioned_controlled,
+};
 pub use compile::{compile_routing_image, compile_routing_image_with_limit};
 pub use cpu::{
     CancellationSignal, CpuSearchDiagnostics, CpuWorkingSetEstimate, NeverCancelled,
@@ -74,3 +80,10 @@ pub use request::{
     CompletionReason, DestinationResult, DestinationState, ExactRoute, NumericPolicy, PathStep,
     RoutePath, RoutingRequest, RoutingResponse, SearchBudget, TiePolicy,
 };
+
+/// Representation-independent semantic agreement used by CPU/CUDA fixtures.
+/// Executor timing and cache diagnostics live outside `RoutingResponse`.
+#[must_use]
+pub fn responses_agree(left: &RoutingResponse, right: &RoutingResponse) -> bool {
+    left == right
+}

@@ -1,5 +1,9 @@
 # Immutable routing image and CPU routing
 
+`RoutingImage` is the low-level, caller-owned in-memory representation used by compact fixtures and resident CPU/CUDA paths. It is not a serialized Rust struct. Production publication uses one current durable bundle containing exactly `manifest.bin`, `identities.bin`, `source-directory.bin`, `topology.bin`, and `evidence.bin`.
+
+Fields are explicitly little-endian; the manifest has semantic policy IDs but no format marker or version. BLAKE3 covers each complete data file and every independently addressable topology/evidence partition. The loader checks lengths, ranges, counts, identities, source-segment coverage, dense bounds, canonical weights, checksums, and trailing bytes before publication. Concatenating a source's segments preserves exact stable `EdgeId` order, including parallel and self relations.
+
 The low-level `RoutingImage` remains a caller-owned point-in-time value for deterministic tests and backend comparison. `GraphEngine` separately owns and publishes the one current CPU image used by its admitted routes; callers cannot replace that image or mutate its catalog outside publication coordination.
 
 PathHydra compiles a self-contained read of the confirmed durable graph into

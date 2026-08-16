@@ -121,6 +121,7 @@ fn postcommit_topology_failure_is_unambiguous_and_repair_recovers() {
     let directory = tempfile::tempdir().unwrap();
     let config = EngineConfig {
         max_active_image_bytes: 8,
+        max_resident_image_metadata_bytes: 8,
         ..EngineConfig::default()
     };
     let engine = GraphEngine::open(directory.path(), config).unwrap();

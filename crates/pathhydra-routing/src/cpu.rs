@@ -16,6 +16,46 @@ use crate::{
     RoutePath, RoutingError, RoutingImage, RoutingRequest, RoutingResponse,
 };
 
+pub(crate) trait RoutingTopology {
+    fn node_count(&self) -> usize;
+    fn relation_kind_count(&self) -> usize;
+    fn adjacency_count(&self) -> usize;
+    fn dense_node_id(&self, external: pathhydra_core::NodeId) -> Option<DenseNodeId>;
+    fn external_node_id(&self, dense: DenseNodeId) -> Option<pathhydra_core::NodeId>;
+    fn relation_ids(&self) -> &[pathhydra_core::RelationId];
+    fn outgoing_range(&self, source: DenseNodeId) -> Result<std::ops::Range<usize>, RoutingError>;
+    fn edge_at(&self, index: usize) -> Result<crate::OutgoingEdge, RoutingError>;
+}
+
+impl RoutingTopology for RoutingImage {
+    fn node_count(&self) -> usize {
+        self.node_count()
+    }
+    fn relation_kind_count(&self) -> usize {
+        self.relation_kind_count()
+    }
+    fn adjacency_count(&self) -> usize {
+        self.adjacency_count()
+    }
+    fn dense_node_id(&self, id: pathhydra_core::NodeId) -> Option<DenseNodeId> {
+        self.dense_node_id(id)
+    }
+    fn external_node_id(&self, id: DenseNodeId) -> Option<pathhydra_core::NodeId> {
+        self.external_node_id(id)
+    }
+    fn relation_ids(&self) -> &[pathhydra_core::RelationId] {
+        self.confirmed_relation_ids()
+    }
+    fn outgoing_range(&self, source: DenseNodeId) -> Result<std::ops::Range<usize>, RoutingError> {
+        RoutingImage::outgoing_range(self, source).ok_or(RoutingError::InternalInvariant {
+            reason: "node has no bounded outgoing range",
+        })
+    }
+    fn edge_at(&self, index: usize) -> Result<crate::OutgoingEdge, RoutingError> {
+        Ok(RoutingImage::edge_at(self, index))
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FrontierEntry {
     distance: f64,
@@ -115,6 +155,13 @@ pub fn estimate_cpu_working_set(
     image: &RoutingImage,
     request: &RoutingRequest,
 ) -> Result<CpuWorkingSetEstimate, RoutingError> {
+    estimate_topology_working_set(image, request)
+}
+
+pub(crate) fn estimate_topology_working_set(
+    image: &impl RoutingTopology,
+    request: &RoutingRequest,
+) -> Result<CpuWorkingSetEstimate, RoutingError> {
     fn add(total: &mut usize, count: usize, width: usize) -> Result<(), RoutingError> {
         *total = total
             .checked_add(
@@ -204,10 +251,18 @@ pub fn route_controlled(
     request: &RoutingRequest,
     cancellation: &impl CancellationSignal,
 ) -> Result<(RoutingResponse, CpuSearchDiagnostics), RoutingError> {
+    route_topology_controlled(image, request, cancellation)
+}
+
+pub(crate) fn route_topology_controlled(
+    image: &impl RoutingTopology,
+    request: &RoutingRequest,
+    cancellation: &impl CancellationSignal,
+) -> Result<(RoutingResponse, CpuSearchDiagnostics), RoutingError> {
     let origin = image
         .dense_node_id(request.origin())
         .ok_or(RoutingError::MissingOrigin(request.origin()))?;
-    let profile = request.profile().pack(image)?;
+    let profile = request.profile().pack_relation_ids(image.relation_ids())?;
 
     let mut dense_destinations = try_vec(request.destinations().len(), "destination mapping")?;
     dense_destinations.extend(
@@ -311,12 +366,7 @@ pub fn route_controlled(
                 break;
             }
 
-            let outgoing =
-                image
-                    .outgoing_range(current.node)
-                    .ok_or(RoutingError::InternalInvariant {
-                        reason: "finalized node has no bounded outgoing range",
-                    })?;
+            let outgoing = image.outgoing_range(current.node)?;
             for adjacency in outgoing {
                 if cancellation.is_cancelled() {
                     completion_reason = CompletionReason::Cancelled;
@@ -332,8 +382,8 @@ pub fn route_controlled(
                         .ok_or(RoutingError::InternalInvariant {
                             reason: "examined-edge counter overflow",
                         })?;
-                let edge = image.edge_at(adjacency);
-                let relation_use = profile.relation_use(image, edge.relation_id()).ok_or(
+                let edge = image.edge_at(adjacency)?;
+                let relation_use = profile.relation_use_index(edge.relation_index()).ok_or(
                     RoutingError::InternalInvariant {
                         reason: "edge relation is absent from packed profile",
                     },
@@ -530,7 +580,7 @@ fn set_predecessor(
 
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_path(
-    image: &RoutingImage,
+    image: &impl RoutingTopology,
     profile: &PackedRelationProfile,
     external_origin: pathhydra_core::NodeId,
     origin: DenseNodeId,
@@ -568,25 +618,20 @@ fn reconstruct_path(
                 reason: "exact destination has a missing predecessor",
             },
         )?;
-        let range =
-            image
-                .outgoing_range(predecessor.source)
-                .ok_or(RoutingError::InternalInvariant {
-                    reason: "predecessor source has no outgoing range",
-                })?;
+        let range = image.outgoing_range(predecessor.source)?;
         if !range.contains(&predecessor.adjacency) {
             return Err(RoutingError::InternalInvariant {
                 reason: "predecessor edge is outside its source range",
             });
         }
-        let edge = image.edge_at(predecessor.adjacency);
+        let edge = image.edge_at(predecessor.adjacency)?;
         if edge.edge_id() != predecessor.edge || edge.destination() != current {
             return Err(RoutingError::InternalInvariant {
                 reason: "predecessor edge endpoints or identity disagree",
             });
         }
         let RelationUse::Enabled(multiplier) = profile
-            .relation_use(image, edge.relation_id())
+            .relation_use_index(edge.relation_index())
             .ok_or(RoutingError::InternalInvariant {
                 reason: "path edge relation is absent from packed profile",
             })?

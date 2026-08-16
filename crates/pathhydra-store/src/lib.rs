@@ -9,7 +9,10 @@ mod codec;
 mod column_families;
 mod error;
 
-pub use catalog::{Catalog, ConfirmedGraphRecords, ConfirmedRecordBatch};
+pub use catalog::{
+    ActiveRoutingImage, Catalog, ConfirmedGraphRecords, ConfirmedGraphScan, ConfirmedRecordBatch,
+    ScanError,
+};
 pub use error::{CatalogError, ConfirmedId, EdgeEndpoint, RecordKind};
 pub use pathhydra_core::{
     BaseWeight, Candidate, CandidateId, ConfirmedRecord, EdgeId, EdgeRecord, InvalidBaseWeight,

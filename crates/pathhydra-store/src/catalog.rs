@@ -25,6 +25,7 @@ const META_NEXT_CANDIDATE_ID: &[u8] = b"next-candidate-id";
 const META_NEXT_NODE_ID: &[u8] = b"next-node-id";
 const META_NEXT_RELATION_ID: &[u8] = b"next-relation-id";
 const META_NEXT_EDGE_ID: &[u8] = b"next-edge-id";
+const META_ACTIVE_ROUTING_IMAGE: &[u8] = b"active-routing-image";
 const INITIAL_ID: u64 = 1;
 
 type NodeNameIndex = HashMap<Box<str>, NodeId>;
@@ -47,6 +48,162 @@ pub struct ConfirmedRecordBatch {
     nodes: BTreeMap<NodeId, NodeRecord>,
     edges: BTreeMap<EdgeId, EdgeRecord>,
     relation_kinds: BTreeMap<RelationId, RelationRecord>,
+}
+
+/// Opaque durable reference to the one current rebuildable routing bundle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveRoutingImage {
+    relative_bundle: Box<str>,
+    manifest_checksum: [u8; 32],
+}
+
+impl ActiveRoutingImage {
+    #[must_use]
+    pub fn new(relative_bundle: impl Into<Box<str>>, manifest_checksum: [u8; 32]) -> Self {
+        Self {
+            relative_bundle: relative_bundle.into(),
+            manifest_checksum,
+        }
+    }
+    #[must_use]
+    pub fn relative_bundle(&self) -> &str {
+        &self.relative_bundle
+    }
+    #[must_use]
+    pub const fn manifest_checksum(&self) -> &[u8; 32] {
+        &self.manifest_checksum
+    }
+}
+
+/// A consistent confirmed-graph view protected from promotion and deletion.
+/// Decoded records are borrowed only for the duration of each callback.
+pub struct ConfirmedGraphScan<'a> {
+    catalog: &'a Catalog,
+    _guard: MutexGuard<'a, ()>,
+}
+
+#[derive(Debug)]
+pub enum ScanError<E> {
+    Catalog(CatalogError),
+    Visitor(E),
+}
+
+impl<'a> ConfirmedGraphScan<'a> {
+    pub fn for_each_node<E>(
+        &self,
+        mut visit: impl FnMut(&NodeRecord) -> Result<(), E>,
+    ) -> Result<(), ScanError<E>> {
+        let family =
+            column_family(&self.catalog.db, column_families::NODES).map_err(ScanError::Catalog)?;
+        for entry in self.catalog.db.iterator_cf(family, IteratorMode::Start) {
+            let (key, value) = entry
+                .map_err(CatalogError::from)
+                .map_err(ScanError::Catalog)?;
+            let id = decode_id_key(&key)
+                .map_err(|error| record_error(column_families::NODES, "key", error))
+                .map_err(ScanError::Catalog)?;
+            let record = decode_node(&value, id)
+                .map_err(|error| record_error(column_families::NODES, id.to_string(), error))
+                .map_err(ScanError::Catalog)?;
+            visit(&record).map_err(ScanError::Visitor)?;
+        }
+        Ok(())
+    }
+
+    pub fn for_each_relation_kind<E>(
+        &self,
+        mut visit: impl FnMut(&RelationRecord) -> Result<(), E>,
+    ) -> Result<(), ScanError<E>> {
+        let family = column_family(&self.catalog.db, column_families::RELATION_KINDS)
+            .map_err(ScanError::Catalog)?;
+        for entry in self.catalog.db.iterator_cf(family, IteratorMode::Start) {
+            let (key, value) = entry
+                .map_err(CatalogError::from)
+                .map_err(ScanError::Catalog)?;
+            let id = decode_id_key(&key)
+                .map_err(|error| record_error(column_families::RELATION_KINDS, "key", error))
+                .map_err(ScanError::Catalog)?;
+            let record = decode_relation(&value, id)
+                .map_err(|error| {
+                    record_error(column_families::RELATION_KINDS, id.to_string(), error)
+                })
+                .map_err(ScanError::Catalog)?;
+            visit(&record).map_err(ScanError::Visitor)?;
+        }
+        Ok(())
+    }
+
+    /// Visits canonical outgoing adjacency in `(source NodeId, EdgeId)` order.
+    pub fn for_each_outgoing_edge<E>(
+        &self,
+        mut visit: impl FnMut(&EdgeRecord) -> Result<(), E>,
+    ) -> Result<(), ScanError<E>> {
+        let outgoing = column_family(&self.catalog.db, column_families::OUTGOING_EDGES)
+            .map_err(ScanError::Catalog)?;
+        for entry in self.catalog.db.iterator_cf(outgoing, IteratorMode::Start) {
+            let (key, value) = entry
+                .map_err(CatalogError::from)
+                .map_err(ScanError::Catalog)?;
+            let (source, edge_id) = decode_adjacency_key(&key)
+                .map_err(|error| record_error(column_families::OUTGOING_EDGES, "key", error))
+                .map_err(ScanError::Catalog)?;
+            decode_adjacency_value(&value, edge_id)
+                .map_err(|error| {
+                    record_error(column_families::OUTGOING_EDGES, edge_id.to_string(), error)
+                })
+                .map_err(ScanError::Catalog)?;
+            let edge = get_edge_from_db(&self.catalog.db, edge_id).map_err(ScanError::Catalog)?;
+            if edge.source() != source {
+                return Err(ScanError::Catalog(corrupt(
+                    column_families::OUTGOING_EDGES,
+                    edge_id.to_string(),
+                    "source does not match canonical edge",
+                )));
+            }
+            require_node(&self.catalog.db, edge.source(), EdgeEndpoint::Source)
+                .map_err(ScanError::Catalog)?;
+            require_node(
+                &self.catalog.db,
+                edge.destination(),
+                EdgeEndpoint::Destination,
+            )
+            .map_err(ScanError::Catalog)?;
+            require_relation_kind(&self.catalog.db, edge.relation_kind())
+                .map_err(ScanError::Catalog)?;
+            validate_exact_adjacency(&self.catalog.db, &edge).map_err(ScanError::Catalog)?;
+            visit(&edge).map_err(ScanError::Visitor)?;
+        }
+        Ok(())
+    }
+
+    pub fn active_routing_image(&self) -> Result<Option<ActiveRoutingImage>, CatalogError> {
+        read_active_routing_image(&self.catalog.db)
+    }
+
+    pub fn set_active_routing_image(
+        &self,
+        pointer: &ActiveRoutingImage,
+    ) -> Result<(), CatalogError> {
+        let name = pointer.relative_bundle.as_bytes();
+        let length = u32::try_from(name.len()).map_err(|_| {
+            corrupt(
+                "default",
+                "active-routing-image",
+                "relative bundle name is too long",
+            )
+        })?;
+        let mut encoded = Vec::with_capacity(4 + name.len() + 32);
+        encoded.extend_from_slice(&length.to_le_bytes());
+        encoded.extend_from_slice(name);
+        encoded.extend_from_slice(&pointer.manifest_checksum);
+        self.catalog.db.put(META_ACTIVE_ROUTING_IMAGE, encoded)?;
+        Ok(())
+    }
+
+    pub fn clear_active_routing_image(&self) -> Result<(), CatalogError> {
+        self.catalog.db.delete(META_ACTIVE_ROUTING_IMAGE)?;
+        Ok(())
+    }
 }
 
 impl ConfirmedRecordBatch {
@@ -316,6 +473,18 @@ impl Catalog {
         Ok(ConfirmedGraphRecords::new(nodes, relation_kinds, edges))
     }
 
+    pub fn confirmed_graph_scan(&self) -> Result<ConfirmedGraphScan<'_>, CatalogError> {
+        Ok(ConfirmedGraphScan {
+            catalog: self,
+            _guard: self.write_guard()?,
+        })
+    }
+
+    pub fn active_routing_image(&self) -> Result<Option<ActiveRoutingImage>, CatalogError> {
+        let guard = self.confirmed_graph_scan()?;
+        guard.active_routing_image()
+    }
+
     /// Reads requested confirmed records once while preventing graph mutation.
     ///
     /// Ordinary absent IDs are omitted. Every found edge is structurally
@@ -407,6 +576,7 @@ impl Catalog {
         let outgoing = column_family(&self.db, column_families::OUTGOING_EDGES)?;
         let incoming = column_family(&self.db, column_families::INCOMING_EDGES)?;
         let mut batch = WriteBatch::default();
+        batch.delete(META_ACTIVE_ROUTING_IMAGE);
         batch.delete_cf(edges, encode_id_key(id.as_u64()));
         batch.delete_cf(outgoing, encode_adjacency_key(edge.source(), id));
         batch.delete_cf(incoming, encode_adjacency_key(edge.destination(), id));
@@ -453,6 +623,7 @@ impl Catalog {
         }
 
         let mut batch = WriteBatch::default();
+        batch.delete(META_ACTIVE_ROUTING_IMAGE);
         for edge in incident.values() {
             batch.delete_cf(edges, encode_id_key(edge.id().as_u64()));
             batch.delete_cf(outgoing, encode_adjacency_key(edge.source(), edge.id()));
@@ -531,6 +702,7 @@ impl Catalog {
         let candidates = column_family(&self.db, column_families::CANDIDATES)?;
         let nodes = column_family(&self.db, column_families::NODES)?;
         let mut batch = WriteBatch::default();
+        batch.delete(META_ACTIVE_ROUTING_IMAGE);
         batch.put_cf(nodes, encode_id_key(next_id), encoded_record);
         batch.put_cf(names_cf, &name_key, encode_u64_record(next_id));
         batch.delete_cf(candidates, encode_id_key(candidate_id.as_u64()));
@@ -571,6 +743,7 @@ impl Catalog {
         let candidates = column_family(&self.db, column_families::CANDIDATES)?;
         let relations = column_family(&self.db, column_families::RELATION_KINDS)?;
         let mut batch = WriteBatch::default();
+        batch.delete(META_ACTIVE_ROUTING_IMAGE);
         batch.put_cf(relations, encode_id_key(next_id), encoded_record);
         batch.put_cf(names_cf, &name_key, encode_u64_record(next_id));
         batch.delete_cf(candidates, encode_id_key(candidate_id.as_u64()));
@@ -610,6 +783,7 @@ impl Catalog {
         let outgoing = column_family(&self.db, column_families::OUTGOING_EDGES)?;
         let incoming = column_family(&self.db, column_families::INCOMING_EDGES)?;
         let mut batch = WriteBatch::default();
+        batch.delete(META_ACTIVE_ROUTING_IMAGE);
         batch.put_cf(edges, encode_id_key(next_id), encode_edge(&record));
         batch.put_cf(
             outgoing,
@@ -1177,6 +1351,47 @@ fn read_metadata(db: &DB, key: &[u8], record_id: &'static str) -> Result<u64, Ca
         .get(key)?
         .ok_or_else(|| corrupt("default", record_id, "required metadata record is missing"))?;
     decode_u64_record(&value).map_err(|error| record_error("default", record_id, error))
+}
+
+fn read_active_routing_image(db: &DB) -> Result<Option<ActiveRoutingImage>, CatalogError> {
+    let Some(encoded) = db.get(META_ACTIVE_ROUTING_IMAGE)? else {
+        return Ok(None);
+    };
+    if encoded.len() < 36 {
+        return Err(corrupt(
+            "default",
+            "active-routing-image",
+            "pointer is truncated",
+        ));
+    }
+    let length = u32::from_le_bytes(encoded[..4].try_into().expect("four-byte slice")) as usize;
+    let expected = 4_usize
+        .checked_add(length)
+        .and_then(|v| v.checked_add(32))
+        .ok_or_else(|| {
+            corrupt(
+                "default",
+                "active-routing-image",
+                "pointer length overflows",
+            )
+        })?;
+    if encoded.len() != expected {
+        return Err(corrupt(
+            "default",
+            "active-routing-image",
+            "pointer has an invalid length or trailing bytes",
+        ));
+    }
+    let name = std::str::from_utf8(&encoded[4..4 + length]).map_err(|_| {
+        corrupt(
+            "default",
+            "active-routing-image",
+            "bundle name is not UTF-8",
+        )
+    })?;
+    let mut checksum = [0_u8; 32];
+    checksum.copy_from_slice(&encoded[4 + length..]);
+    Ok(Some(ActiveRoutingImage::new(name, checksum)))
 }
 
 fn column_family<'a>(db: &'a DB, name: &'static str) -> Result<&'a ColumnFamily, CatalogError> {

@@ -32,7 +32,7 @@ pub use hydration::{
 };
 pub use pathhydra_subgraph::{EdgeHandle, Subgraph, SubgraphError, SubgraphHandles};
 pub use publication::{
-    ConfirmedMutation, ImageBuildOutcome, ImageBuildReport, PublicationOutcome,
+    ConfirmedMutation, CpuTopologyMode, ImageBuildOutcome, ImageBuildReport, PublicationOutcome,
     RoutingUnavailableReason,
 };
-pub(crate) use publication::{PublishedExecutionImage, RoutingState};
+pub(crate) use publication::{CpuTopology, PublishedExecutionImage, RoutingState};

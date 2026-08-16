@@ -4,20 +4,59 @@ use std::{
     time::{Duration, Instant},
 };
 
-use pathhydra_routing::{RoutingImage, RoutingImageManifest};
+use pathhydra_routing::{ChunkedRoutingImage, RoutingImage, RoutingImageManifest};
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CpuTopologyMode {
+    Resident,
+    Partitioned,
+}
+
+pub(crate) enum CpuTopology {
+    Resident(Arc<RoutingImage>),
+    Partitioned(Arc<ChunkedRoutingImage>),
+}
+
+impl CpuTopology {
+    pub fn manifest(&self) -> RoutingImageManifest {
+        match self {
+            Self::Resident(image) => image.manifest().clone(),
+            Self::Partitioned(image) => image
+                .routing_manifest()
+                .expect("validated bundle counts remain representable"),
+        }
+    }
+    pub fn resident(&self) -> Option<Arc<RoutingImage>> {
+        match self {
+            Self::Resident(image) => Some(Arc::clone(image)),
+            Self::Partitioned(_) => None,
+        }
+    }
+    pub const fn mode(&self) -> CpuTopologyMode {
+        match self {
+            Self::Resident(_) => CpuTopologyMode::Resident,
+            Self::Partitioned(_) => CpuTopologyMode::Partitioned,
+        }
+    }
+    pub fn host_cache(&self) -> Option<pathhydra_routing::HostCacheSnapshot> {
+        match self {
+            Self::Resident(_) => None,
+            Self::Partitioned(image) => Some(image.cache_snapshot()),
+        }
+    }
+}
+
 pub(crate) struct PublishedExecutionImage {
-    pub cpu: Arc<RoutingImage>,
+    pub cpu: CpuTopology,
     #[cfg(feature = "cuda")]
     pub cuda: Option<Arc<pathhydra_cuda::CudaResidentImage>>,
     pub cuda_unavailable_reason: Option<crate::CudaAvailability>,
 }
 
 impl PublishedExecutionImage {
-    pub fn cpu_only(image: Arc<RoutingImage>, reason: crate::CudaAvailability) -> Self {
+    pub fn cpu_only(cpu: CpuTopology, reason: crate::CudaAvailability) -> Self {
         Self {
-            cpu: image,
+            cpu,
             #[cfg(feature = "cuda")]
             cuda: None,
             cuda_unavailable_reason: Some(reason),
@@ -30,7 +69,7 @@ impl PublishedExecutionImage {
         cuda: Arc<pathhydra_cuda::CudaResidentImage>,
     ) -> Self {
         Self {
-            cpu: image,
+            cpu: CpuTopology::Resident(image),
             cuda: Some(cuda),
             cuda_unavailable_reason: None,
         }
@@ -41,6 +80,8 @@ impl PublishedExecutionImage {
 pub enum RoutingUnavailableReason {
     ImageCompilation(String),
     TopologyLimit { required: usize, limit: usize },
+    MetadataLimit { required: u64, limit: u64 },
+    Bundle(String),
 }
 
 impl fmt::Display for RoutingUnavailableReason {
@@ -51,6 +92,11 @@ impl fmt::Display for RoutingUnavailableReason {
                 formatter,
                 "topology requires {required} bytes; limit is {limit}"
             ),
+            Self::MetadataLimit { required, limit } => write!(
+                formatter,
+                "routing metadata requires {required} bytes; limit is {limit}"
+            ),
+            Self::Bundle(reason) => write!(formatter, "durable routing bundle failure: {reason}"),
         }
     }
 }
@@ -153,11 +199,13 @@ pub(crate) enum RoutingState {
 impl RoutingState {
     pub fn image(&self) -> Result<Arc<RoutingImage>, RoutingUnavailableReason> {
         match self {
-            Self::Available { image, .. } => Ok(Arc::clone(&image.cpu)),
+            Self::Available { image, .. } => image.cpu.resident().ok_or_else(|| {
+                RoutingUnavailableReason::Bundle("current CPU topology is partitioned".into())
+            }),
             Self::Unavailable { reason, .. } => Err(reason.clone()),
         }
     }
-    pub fn manifest(&self) -> Option<&RoutingImageManifest> {
+    pub fn manifest(&self) -> Option<RoutingImageManifest> {
         match self {
             Self::Available { image, .. } => Some(image.cpu.manifest()),
             Self::Unavailable { .. } => None,

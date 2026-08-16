@@ -1,5 +1,7 @@
 # CUDA operations
 
+Routing bundles are rebuildable and survive CUDA context loss. Reinitializing CUDA never changes confirmed records or bundle bytes. Operators size complete CUDA topology separately from host identity/directory metadata, the host partition cache, and CPU/device search reservations. A corrupt or unreadable partition is an image failure that triggers a controlled RocksDB rebuild, never an unreachable route.
+
 CUDA is disabled by default. Enable `EngineConfig.cuda`, choose device ordinal
 and executor policy, retain display/headroom memory, and set topology, search,
 concurrency, batch, and algorithm limits. Configuration values are validated

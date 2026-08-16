@@ -14,6 +14,10 @@ pub enum EngineConfigError {
         field: &'static str,
         reason: &'static str,
     },
+    InvalidRoutingImageValue {
+        field: &'static str,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for EngineConfigError {
@@ -23,6 +27,10 @@ impl fmt::Display for EngineConfigError {
             Self::InvalidCudaValue { field, reason } => {
                 write!(formatter, "invalid CUDA configuration {field}: {reason}")
             }
+            Self::InvalidRoutingImageValue { field, reason } => write!(
+                formatter,
+                "invalid routing-image configuration {field}: {reason}"
+            ),
         }
     }
 }

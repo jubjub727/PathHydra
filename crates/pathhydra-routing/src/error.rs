@@ -121,6 +121,7 @@ pub enum RoutingError {
     ResourceEstimateOverflow,
     AllocationFailed { structure: &'static str },
     InternalInvariant { reason: &'static str },
+    ImageAccess(String),
 }
 
 impl fmt::Display for RoutingError {
@@ -138,6 +139,7 @@ impl fmt::Display for RoutingError {
             Self::InternalInvariant { reason } => {
                 write!(formatter, "routing internal invariant failed: {reason}")
             }
+            Self::ImageAccess(reason) => write!(formatter, "routing image access failed: {reason}"),
         }
     }
 }

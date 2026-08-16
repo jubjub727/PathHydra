@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use pathhydra_routing::{NUMERIC_POLICY_ID, RoutingImageManifest, TIE_POLICY_ID};
 
-use crate::{CudaAvailability, EngineConfig, ImageBuildReport, RoutingUnavailableReason};
+use crate::{
+    CpuTopologyMode, CudaAvailability, EngineConfig, ImageBuildReport, RoutingUnavailableReason,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CudaDeviceSummary {
@@ -63,7 +65,7 @@ impl EngineCapabilities {
             cancellation: true,
             hydration: true,
             subgraphs: true,
-            durable_routing_images: false,
+            durable_routing_images: true,
             numeric_policy_id: NUMERIC_POLICY_ID,
             tie_policy_id: TIE_POLICY_ID,
             resource_limits: config,
@@ -106,6 +108,8 @@ pub struct EngineHealth {
     pub routing: RoutingHealth,
     pub current_image_manifest: Option<RoutingImageManifest>,
     pub current_image_age: Option<Duration>,
+    pub cpu_topology_mode: Option<CpuTopologyMode>,
+    pub host_partition_cache: Option<pathhydra_routing::HostCacheSnapshot>,
     pub last_image_build: ImageBuildReport,
     pub active_routes: usize,
     pub peak_active_routes: usize,

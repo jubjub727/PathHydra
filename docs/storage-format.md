@@ -1,5 +1,9 @@
 # Durable Graph Store Layout
 
+The default-column-family record `active-routing-image` is rebuildable index metadata, not graph state. Its current encoding is a little-endian `u32` UTF-8 relative-child-name length, the exact relative child name, and a 32-byte manifest checksum. Confirmed node, relation, or edge promotion and confirmed edge/node deletion remove it in the same RocksDB batch. Provisional candidate insertion does not.
+
+Routing bundles may be omitted from backup. On restore, a missing referenced child or any checksum/semantic failure clears the pointer and rebuilds from confirmed records. There are intentionally no schema markers, compatibility layouts, graph revisions, or migrations before the first release.
+
 ## Batched confirmed-record reads
 
 `Catalog::confirmed_records_by_id` adds no durable key space. It holds the existing catalog write mutex for one batch, deduplicates requested physical node and edge reads, and fetches the exact confirmed relation-kind record for every found edge. Missing requested IDs are ordinary missing results. A found edge with a missing endpoint or relation kind is corruption. Provisional candidates are never consulted.
