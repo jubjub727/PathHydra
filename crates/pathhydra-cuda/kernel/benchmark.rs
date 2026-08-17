@@ -1,9 +1,16 @@
+//! Benchmark-kernel safety invariant for every unsafe block in this module:
+//! the launcher supplies aligned buffers at the declared lengths, keeps them
+//! live through synchronization, and validates downloaded output before any
+//! timing row is accepted.
+
 use crate::{
     arithmetic::{global_thread_index, separate_multiply},
     atomic::{load_u32, store_u32},
 };
 
 #[no_mangle]
+/// # Safety
+/// All arguments satisfy the module benchmark-kernel safety invariant.
 pub unsafe extern "ptx-kernel" fn pathhydra_benchmark_reset(
     distance_bits: *mut u64,
     frontier: *mut u32,
@@ -31,6 +38,8 @@ pub unsafe extern "ptx-kernel" fn pathhydra_benchmark_reset(
 }
 
 #[no_mangle]
+/// # Safety
+/// All arguments satisfy the module benchmark-kernel safety invariant.
 pub unsafe extern "ptx-kernel" fn pathhydra_benchmark_target(
     representation: *const u32,
     representation_len: u32,
@@ -65,6 +74,8 @@ pub unsafe extern "ptx-kernel" fn pathhydra_benchmark_target(
 }
 
 #[no_mangle]
+/// # Safety
+/// All arguments satisfy the module benchmark-kernel safety invariant.
 pub unsafe extern "ptx-kernel" fn pathhydra_benchmark_profile_inline(
     base_weight_bits: *const u32,
     relation_indexes: *const u32,
@@ -87,6 +98,8 @@ pub unsafe extern "ptx-kernel" fn pathhydra_benchmark_profile_inline(
 }
 
 #[no_mangle]
+/// # Safety
+/// All arguments satisfy the module benchmark-kernel safety invariant.
 pub unsafe extern "ptx-kernel" fn pathhydra_benchmark_profile_consume(
     materialized: *const u64,
     edge_count: u32,

@@ -1,4 +1,4 @@
-use std::{fmt, io};
+use std::{collections::BTreeSet, fmt, io};
 
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -470,7 +470,6 @@ canonical_simple!(
     ExecutorDto,
     ExecutorSelectionReasonDto,
     CudaIneligibilityDto,
-    CpuSearchDiagnosticsDto,
     EdgeHandleDto,
     CudaExecutorPolicyDto,
     StartupBundlePolicyDto,
@@ -486,6 +485,15 @@ canonical_simple!(
     ShutdownFailureStageDto,
     CudaWorkerShutdownReportDto,
 );
+
+impl CanonicalDto for CpuSearchDiagnosticsDto {
+    fn validate_boundary(&self, limits: &ApiLimits) -> Result<(), ApiCodecError> {
+        if let Some(duration) = &self.first_destination_duration {
+            duration.validate_boundary(limits)?;
+        }
+        self.path_reconstruction_duration.validate_boundary(limits)
+    }
+}
 
 impl CanonicalDto for ApiErrorDto {
     fn validate_boundary(&self, limits: &ApiLimits) -> Result<(), ApiCodecError> {
@@ -710,7 +718,11 @@ impl CanonicalDto for CudaRequestDiagnosticsDto {
             &self.response_transfer_duration,
             &self.frontier_compaction_duration,
             &self.destination_completion_duration,
+            &self.path_reconstruction_duration,
         ] {
+            duration.validate_boundary(limits)?;
+        }
+        if let Some(duration) = &self.first_destination_duration {
             duration.validate_boundary(limits)?;
         }
         Ok(())
@@ -727,11 +739,93 @@ impl CanonicalDto for RuntimeDiagnosticsDto {
     fn validate_boundary(&self, limits: &ApiLimits) -> Result<(), ApiCodecError> {
         self.admission_duration.validate_boundary(limits)?;
         self.execution_duration.validate_boundary(limits)?;
+        if let Some(duration) = &self.first_destination_duration {
+            duration.validate_boundary(limits)?;
+        }
+        self.reconstruction_duration.validate_boundary(limits)?;
+        self.search.validate_boundary(limits)?;
+        let execution = self
+            .execution_duration
+            .to_duration()
+            .map_err(|_| ApiCodecError::contextual_validation())?;
+        let reconstruction = self
+            .reconstruction_duration
+            .to_duration()
+            .map_err(|_| ApiCodecError::contextual_validation())?;
+        let first_destination = self
+            .first_destination_duration
+            .as_ref()
+            .map(DurationDto::to_duration)
+            .transpose()
+            .map_err(|_| ApiCodecError::contextual_validation())?;
+        if reconstruction > execution
+            || first_destination.is_some_and(|duration| duration > execution)
+            || self.first_destination_duration != self.search.first_destination_duration
+            || self.reconstruction_duration != self.search.path_reconstruction_duration
+        {
+            return Err(ApiCodecError::contextual_validation());
+        }
+        match &self.executor {
+            ExecutorDto::NvidiaCuda => {
+                if !self.attempted_cuda
+                    || self.cuda.is_none()
+                    || self.partitioned_cpu.is_some()
+                    || self.cuda_fallback_reason.is_some()
+                {
+                    return Err(ApiCodecError::contextual_validation());
+                }
+            }
+            ExecutorDto::CpuReference => {
+                if self.cuda.is_some() {
+                    return Err(ApiCodecError::contextual_validation());
+                }
+            }
+        }
+        if matches!(
+            &self.selection_reason,
+            ExecutorSelectionReasonDto::CpuFallback
+        ) != self.cuda_fallback_reason.is_some()
+            || self.cuda_fallback_reason.is_some() && !self.attempted_cuda
+        {
+            return Err(ApiCodecError::contextual_validation());
+        }
         if let Some(partitioned) = &self.partitioned_cpu {
             partitioned.io_wait.validate_boundary(limits)?;
+            if partitioned
+                .io_wait
+                .to_duration()
+                .map_err(|_| ApiCodecError::contextual_validation())?
+                > execution
+            {
+                return Err(ApiCodecError::contextual_validation());
+            }
         }
         if let Some(cuda) = &self.cuda {
             cuda.validate_boundary(limits)?;
+            if cuda.first_destination_duration != self.first_destination_duration
+                || cuda.path_reconstruction_duration != self.reconstruction_duration
+            {
+                return Err(ApiCodecError::contextual_validation());
+            }
+            for duration in [
+                &cuda.queue_duration,
+                &cuda.batch_collection_duration,
+                &cuda.synchronized_execution_duration,
+                &cuda.state_initialization_duration,
+                &cuda.partition_scheduling_duration,
+                &cuda.relation_relaxation_duration,
+                &cuda.response_transfer_duration,
+                &cuda.frontier_compaction_duration,
+                &cuda.destination_completion_duration,
+            ] {
+                if duration
+                    .to_duration()
+                    .map_err(|_| ApiCodecError::contextual_validation())?
+                    > execution
+                {
+                    return Err(ApiCodecError::contextual_validation());
+                }
+            }
         }
         Ok(())
     }
@@ -740,7 +834,89 @@ impl CanonicalDto for RuntimeDiagnosticsDto {
 impl CanonicalDto for EngineRoutingResponseDto {
     fn validate_boundary(&self, limits: &ApiLimits) -> Result<(), ApiCodecError> {
         self.response.validate_boundary(limits)?;
-        self.diagnostics.validate_boundary(limits)
+        self.diagnostics.validate_boundary(limits)?;
+        if self.response.numeric_policy != self.diagnostics.numeric_policy
+            || self.response.tie_policy != self.diagnostics.tie_policy
+            || self.response.completion_reason != self.diagnostics.completion_reason
+        {
+            return Err(ApiCodecError::contextual_validation());
+        }
+        let mut states = [0_u64; 4];
+        let mut present = BTreeSet::new();
+        let mut reconstructed = BTreeSet::new();
+        let mut reconstruction_steps = 0_u64;
+        for result in &self.response.results {
+            match &result.state {
+                DestinationStateDto::Exact { path, .. } => {
+                    states[0] += 1;
+                    present.insert(result.destination.clone());
+                    if let Some(path) = path
+                        && reconstructed.insert(result.destination.clone())
+                    {
+                        reconstruction_steps = reconstruction_steps
+                            .checked_add(
+                                u64::try_from(path.steps.len())
+                                    .map_err(|_| ApiCodecError::contextual_validation())?,
+                            )
+                            .ok_or_else(ApiCodecError::contextual_validation)?;
+                    }
+                }
+                DestinationStateDto::Unreachable => {
+                    states[1] += 1;
+                    present.insert(result.destination.clone());
+                }
+                DestinationStateDto::MissingNode => states[2] += 1,
+                DestinationStateDto::Incomplete => {
+                    states[3] += 1;
+                    present.insert(result.destination.clone());
+                }
+            }
+        }
+        let valid_completion_states = match self.response.completion_reason {
+            CompletionReasonDto::AllDestinationsFinalized => states[1] == 0 && states[3] == 0,
+            CompletionReasonDto::FrontierExhausted => states[1] != 0 && states[3] == 0,
+            CompletionReasonDto::BudgetExhausted => states[1] == 0 && states[3] != 0,
+            CompletionReasonDto::Cancelled => states[1] == 0,
+        };
+        if !valid_completion_states {
+            return Err(ApiCodecError::contextual_validation());
+        }
+        let first_destination_present = self.diagnostics.first_destination_duration.is_some();
+        if self.response.completion_reason != CompletionReasonDto::Cancelled {
+            if first_destination_present != (states[0] != 0 || states[1] != 0) {
+                return Err(ApiCodecError::contextual_validation());
+            }
+        } else if first_destination_present && states[0] == 0 {
+            return Err(ApiCodecError::contextual_validation());
+        }
+        let parse = |value: &DecimalU64Dto| {
+            value
+                .as_u64()
+                .map_err(|_| ApiCodecError::contextual_validation())
+        };
+        if parse(&self.diagnostics.search.exact_destinations)? != states[0]
+            || parse(&self.diagnostics.search.unreachable_destinations)? != states[1]
+            || parse(&self.diagnostics.search.missing_destinations)? != states[2]
+            || parse(&self.diagnostics.search.incomplete_destinations)? != states[3]
+            || parse(&self.diagnostics.search.unique_present_destinations)?
+                != u64::try_from(present.len())
+                    .map_err(|_| ApiCodecError::contextual_validation())?
+            || parse(&self.diagnostics.search.path_reconstruction_steps)? != reconstruction_steps
+            || self.response.examined_edges != self.diagnostics.search.examined_edges
+            || self.response.finalized_nodes != self.diagnostics.search.finalized_nodes
+        {
+            return Err(ApiCodecError::contextual_validation());
+        }
+        if let Some(cuda) = &self.diagnostics.cuda
+            && (cuda.examined_edges != self.diagnostics.search.examined_edges
+                || cuda.relaxation_updates != self.diagnostics.search.relaxation_updates
+                || parse(&cuda.destination_count_checked)?
+                    != u64::try_from(self.response.results.len())
+                        .map_err(|_| ApiCodecError::contextual_validation())?)
+        {
+            return Err(ApiCodecError::contextual_validation());
+        }
+        Ok(())
     }
 }
 
@@ -756,6 +932,29 @@ impl CanonicalDto for HydrationRequestDto {
             profile.validate_boundary(limits)?;
         }
         dto_validation(self.validate())
+    }
+}
+
+impl CanonicalDto for HydrationDiagnosticsDto {
+    fn validate_boundary(&self, limits: &ApiLimits) -> Result<(), ApiCodecError> {
+        self.execution_duration.validate_boundary(limits)?;
+        let parse = |value: &DecimalU64Dto| {
+            value
+                .as_u64()
+                .map_err(|_| ApiCodecError::contextual_validation())
+        };
+        if parse(&self.requested_nodes)?
+            != parse(&self.found_nodes)?
+                .checked_add(parse(&self.missing_nodes)?)
+                .ok_or_else(ApiCodecError::contextual_validation)?
+            || parse(&self.requested_edges)?
+                != parse(&self.found_edges)?
+                    .checked_add(parse(&self.missing_edges)?)
+                    .ok_or_else(ApiCodecError::contextual_validation)?
+        {
+            return Err(ApiCodecError::contextual_validation());
+        }
+        Ok(())
     }
 }
 
@@ -829,6 +1028,24 @@ impl CanonicalDto for HydrationResponseDto {
         if let Some(profile) = &self.profile {
             profile.validate_boundary(limits)?;
         }
+        self.diagnostics.validate_boundary(limits)?;
+        let found_nodes = self
+            .nodes
+            .iter()
+            .filter(|node| matches!(&node.state, HydratedNodeStateDto::Found { .. }))
+            .count();
+        let found_edges = self
+            .edges
+            .iter()
+            .filter(|edge| matches!(&edge.state, HydratedEdgeStateDto::Found { .. }))
+            .count();
+        validate_hydration_counts(
+            &self.diagnostics,
+            self.nodes.len(),
+            self.edges.len(),
+            found_nodes,
+            found_edges,
+        )?;
         Ok(())
     }
 }
@@ -857,7 +1074,15 @@ impl CanonicalDto for HydratedPathDto {
             }
         }
         validate_nonnegative_finite(&self.logical_distance)?;
-        self.profile.validate_boundary(limits)
+        self.profile.validate_boundary(limits)?;
+        self.diagnostics.validate_boundary(limits)?;
+        validate_hydration_counts(
+            &self.diagnostics,
+            self.nodes.len(),
+            self.edges.len(),
+            self.nodes.len(),
+            self.edges.len(),
+        )
     }
 }
 
@@ -914,8 +1139,44 @@ impl CanonicalDto for HydratedSubgraphDto {
         if let Some(profile) = &self.profile {
             profile.validate_boundary(limits)?;
         }
-        Ok(())
+        if self.complete != (self.missing_node_ids.is_empty() && self.missing_edge_ids.is_empty()) {
+            return Err(ApiCodecError::contextual_validation());
+        }
+        self.diagnostics.validate_boundary(limits)?;
+        validate_hydration_counts(
+            &self.diagnostics,
+            self.nodes.len().saturating_add(self.missing_node_ids.len()),
+            self.edges.len().saturating_add(self.missing_edge_ids.len()),
+            self.nodes.len(),
+            self.edges.len(),
+        )
     }
+}
+
+fn validate_hydration_counts(
+    diagnostics: &HydrationDiagnosticsDto,
+    requested_nodes: usize,
+    requested_edges: usize,
+    found_nodes: usize,
+    found_edges: usize,
+) -> Result<(), ApiCodecError> {
+    let count =
+        |value: usize| u64::try_from(value).map_err(|_| ApiCodecError::contextual_validation());
+    let parse = |value: &DecimalU64Dto| {
+        value
+            .as_u64()
+            .map_err(|_| ApiCodecError::contextual_validation())
+    };
+    if parse(&diagnostics.requested_nodes)? != count(requested_nodes)?
+        || parse(&diagnostics.requested_edges)? != count(requested_edges)?
+        || parse(&diagnostics.found_nodes)? != count(found_nodes)?
+        || parse(&diagnostics.found_edges)? != count(found_edges)?
+        || parse(&diagnostics.missing_nodes)? != count(requested_nodes.saturating_sub(found_nodes))?
+        || parse(&diagnostics.missing_edges)? != count(requested_edges.saturating_sub(found_edges))?
+    {
+        return Err(ApiCodecError::contextual_validation());
+    }
+    Ok(())
 }
 
 impl CanonicalDto for CudaAlgorithmDto {

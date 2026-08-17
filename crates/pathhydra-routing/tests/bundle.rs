@@ -68,7 +68,24 @@ fn deterministic_chunked_bundle_reconstructs_and_routes_exactly() {
         );
     }
     drop(scan);
-    let bundle = open_bundle(&temporary.path().join("bundle-a")).unwrap();
+    let bundle_path = temporary.path().join("bundle-a");
+    for configure in [
+        (|config: &mut HostCacheConfig| config.maximum_bytes = 0) as fn(&mut HostCacheConfig),
+        (|config: &mut HostCacheConfig| config.maximum_staging_bytes = 0)
+            as fn(&mut HostCacheConfig),
+        (|config: &mut HostCacheConfig| config.maximum_entries = 0) as fn(&mut HostCacheConfig),
+        (|config: &mut HostCacheConfig| config.io_worker_count = 0) as fn(&mut HostCacheConfig),
+        (|config: &mut HostCacheConfig| config.maximum_queued_reads = 0)
+            as fn(&mut HostCacheConfig),
+    ] {
+        let mut invalid = HostCacheConfig::default();
+        configure(&mut invalid);
+        assert!(
+            ChunkedRoutingImage::open(open_bundle(&bundle_path).unwrap(), invalid).is_err(),
+            "zero host-cache resource limit was accepted"
+        );
+    }
+    let bundle = open_bundle(&bundle_path).unwrap();
     let resident = bundle.to_resident_image().unwrap();
     let ordinary = RoutingImage::compile(&catalog.confirmed_graph_records().unwrap()).unwrap();
     assert_eq!(resident.arrays().offsets, ordinary.arrays().offsets);
@@ -377,6 +394,7 @@ fn analytic_scale_generator_uses_production_reader_and_exact_route() {
         &bundle_path,
         AnalyticParallelBundleConfig {
             adjacency_count: 1_000,
+            destination_count: 64,
             bundle: BundleConfig {
                 target_partition_topology_bytes: 48,
                 hard_maximum_partition_topology_bytes: 48,

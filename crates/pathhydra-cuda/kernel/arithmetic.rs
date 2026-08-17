@@ -1,3 +1,7 @@
+//! Arithmetic-kernel safety invariant for every unsafe block in this module:
+//! NVPTX thread-index intrinsics execute only inside a PTX kernel; these
+//! arithmetic helpers dereference no pointers.
+
 use core::arch::nvptx::{_block_dim_x, _block_idx_x, _thread_idx_x};
 
 #[inline(always)]

@@ -408,7 +408,7 @@ pub fn open_bundle(root: &Path) -> Result<RoutingBundle, BundleError> {
             source_edge_offsets
                 .last()
                 .copied()
-                .unwrap()
+                .ok_or_else(|| invalid("source edge offset state is empty"))?
                 .checked_add(ordinal)
                 .ok_or_else(|| invalid("adjacency offset overflow"))?,
         );
@@ -449,7 +449,13 @@ pub fn open_bundle(root: &Path) -> Result<RoutingBundle, BundleError> {
                 ));
             }
         }
-        partition_edge_offsets.push(partition_edge_offsets.last().copied().unwrap() + p.edge_count);
+        let partition_end = partition_edge_offsets
+            .last()
+            .copied()
+            .ok_or_else(|| invalid("partition edge offset state is empty"))?
+            .checked_add(p.edge_count)
+            .ok_or_else(|| invalid("partition adjacency offset overflow"))?;
+        partition_edge_offsets.push(partition_end);
     }
     if partition_edge_offsets.last() != Some(&manifest.adjacency_count) {
         return Err(invalid("partition adjacency counts disagree"));

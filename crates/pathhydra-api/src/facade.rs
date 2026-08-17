@@ -6,6 +6,7 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
+    time::Instant,
 };
 
 use pathhydra_core::{
@@ -25,12 +26,12 @@ use pathhydra_subgraph::Subgraph;
 use crate::convert::{capabilities, edge_removal_outcome, node_removal_outcome};
 use crate::{
     ApiError, ApiLimits, Binary32Dto, CancellationOutcomeDto, CandidateDto, CandidateIdDto,
-    CapabilitiesDto, CheckpointReportDto, CompactionReportDto, DecimalU64Dto, EdgeIdDto,
-    EdgeRecordDto, EngineRestoreReportDto, EngineRoutingResponseDto, HealthDto, HydratedPathDto,
-    HydratedSubgraphDto, HydrationRequestDto, HydrationResponseDto, ImageBuildReportDto,
-    LifecycleSnapshotDto, MutationOutcomeDto, NodeIdDto, NodeRecordDto, PathHydraConfigDto,
-    PayloadDto, RelationIdDto, RelationKindRecordDto, RelationProfileDto, RequestIdDto,
-    RoutingRequestDto, ShutdownReportDto, SubgraphHandlesDto, VerificationLimitsDto,
+    CapabilitiesDto, CheckpointReportDto, CompactionReportDto, DecimalU64Dto, DurationDto,
+    EdgeIdDto, EdgeRecordDto, EngineRestoreReportDto, EngineRoutingResponseDto, HealthDto,
+    HydratedPathDto, HydratedSubgraphDto, HydrationRequestDto, HydrationResponseDto,
+    ImageBuildReportDto, LifecycleSnapshotDto, MutationOutcomeDto, NodeIdDto, NodeRecordDto,
+    PathHydraConfigDto, PayloadDto, RelationIdDto, RelationKindRecordDto, RelationProfileDto,
+    RequestIdDto, RoutingRequestDto, ShutdownReportDto, SubgraphHandlesDto, VerificationLimitsDto,
     VerificationReportDto,
 };
 
@@ -595,8 +596,11 @@ impl PathHydra {
             ));
         }
         let request = HydrationRequest::try_from(request)?;
+        let started = Instant::now();
         let response = self.inner.engine.hydrate(&request)?;
-        Ok(HydrationResponseDto::from(&response))
+        let mut response = HydrationResponseDto::from(&response);
+        response.diagnostics.execution_duration = DurationDto::from_duration(started.elapsed());
+        Ok(response)
     }
 
     #[must_use]
@@ -693,8 +697,11 @@ impl PathHydra {
         let subgraph = Subgraph::try_from(subgraph)?;
         self.check_subgraph_limits(&subgraph)?;
         let profile = profile.map(RelationProfile::try_from).transpose()?;
+        let started = Instant::now();
         let hydrated = self.inner.engine.hydrate_subgraph(&subgraph, profile)?;
-        Ok(HydratedSubgraphDto::from(&hydrated))
+        let mut hydrated = HydratedSubgraphDto::from(&hydrated);
+        hydrated.diagnostics.execution_duration = DurationDto::from_duration(started.elapsed());
+        Ok(hydrated)
     }
 
     #[must_use]
@@ -1087,8 +1094,11 @@ impl RequestHandle {
             )
         })?;
         let response = self.completed_response()?;
+        let started = Instant::now();
         let hydrated = self.facade.engine.hydrate_path(&response, position)?;
-        Ok(HydratedPathDto::from(&hydrated))
+        let mut hydrated = HydratedPathDto::from(&hydrated);
+        hydrated.diagnostics.execution_duration = DurationDto::from_duration(started.elapsed());
+        Ok(hydrated)
     }
 
     /// Adds one exact returned path to a caller-owned subgraph.

@@ -1,16 +1,21 @@
 # PathHydra System Shape
 
-This document describes the parts the system needs and the contracts between them. It is not an implementation sequence. A choice is fixed only where the required behaviour or available evidence already narrows it sufficiently.
+This document describes the implemented Rust-engine shape and the contracts
+between its parts. It is normative for the current pre-release system, not an
+implementation sequence or a compatibility promise for obsolete layouts.
 
-Two implementation choices are fixed. The graph engine is written in Rust and exposed as a library/API consumed by BAML. The design and eventual use of the BAML side are not defined here.
+The graph engine is written in Rust and exposed through the in-process typed
+`pathhydra-api` facade for application and BAML consumers. BAML prompts,
+workflows, factual candidate validation, and final graph composition remain
+explicitly outside the Rust-engine scope.
 
 ## Fixed behaviour
 
 PathHydra operates on a directed, weighted graph.
 
-- A vertex represents a stored subject and has a stable identity. Its payload is opaque to routing.
+- A node represents a stored subject and has a stable identity. Its payload is opaque to routing.
 - A relation kind has a stable numeric identity and a text label.
-- An edge points from one vertex to another, names one relation kind, and has a stored base weight.
+- An edge points from one node to another, names one relation kind, and has a stored base weight.
 - A request supplies one multiplier for every usable relation kind.
 - The effective edge weight is `base weight * request multiplier`.
 - Path weight is the sum of its effective edge weights.
@@ -35,8 +40,8 @@ input and application state
             |
             v
 +-----------------------------+
-| BAML consumer               |
-| details not yet specified   |
+| application/BAML consumer   |
+| outside engine scope        |
 +-----------------------------+
             |
       typed Rust calls
@@ -64,20 +69,23 @@ input and application state
 
 The BAML side does not read or write RocksDB directly and does not manipulate routing images. The Rust API is the sole owner of those resources and their invariants. No other responsibility is assigned to BAML here.
 
-No binding, transport, or process-model decision is made for the BAML side here.
+The selected process model is the in-process Rust facade in Decision 0011.
+Canonical JSON supplies a bounded owned DTO representation but does not imply a
+network transport. A hosted or remote service is outside the current system
+scope.
 
 ## Identity and records
 
 Three identity domains are needed:
 
-- **External vertex ID:** stable across database rebuilds and suitable for callers.
-- **Dense vertex ID:** compact and specific to one routing snapshot.
+- **External node ID:** stable across database rebuilds and suitable for callers.
+- **Dense node ID:** compact and specific to one routing snapshot.
 - **Relation ID:** stable key for a relation label and for indexing the request profile.
 
 The minimum durable records are:
 
 ```text
-Vertex
+Node
   external_id
   name
   payload
@@ -95,7 +103,9 @@ Edge
 
 Provisional candidates also need durable identity and lifecycle state. They may be stored in separate key spaces or marked records, but the physical choice must make accidental inclusion in the confirmed graph impossible. The Rust layer records the promotion decision; it does not define or perform the factual validation that precedes it.
 
-An edge also needs an unambiguous handle if duplicate edges with the same endpoints and relation kind are allowed. Whether that is a standalone edge ID or a compound key remains open until duplicate-edge behaviour is fixed. Routing must never merge parallel edges merely because their endpoints match.
+Every edge has a standalone stable `EdgeId`. Duplicate-looking parallel edges,
+self-edges, and edges with identical endpoints/relation kind remain independent
+canonical records and routing/path evidence; routing never merges them.
 
 Node and relation names are preserved exactly as supplied. They are case-sensitive and are never normalized, folded, corrected, stemmed, or treated as synonyms. Different spellings, punctuation, casing, or Unicode sequences identify different names. Within the node namespace, one exact name maps to one node ID. Within the relation namespace, one exact name maps to one relation ID.
 
@@ -114,7 +124,9 @@ The confirmed mappings remain durable in RocksDB. The in-memory maps are rebuild
 
 ## Numeric contract
 
-The stored weight type and calculation type remain open. The selected representation must define:
+Decisions 0001 and 0002 select canonical binary32 stored base weights and
+request multipliers with separate binary64 multiplication and addition. The
+contract defines:
 
 - valid ranges for base weights and multipliers;
 - multiplication and path-sum overflow behaviour;
@@ -125,7 +137,12 @@ The stored weight type and calculation type remain open. The selected representa
 - reproducibility expectations across CPU and GPU;
 - the representation of unreachable distance.
 
-Floating point saves space and is directly supported by existing GPU graph libraries. Integer or fixed-point arithmetic offers stronger reproducibility. Neither should be selected without measuring range, precision, memory traffic, and CPU/GPU agreement on representative data.
+Base weights are finite canonical binary32 values in `[0, 1]`. Enabled
+multipliers are finite nonnegative canonical binary32 values; disabled is an
+explicit state and profiles are complete. Products and accumulated distances
+must remain finite. Overflow and invalid numeric evidence are typed failures,
+enabled zero is distinct from disabled, and positive infinity is internal
+unreachable state rather than a returned exact distance.
 
 Equal shortest-path candidates are equally correct for selection. A deterministic tie policy is still useful for stable tests and cacheable results. Zero-weight cycles require selection state that terminates and cannot corrupt the returned graph.
 
@@ -138,7 +155,7 @@ RocksDB is not expected to understand the graph. PathHydra owns record encoding,
 The durable layout needs logical key spaces for:
 
 - next-ID metadata;
-- vertex records;
+- node records;
 - relation ID-to-name records;
 - canonical edges;
 - provisional candidates and their lifecycle state;
@@ -148,19 +165,20 @@ The durable layout needs logical key spaces for:
 - exact node-name and relation-name lookup;
 - routing snapshot manifests.
 
-These may become column families or prefixed regions. The number of column families is not fixed early because RocksDB gives each one separate memtables and table files, which affects memory and tuning.
+Decision 0010 fixes the current layout as the default metadata family plus
+eight named column families. Dense mappings and routing manifests live in the
+rebuildable five-file routing bundle rather than authoritative graph families.
 
-Outgoing neighbours must be retrievable with a bounded prefix or range read. The physical adjacency form remains open:
-
-- one entry per key favours simple mutations;
-- packed adjacency favours dense reads but rewrites more data;
-- chunked blocks provide a middle ground and avoid single huge values for high-degree vertices.
-
-The choice belongs to workload measurements covering ingest rate, random mutation, snapshot construction, high-degree vertices, compaction, and space amplification.
+Outgoing and incoming adjacency use one fixed-width `(NodeId, EdgeId)` key per
+canonical edge and an eight-byte node prefix extractor, so each direction is a
+bounded prefix read. Decision 0008 separately selects bounded source-segment
+partitions for high-degree routing topology. Decision 0010 records ingest,
+mutation, build, high-degree, compaction, and space evidence for retaining the
+one-entry durable layout.
 
 One logical mutation may touch a canonical edge and multiple indexes. Those writes must become visible atomically. RocksDB `WriteBatch` provides atomic multi-key and cross-column-family writes. If adjacency updates require concurrent read-modify-write conflict detection, the graph layer must either serialize them or use RocksDB's transaction support; atomic batches alone do not detect application-level conflicts.
 
-Deletion is part of the graph contract. Removing one directed relation deletes its canonical record and every adjacency/index entry for that relation. Removing a vertex atomically deletes the vertex, its lookup records, and every relation whose source or destination is that vertex. An incoming adjacency or equivalent incident-edge index is therefore required so the engine can find all affected relations without a graph-wide scan. Tombstones or deferred cleanup may support the implementation, but they do not satisfy deletion while incident relations remain part of the confirmed graph.
+Deletion is part of the graph contract. Removing one directed relation deletes its canonical record and every adjacency/index entry for that relation. Removing a node atomically deletes the node, its lookup records, and every relation whose source or destination is that node. An incoming adjacency or equivalent incident-edge index is therefore required so the engine can find all affected relations without a graph-wide scan. Tombstones or deferred cleanup may support the implementation, but they do not satisfy deletion while incident relations remain part of the confirmed graph.
 
 Record encodings require fixed byte order and length checks. Malformed records must fail visibly.
 
@@ -182,31 +200,35 @@ The compiler turns one consistent view of the confirmed durable graph into a que
 
 Its output contains only what expansion and reconstruction require:
 
-- dense vertex numbering;
+- dense node numbering;
 - outgoing adjacency boundaries;
 - destination dense IDs;
 - relation IDs;
 - base weights;
 - edge handles needed to reconstruct and hydrate requested paths precisely;
-- maps between external and dense vertex IDs.
+- maps between external and dense node IDs.
 
 The compiler checks every confirmed endpoint, relation ID, weight, array bound, and count. These are structural checks, not factual validation. It emits a manifest containing the numeric policy, element widths, counts, byte ranges, and checksums.
 
 The image is a rebuildable index, never a second source of truth. A serialized copy is useful because loading a validated contiguous file is different from rebuilding the image through a full database scan.
 
-Shortest-path state is internal search machinery. When paths are requested, predecessor chains provide the vertex and edge handles for each destination independently.
+Shortest-path state is internal search machinery. When paths are requested, predecessor chains provide the node and edge handles for each destination independently.
 
-A compressed sparse row layout with separate arrays is the baseline shape, not yet a locked file format:
+A structure-of-arrays CSR representation is the selected resident shape:
 
 ```text
-offsets[vertex_count + 1]
+offsets[node_count + 1]
 destinations[adjacency_count]
 relation_ids[adjacency_count]
 base_weights[adjacency_count]
 edge_handles[adjacency_count]       optional
 ```
 
-This matches the sparse, outgoing-neighbour access pattern and maps naturally to contiguous device arrays. Existing GPU graph systems expose CSR graphs and weighted SSSP, while GPU guidance favours memory layouts that allow adjacent threads to make coalesced accesses. Field widths still depend on measured graph size.
+The durable form is the current five-file, little-endian, checksummed bundle in
+Decision 0007/0008. Dense destinations and relation indexes are `u32`, offsets
+and stable identities are `u64`, base weights retain canonical `u32` bits, and
+stable edge evidence is stored separately. Source segments permit bounded
+partition loading without changing edge order.
 
 Approximate topology memory is calculated before implementation from actual widths:
 
@@ -229,7 +251,9 @@ Durable writes and device arrays cannot change atomically together. A routing im
 3. Publish the completed image in one operation.
 4. Requests already using the previous image may finish before it is released.
 
-The implementation may rebuild whole images or apply verified deltas, but a request uses one complete image.
+The selected first-release policy rebuilds and validates one complete immutable
+bundle after confirmed mutation. No overlay or incremental publication is
+present. A request owns one complete image/bundle lease.
 
 Loss of the GPU image should cause a rebuild, not graph loss.
 
@@ -255,11 +279,11 @@ Per-destination selection state distinguishes:
 
 - exact distance found, with a path when requested;
 - unreachable after complete search;
-- missing vertex;
+- missing node;
 - incomplete because a budget or cancellation stopped the search;
 - invalid request.
 
-Every response identifies the numeric policy used. A returned path contains stable vertex and edge handles plus enough weight information to reproduce its distance.
+Every response identifies the numeric policy used. A returned path contains stable node and edge handles plus enough weight information to reproduce its distance.
 
 ## Rust query runtime
 
@@ -292,7 +316,7 @@ The CPU and GPU implementations consume the same snapshot, multiplier vector, nu
 
 ## GPU routing engine
 
-The accelerator runs exact weighted shortest-path search. It does not read RocksDB or full vertex payloads during edge relaxation.
+The accelerator runs exact weighted shortest-path search. It does not read RocksDB or full node payloads during edge relaxation.
 
 Each edge relaxation computes or reads:
 
@@ -301,16 +325,19 @@ effective = base_weights[edge] * profile[relation_ids[edge]]
 candidate = current_distance + effective
 ```
 
-Two cost modes are legitimate:
+The selected production mode computes the effective value inline during
+relaxation. Decision 0009 found no conservative complete-request win for a
+materialized array and no current cache identity/eviction need. Profiles are
+never blended or approximated for batching.
 
-- compute the effective value during relaxation;
-- materialize one temporary effective-weight array and reuse it across requests with an identical profile.
+Frontier label correction is the selected ordinary/automatic CUDA algorithm.
+Exact delta stepping remains an explicit supported choice with a caller-supplied
+positive delta; no universal automatic delta exists. Decision 0009 records the
+resident/partitioned workload comparison.
 
-They must return the same result. Materialization spends a full edge pass and more device memory, so profile reuse and benchmark results decide whether it is worthwhile. Profiles are never blended or approximated for batching.
-
-The GPU algorithm is not fixed yet. Delta-stepping is the leading candidate because it was designed as a parallel single-source shortest-path algorithm for directed graphs with non-negative weights. Its bucket width affects parallel work and repeated relaxations, so it needs workload-specific evidence. Other exact candidates should remain available until they are compared on PathHydra's graph shapes and context profiles.
-
-An off-the-shelf GPU library can serve as a reference or a materialized-weight backend. cuGraph currently supports directed weighted graphs, SSSP, predecessor output, and CSR conversion. Its public SSSP interface accepts a concrete edge-weight view; PathHydra's inline relation multiplier and target-aware multi-request scheduler may therefore require custom kernels. This is a reason to evaluate cuGraph, not a reason to commit the core design to it.
+cuGraph was not added. The independent CPU oracle plus Rust-authored resident
+and partitioned kernels cover the current correctness requirement without a
+second NVIDIA-specific production dependency.
 
 Per active search, the accelerator needs independent:
 
@@ -327,9 +354,15 @@ One search cannot finalize a destination because another search reached it. Batc
 
 A destination is complete only when the algorithm proves its distance final. First discovery is not sufficient. Zero-weight edges and repeated relaxations must close correctly before a bucket or equivalent frontier is retired.
 
-Predecessors may be retained during the first search or reproduced in a second pass against the same snapshot, profile, destinations, and tie policy. The choice trades device memory for recomputation but cannot change the routing contract.
+CPU routing retains predecessor evidence when paths are requested. CUDA path
+requests first produce exact distances, then run a cancellation-aware CPU
+evidence pass against the same immutable image/bundle lease and require exact
+state/distance-bit agreement before returning the path.
 
-The GPU API, kernel language, and supported vendors remain open. The decision depends on target hardware, operating systems, required atomics, compiler support, profiling quality, library compatibility, and measured performance. No cross-vendor abstraction should be added before there are at least two real backends to abstract.
+The optional accelerator is NVIDIA CUDA: Rust-authored `sm_86` PTX loaded
+dynamically through cudarc's CUDA Driver API. CPU operation needs no NVIDIA
+software. There is no cross-vendor abstraction because only one production
+accelerator backend exists.
 
 ## Admission and concurrency
 
@@ -337,7 +370,9 @@ Topology residency is reserved first. Each admitted search then reserves enough 
 
 The runtime refuses or queues work that cannot fit safely. It must not depend on an optimistic average frontier size and then fail mid-search without a controlled incomplete result.
 
-Completed lanes can be reused only after their state is logically reset. Generation-stamped arrays may avoid clearing an entire vertex-sized allocation for short searches, but generation wrap and stale entries need tests.
+Completed lanes use explicit full state reset. Generation-stamped persistent
+state was measured and rejected because complete-request evidence did not
+justify wrap coordination and persistent lane ownership.
 
 Concurrency targets throughput. Once a single broad search saturates the device, adding searches does not promise lower latency for that search.
 
@@ -347,25 +382,29 @@ The preferred hot path keeps the routing image resident on the accelerator. Payl
 
 If the routing image does not fit:
 
-- partition it by source-vertex ranges;
+- partition it by source-node ranges;
 - keep global search state in the most suitable memory tier;
 - group active vertices by required partition;
 - stage immutable partitions through a bounded cache;
 - track pending I/O as part of frontier completion;
 - permit eviction only when data can be reloaded without changing the answer.
 
-If the image fits in host RAM, pinned-memory staging is the baseline candidate. If it exceeds host RAM, a serialized chunked image is preferable to tiny RocksDB reads from the relaxation loop.
+The selected path uses a serialized chunked bundle, bounded conventional worker
+reads, checked decoding, bounded pageable host staging, and explicit CUDA
+copies. It never performs tiny RocksDB reads in the relaxation loop.
 
-DirectStorage is optional, Windows-specific transport research. Microsoft's implementation supports reads and demonstrates file-to-GPU loading, but it does not choose graph partitions or maintain shortest-path correctness. Conventional asynchronous file reads and explicit device copies remain the comparison baseline. No transport is selected before topology size and staging traces show that I/O is actually limiting search.
+Conventional reads and explicit device copies are selected. The 12-GiB scale
+evidence did not show file I/O as the dominant stage, so the DirectStorage gate
+did not trigger and no platform-specific transport dependency was added.
 
 ## Path reconstruction and hydration
 
 When requested, reconstruction walks predecessor state from a completed destination back to the origin and returns that destination's path handles. Paths remain independent routing results; the Rust engine does not impose a final graph-building strategy.
 
-Hydration accepts caller-specified vertex and edge handles and resolves them into:
+Hydration accepts caller-specified node and edge handles and resolves them into:
 
-- external vertex IDs;
-- requested vertex payloads;
+- external node IDs;
+- requested node payloads;
 - directed edges with relation IDs and labels;
 - stored and effective weights for each edge;
 - stored and effective path distances when applicable;
@@ -377,17 +416,17 @@ Hydration returns records; it does not decide how the caller composes them.
 
 ## Subgraph construction
 
-The Rust API provides a graph-shaped result container without imposing a policy for what belongs in it. A subgraph stores sets of vertex and edge handles.
+The Rust API provides a graph-shaped result container without imposing a policy for what belongs in it. A subgraph stores sets of node and edge handles.
 
 The construction surface needs operations equivalent to:
 
 - create an empty subgraph;
-- add a vertex handle;
+- add a node handle;
 - add an edge handle together with its endpoints;
 - add every handle from a reconstructed path;
 - union another subgraph;
 - remove an edge;
-- remove a vertex and every incident edge currently in the subgraph;
+- remove a node and every incident edge currently in the subgraph;
 - test membership and enumerate vertices and edges;
 - hydrate the current contents;
 - encode the result for return across the Rust API boundary.
@@ -426,7 +465,10 @@ The stable boundary is a narrow typed graph API rather than a general graph quer
 - inspect routing capabilities;
 - cancel work and read health information.
 
-The binding or local transport, streaming shape, process model, and remote-access policy remain open. The Rust request and response types should not depend on any one transport.
+Decision 0011 selects a synchronous in-process Rust facade returning complete
+owned DTOs, and Decision 0012 selects bounded canonical JSON for deterministic
+serialization. Streaming, hosted transport, authentication, tenancy, and
+remote access are explicitly outside the current system scope.
 
 ## Failure and recovery
 
@@ -475,7 +517,7 @@ Property tests generate graphs and profiles, compare CPU and GPU outcomes, and v
 
 Performance reports include:
 
-- vertex and adjacency counts;
+- node and adjacency counts;
 - durable and routing-image bytes;
 - snapshot build and load time;
 - profile packing or weight-materialization time;
@@ -494,7 +536,8 @@ Benchmarks report correctness failures before timing results. Performance target
 Every request should expose enough structured diagnostics to explain its execution without logging payload contents:
 
 - request IDs;
-- profile identity or hash;
+- exact canonical context profile in the structured routing response (selected
+  as the profile identity; no separate hash is required);
 - executor used;
 - queue and execution duration;
 - completion reason;
@@ -506,11 +549,20 @@ Every request should expose enough structured diagnostics to explain its executi
 
 Store-level metrics cover write failures, compaction pressure, cache behaviour, image age, image build failures, and active image references.
 
+The redacted runtime-diagnostics object intentionally does not duplicate names,
+payloads, the context profile, or returned paths. Those request semantics remain
+inspectable through the structured routing response, whose `response.profile()`
+is the exact profile used for execution.
+
 ## Software and licensing boundary
 
 The project must build and run without a required licence payment, subscription, hosted database, or paid cloud service. Core development, tests, benchmarks, database inspection, and recovery all run locally.
 
-Dependencies need recorded versions and licences. Prefer permissive open-source components when they meet the requirement. A free-to-use proprietary GPU driver or SDK may be necessary for particular hardware, but PathHydra must not depend on a paid edition or evaluation licence. Optional integrations cannot become mandatory for correctness or data access.
+Locked versions, declared licence expressions, roles, optional/default status,
+and native requirements are recorded in `docs/dependency-inventory.tsv` and
+`docs/dependencies.md`. The optional proprietary NVIDIA driver is not required
+for CPU correctness or data access. Optional integrations cannot become
+mandatory for correctness or recovery.
 
 Rust and its standard tooling are available under MIT or Apache 2.0 terms. BAML is Apache 2.0 and can run locally. RocksDB has an Apache 2.0 licensing option. cuGraph is also Apache 2.0 but is NVIDIA-specific and is only an evaluation candidate. DirectStorage samples are MIT-licensed, but the API is platform-specific and optional.
 
@@ -533,28 +585,31 @@ PathHydra-owned engine code is Rust. RocksDB itself is implemented in C++ and wi
 | Published routing images are immutable per request. | RocksDB batches cannot atomically modify already-resident device arrays. |
 | Full payloads stay out of the routing loop. | Expansion needs endpoints, relation IDs, and weights; reading unrelated text adds storage traffic without affecting the calculation. |
 
-## Decisions deliberately left open
+## Closed implementation decisions
 
-- Rust workspace and crate boundaries;
-- concrete hash-map implementation, concurrency strategy, and full-residency threshold;
-- GPU vendor and programming API;
-- exact accelerator algorithm and tuning parameters;
-- stored and accumulated numeric types;
-- edge identity and duplicate-edge policy;
-- RocksDB column-family split and key encoding;
-- adjacency packing and high-degree representation (fixed by Decision 0008);
-- full rebuilds, incremental images, or overlay publication;
-- snapshot retention method for hydration;
-- distance-only versus additional selection-state capture policy;
-- profile materialization threshold;
-- target-set representation;
-- batch width and lane scheduling;
-- alternative out-of-core I/O transports beyond the conventional baseline;
-- in-process Rust library or separately hosted Rust API packaging;
-- request, response, and serialized subgraph encoding;
-- in-memory subgraph representation.
+All original alternatives now have one current answer. Decision 0013
+consolidates the selections and points to their detailed evidence:
 
-Each becomes fixed only after its required workload, correctness constraint, target platform, and benchmark evidence are recorded.
+| Original decision | Current selection |
+| --- | --- |
+| Workspace/crates | Nine responsibility-specific workspace packages. |
+| Exact maps/concurrency/residency | Standard `HashMap` exact-name indexes under independent `RwLock`s; catalog mutation mutex; explicit `max_active_image_bytes` resident/partition threshold. |
+| GPU vendor/API | Optional NVIDIA `sm_86` Rust PTX through the dynamically loaded CUDA Driver API. |
+| Algorithm/tuning | Frontier default; explicit positive-delta stepping; compact active tasks; one lane/zero delay default. |
+| Numeric representation | Canonical binary32 operands, separate checked binary64 multiply/add, stable predecessor tie policy. |
+| Edge identity | Stable standalone `EdgeId`; parallel/self edges retained independently. |
+| RocksDB layout | Default metadata plus eight named families; fixed big-endian keys and exact length-checked values. |
+| Adjacency/high degree | One outgoing/incoming durable entry per edge; bounded routing source segments. |
+| Publication | Complete immutable rebuild; no overlay or incremental publication. |
+| Hydration snapshots | Current-state record hydration with explicit missing evidence. |
+| CUDA path state | Exact CUDA distances plus same-image CPU path evidence; finite edge budgets remain CPU. |
+| Profile policy | Inline exact multiplication; no materialized-weight cache. |
+| Targets | Sorted/deduplicated sparse host membership with caller order restored. |
+| Batch/lane scheduling | Bounded independent lanes; one lane and zero collection delay by default. |
+| Out-of-core transport | Conventional bounded file workers and explicit copies; no DirectStorage dependency. |
+| Process packaging | In-process synchronous Rust facade; hosted/remote service outside scope. |
+| Boundary encoding | Bounded canonical UTF-8 JSON. |
+| In-memory subgraph | Ordered `BTreeSet` nodes plus `BTreeMap` edge endpoint evidence. |
 
 ## Evidence for the early choices
 

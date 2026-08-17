@@ -11,7 +11,7 @@ use pathhydra_store::{
     ResourceKind, RestoreRequest, VerificationLimits, WriteOperationClass, restore_checkpoint,
     standalone_restore_metrics, validate_operational_paths,
 };
-use rocksdb::{DB, Options};
+use rocksdb::{DB, IteratorMode, Options};
 use tempfile::TempDir;
 
 const COLUMN_FAMILIES: [&str; 8] = [
@@ -353,6 +353,42 @@ fn restore_rejects_missing_adjacency_and_truncated_checkpoint_and_preserves_sour
         })
         .unwrap();
 
+    let clean_checkpoint_before = directory_listing(&checkpoint);
+    let manifest_name = fs::read_to_string(checkpoint.join("CURRENT"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let mut required_components = vec![PathBuf::from("CURRENT"), PathBuf::from(manifest_name)];
+    required_components.extend(
+        fs::read_dir(&checkpoint)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "sst"))
+            .map(|path| PathBuf::from(path.file_name().unwrap())),
+    );
+    assert!(required_components.len() >= 3);
+    for (index, component) in required_components.iter().enumerate() {
+        let corrupted = directory
+            .path()
+            .join(format!("missing-checkpoint-component-{index}"));
+        copy_flat_directory(&checkpoint, &corrupted);
+        fs::remove_file(corrupted.join(component)).unwrap();
+        assert!(
+            catalog
+                .restore_checkpoint(&restore_request(
+                    directory.path(),
+                    &corrupted,
+                    &directory
+                        .path()
+                        .join(format!("missing-component-restore-{index}"))
+                ))
+                .is_err(),
+            "checkpoint without {} was accepted",
+            component.display()
+        );
+        assert_eq!(directory_listing(&checkpoint), clean_checkpoint_before);
+    }
+
     let raw = open_raw(&checkpoint);
     let outgoing = raw.cf_handle("outgoing_edges").unwrap();
     raw.delete_cf(
@@ -372,27 +408,24 @@ fn restore_rejects_missing_adjacency_and_truncated_checkpoint_and_preserves_sour
             .is_err()
     );
     assert_eq!(directory_listing(&checkpoint), corrupted_before);
-
-    let truncated = directory.path().join("truncated");
-    copy_flat_directory(&checkpoint, &truncated);
-    fs::remove_file(truncated.join("CURRENT")).unwrap();
-    assert!(
-        catalog
-            .restore_checkpoint(&restore_request(
-                directory.path(),
-                &truncated,
-                &directory.path().join("truncated-restore")
-            ))
-            .is_err()
-    );
 }
 
 #[test]
-fn restore_rejects_a_malformed_record_and_preserves_the_checkpoint() {
+fn restore_rejects_every_malformed_record_and_index_class_and_preserves_checkpoints() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("database");
     let catalog = Catalog::open(&database).unwrap();
-    let candidate = catalog.insert_node_candidate("candidate").unwrap();
+    let source = confirm_node(&catalog, "source");
+    let destination = confirm_node(&catalog, "destination");
+    let relation = confirm_relation(&catalog, "relation");
+    let edge_candidate = catalog
+        .insert_edge_candidate(source.id(), destination.id(), relation.id(), 0.5)
+        .unwrap();
+    let ConfirmedRecord::Edge(_) = catalog.confirm_validated_candidate(edge_candidate).unwrap()
+    else {
+        panic!("expected edge")
+    };
+    catalog.insert_node_candidate("candidate").unwrap();
     let checkpoint = directory.path().join("malformed-checkpoint");
     catalog
         .create_checkpoint(&CheckpointRequest {
@@ -404,22 +437,31 @@ fn restore_rejects_a_malformed_record_and_preserves_the_checkpoint() {
             minimum_headroom_bytes: 0,
         })
         .unwrap();
-    let raw = open_raw(&checkpoint);
-    let candidates = raw.cf_handle("candidates").unwrap();
-    raw.put_cf(candidates, candidate.as_u64().to_be_bytes(), [0xff])
-        .unwrap();
-    drop(raw);
-    let source_before = directory_listing(&checkpoint);
-    assert!(
-        catalog
-            .restore_checkpoint(&restore_request(
-                directory.path(),
-                &checkpoint,
-                &directory.path().join("malformed-restore")
-            ))
-            .is_err()
-    );
-    assert_eq!(directory_listing(&checkpoint), source_before);
+    for family in ["default"].into_iter().chain(COLUMN_FAMILIES) {
+        let corrupted = directory.path().join(format!("malformed-{family}"));
+        copy_flat_directory(&checkpoint, &corrupted);
+        let raw = open_raw(&corrupted);
+        let handle = raw.cf_handle(family).unwrap();
+        let first = raw
+            .iterator_cf(handle, IteratorMode::Start)
+            .next()
+            .expect("record class is populated")
+            .unwrap();
+        raw.put_cf(handle, &first.0, [0xff]).unwrap();
+        drop(raw);
+        let source_before = directory_listing(&corrupted);
+        assert!(
+            catalog
+                .restore_checkpoint(&restore_request(
+                    directory.path(),
+                    &corrupted,
+                    &directory.path().join(format!("malformed-restore-{family}"))
+                ))
+                .is_err(),
+            "malformed {family} record was accepted"
+        );
+        assert_eq!(directory_listing(&corrupted), source_before);
+    }
 }
 
 #[test]
@@ -557,12 +599,12 @@ fn adjacency_key(node: u64, edge: u64) -> [u8; 16] {
     output
 }
 
-fn directory_listing(path: &Path) -> Vec<(PathBuf, u64)> {
+fn directory_listing(path: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     let mut entries: Vec<_> = fs::read_dir(path)
         .unwrap()
         .map(|entry| {
             let entry = entry.unwrap();
-            (entry.file_name().into(), entry.metadata().unwrap().len())
+            (entry.file_name().into(), fs::read(entry.path()).unwrap())
         })
         .collect();
     entries.sort();

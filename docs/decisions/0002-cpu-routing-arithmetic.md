@@ -7,7 +7,7 @@ Accepted.
 ## Context
 
 The immutable routing image is the reference input for exact CPU routing and a
-future GPU implementation. Request context must alter edge costs through a
+CPU and GPU implementations. Request context must alter edge costs through a
 compact, reproducible numeric contract. Equal-distance paths also need a
 stable selection rule so returned edge identities are inspectable.
 
@@ -50,7 +50,7 @@ The stable predecessor tie policy is:
 
 This defines one deterministic minimum-distance predecessor tree. It does not
 claim to return the globally lexicographically smallest path. Zero-weight
-cycles terminate because each node is finalized at most once. A future GPU
+cycles terminate because each node is finalized at most once. The GPU
 backend must reproduce this policy for requests it serves or leave those
 requests on the CPU reference engine.
 

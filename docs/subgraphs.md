@@ -6,4 +6,10 @@ Adding an edge inserts both endpoints. Repeating a node or an edge with the same
 
 `add_path` validates origin, destination, continuity, and every edge identity before mutation. `union` likewise validates all conflicts first, so both operations are atomic to the caller. Removing a node removes every included incoming and outgoing edge. Removing an edge preserves isolated nodes.
 
-`SubgraphHandles` exports ordered node IDs and edge endpoint evidence without choosing a serialized format. The container owns no catalog or engine reference and has no interior mutation. Every edit affects only the caller's value. The engine hydrates records but never decides which paths to union or how to compose a final inference graph.
+`SubgraphHandles` exports ordered node IDs and edge endpoint evidence.
+`SubgraphHandlesDto` carries the same structure across the consumer boundary,
+where Decision 0012's bounded canonical JSON preserves order, parallel/self-edge
+identity, and endpoint evidence. The container owns no catalog or engine
+reference and has no interior mutation. Every edit affects only the caller's
+value. The engine hydrates records but never decides which paths to union or how
+to compose a final inference graph.

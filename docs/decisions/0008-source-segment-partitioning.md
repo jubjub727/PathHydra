@@ -8,7 +8,7 @@ Partitions are immutable and independently checksummed. The configured target cl
 
 CPU state remains in host memory while topology moves through a byte- and entry-bounded shared cache. Presence, eviction, and request interleaving affect only performance. Expansion still counts each relation immediately before profile evaluation and uses the same separate binary64 multiplication/addition and stable predecessor tuple. Pending reads are unfinished work; pinned entries cannot be evicted. Discarded bytes remain reloadable from the exact bundle owned by the request.
 
-Conventional checked file reads and explicit accelerator copies are the transport baseline. A future transport can be compared only after measurements show file transport dominates; it cannot change partition selection or exact semantics.
+Conventional checked file reads and explicit accelerator copies are the selected transport. In the final 12-GiB regression, Frontier spent 18.13 of 50.67 seconds and Delta spent 36.09 of 80.11 seconds in partition scheduling/I/O; relation relaxation remained the larger stage in both. File transport was therefore material but not repeatably dominant, so no DirectStorage implementation was added. Any alternative requires a separate measured transport plan and cannot change partition selection or exact semantics.
 
 CUDA uses the same directory. The resident mode remains preferred when the
 complete topology fits. Otherwise global identity, profile, distance, bucket,

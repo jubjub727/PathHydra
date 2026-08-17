@@ -14,7 +14,10 @@ with separate binary64 multiplication and addition and proposes a distance with
 an audited unsigned-64 compare-and-swap minimum. The bit ordering is valid
 because routing admits only nonnegative finite weights and positive infinity.
 Equal values do not modify state. Atomic checked counters and compare-and-swap
-retry counts make contention and overflow visible.
+retry counts make contention and overflow visible. Examined and attempted
+edge counts are validated and accumulated once per thread block rather than
+through one contended global atomic per edge; retry totals omit zero-valued
+atomic additions. The reported totals remain exact.
 
 The host retains explicit, inspectable phase orchestration. Frontier phases do
 not close until all relation chunks, source segments, cache reads, copies,
@@ -28,7 +31,10 @@ cycles.
 Plan 06 continues to own resident and partitioned topology, immutable bundle
 leases, cache/event lifetimes, admission, cancellation, device-loss recovery,
 and same-bundle CPU fallback. Search admission reserves the worst host/device
-overlap for compact task buffers before any CUDA allocation. New scratch-
+overlap for compact task buffers before any CUDA allocation. Resident mode
+uses its complete adjacency count; partitioned mode uses the largest single
+partition because it synchronizes and releases task buffers partition by
+partition. New scratch-
 allocation, task construction/upload, and path-evidence failures enter the
 same typed fault and recovery path. Decision 0005's unsafe boundary is
 unchanged: private launch code and the separately compiled kernel package are

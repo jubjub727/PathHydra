@@ -163,6 +163,15 @@ fn frontier_and_delta_match_the_cpu_oracle_bit_for_bit() {
             algorithm,
         )
         .unwrap();
+        let undersized = resident
+            .route(
+                &request,
+                algorithm,
+                &AtomicBool::new(false),
+                reserved.saturating_sub(1),
+            )
+            .expect_err("undersized resident search evidence must be refused before allocation");
+        assert_eq!(undersized.kind(), CudaFailureKind::Admission);
         let cuda = resident
             .route(&request, algorithm, &AtomicBool::new(false), reserved)
             .unwrap();
@@ -176,6 +185,101 @@ fn frontier_and_delta_match_the_cpu_oracle_bit_for_bit() {
         assert!(!cuda.diagnostics.frontier_compaction_duration.is_zero());
         assert!(!cuda.diagnostics.destination_completion_duration.is_zero());
     }
+}
+
+#[test]
+fn unrepresentable_delta_bucket_is_a_typed_failure_in_resident_and_partitioned_modes() {
+    let directory = tempfile::tempdir().unwrap();
+    let catalog = Catalog::open(directory.path().join("catalog")).unwrap();
+    let nodes: Vec<_> = ["origin", "destination"]
+        .into_iter()
+        .map(|name| {
+            let candidate = catalog.insert_node_candidate(name).unwrap();
+            let ConfirmedRecord::Node(node) =
+                catalog.confirm_validated_candidate(candidate).unwrap()
+            else {
+                panic!()
+            };
+            node.id()
+        })
+        .collect();
+    let relation = catalog.insert_relation_candidate("maximum").unwrap();
+    let ConfirmedRecord::Relation(relation) =
+        catalog.confirm_validated_candidate(relation).unwrap()
+    else {
+        panic!()
+    };
+    let edge = catalog
+        .insert_edge_candidate(nodes[0], nodes[1], relation.id(), 1.0)
+        .unwrap();
+    catalog.confirm_validated_candidate(edge).unwrap();
+    let image =
+        Arc::new(RoutingImage::compile(&catalog.confirmed_graph_records().unwrap()).unwrap());
+    let request = RoutingRequest::new(
+        nodes[0],
+        [nodes[1]],
+        RelationProfile::new([(
+            relation.id(),
+            RelationUse::Enabled(RelationMultiplier::new(f32::MAX).unwrap()),
+        )]),
+        false,
+        SearchBudget::Unlimited,
+        TiePolicy::StablePredecessor,
+    );
+    let algorithm =
+        CudaAlgorithm::DeltaStepping(DeltaConfiguration::new(f64::MIN_POSITIVE).unwrap());
+    let context = CudaContextOwner::initialize(0).unwrap();
+    let resident =
+        CudaResidentImage::upload(Arc::clone(&context), Arc::clone(&image), usize::MAX, 0).unwrap();
+    let reserved = estimate_search_bytes(2, 1, 1, 1, algorithm).unwrap();
+    let resident_error = resident
+        .route(&request, algorithm, &AtomicBool::new(false), reserved)
+        .unwrap_err();
+    assert_eq!(resident_error.kind(), CudaFailureKind::KernelInvariant);
+
+    let bundle_path = directory.path().join("unrepresentable-bucket");
+    let scan = catalog.confirmed_graph_scan().unwrap();
+    compile_bundle(
+        &scan,
+        &bundle_path,
+        BundleConfig {
+            target_partition_topology_bytes: 48,
+            hard_maximum_partition_topology_bytes: 48,
+            maximum_total_bundle_bytes: 1024 * 1024,
+        },
+    )
+    .unwrap();
+    drop(scan);
+    let chunked = Arc::new(
+        ChunkedRoutingImage::open(
+            open_bundle(&bundle_path).unwrap(),
+            HostCacheConfig {
+                maximum_bytes: 112,
+                maximum_staging_bytes: 56,
+                maximum_entries: 1,
+                io_worker_count: 1,
+                maximum_queued_reads: 1,
+            },
+        )
+        .unwrap(),
+    );
+    let partitioned = CudaPartitionedImage::upload(
+        context,
+        chunked,
+        CudaPartitionedConfig {
+            maximum_topology_cache_bytes: 48,
+            maximum_topology_cache_slots: 1,
+            maximum_host_staging_bytes: 48,
+            minimum_free_memory_headroom: 0,
+            reserved_concurrent_search_bytes: 1024 * 1024,
+            reverse_partition_order: false,
+        },
+    )
+    .unwrap();
+    let partitioned_error = partitioned
+        .route(&request, algorithm, &AtomicBool::new(false), reserved)
+        .unwrap_err();
+    assert_eq!(partitioned_error.kind(), CudaFailureKind::KernelInvariant);
 }
 
 #[test]
@@ -409,6 +513,8 @@ fn cancellation_at_resident_path_evidence_boundary_returns_controlled_incomplete
         output.response.completion_reason(),
         CompletionReason::Cancelled
     );
+    assert!(output.response.paths_requested());
+    assert_eq!(output.diagnostics.first_destination_duration, None);
     for result in output.response.results() {
         match result.state() {
             DestinationState::Exact(route) => {
@@ -580,10 +686,23 @@ fn resident_path_evidence_fault_is_classified_and_the_image_recovers() {
 #[test]
 fn cancelled_cuda_search_never_reports_discovered_tentative_values_as_exact() {
     let (_directory, _catalog, image, request) = fixture();
+    let reserved = estimate_search_bytes(
+        image.node_count(),
+        image.relation_kind_count(),
+        image.adjacency_count(),
+        request.destinations().len(),
+        CudaAlgorithm::Frontier,
+    )
+    .unwrap();
     let context = CudaContextOwner::initialize(0).unwrap();
     let resident = CudaResidentImage::upload(context, image, usize::MAX, 0).unwrap();
     let cuda = resident
-        .route(&request, CudaAlgorithm::Frontier, &AtomicBool::new(true), 1)
+        .route(
+            &request,
+            CudaAlgorithm::Frontier,
+            &AtomicBool::new(true),
+            reserved,
+        )
         .unwrap();
     assert_eq!(cuda.diagnostics.kernel_launches, 0);
     assert_eq!(cuda.response.finalized_nodes(), 0);
@@ -603,6 +722,14 @@ fn cancelled_cuda_search_never_reports_discovered_tentative_values_as_exact() {
 #[test]
 fn complete_profiles_remain_distinct_between_independent_searches() {
     let (_directory, _catalog, image, request) = fixture();
+    let reserved = estimate_search_bytes(
+        image.node_count(),
+        image.relation_kind_count(),
+        image.adjacency_count(),
+        request.destinations().len(),
+        CudaAlgorithm::Frontier,
+    )
+    .unwrap();
     let context = CudaContextOwner::initialize(0).unwrap();
     let resident = CudaResidentImage::upload(context, image, usize::MAX, 0).unwrap();
     let disabled = RoutingRequest::new(
@@ -621,7 +748,7 @@ fn complete_profiles_remain_distinct_between_independent_searches() {
             &request,
             CudaAlgorithm::Frontier,
             &AtomicBool::new(false),
-            1,
+            reserved,
         )
         .unwrap();
     let disabled = resident
@@ -629,7 +756,7 @@ fn complete_profiles_remain_distinct_between_independent_searches() {
             &disabled,
             CudaAlgorithm::Frontier,
             &AtomicBool::new(false),
-            1,
+            reserved,
         )
         .unwrap();
     assert_ne!(
@@ -708,6 +835,25 @@ fn one_edge_partitions_cache_thrash_and_reverse_group_order_match_cpu() {
                 algorithm,
             )
             .unwrap();
+            let minimum_reserved = estimate_search_bytes(
+                chunked.node_count(),
+                chunked.relation_kind_count(),
+                partitioned.maximum_partition_adjacency_count(),
+                request.destinations().len(),
+                algorithm,
+            )
+            .unwrap();
+            let undersized = partitioned
+                .route(
+                    &request,
+                    algorithm,
+                    &AtomicBool::new(false),
+                    minimum_reserved.saturating_sub(1),
+                )
+                .expect_err(
+                    "undersized partitioned search evidence must be refused before allocation",
+                );
+            assert_eq!(undersized.kind(), CudaFailureKind::Admission);
             let cancellation = AtomicBool::new(false);
             let cuda = if !reverse && matches!(algorithm, CudaAlgorithm::Frontier) {
                 partitioned.fault_injection().hold_completion_events(true);
@@ -1257,7 +1403,8 @@ fn extreme_block_boundary_and_high_degree_split_source_remain_exact() {
         CudaAlgorithm::Frontier,
         CudaAlgorithm::DeltaStepping(DeltaConfiguration::new(0.01).unwrap()),
     ] {
-        let reserved = estimate_search_bytes(2, 1, 1, 1, algorithm).unwrap();
+        let reserved =
+            estimate_search_bytes(2, 1, resident.adjacency_count(), 1, algorithm).unwrap();
         let output = cuda_resident
             .route(&request, algorithm, &AtomicBool::new(false), reserved)
             .unwrap();
@@ -1310,7 +1457,14 @@ fn extreme_block_boundary_and_high_degree_split_source_remain_exact() {
                 },
             )
             .unwrap();
-            let reserved = estimate_search_bytes(2, 1, 1, 1, algorithm).unwrap();
+            let reserved = estimate_search_bytes(
+                2,
+                1,
+                partitioned.maximum_partition_adjacency_count(),
+                1,
+                algorithm,
+            )
+            .unwrap();
             let output = partitioned
                 .route(&request, algorithm, &AtomicBool::new(false), reserved)
                 .unwrap();

@@ -178,7 +178,12 @@ pub fn build(workload: Workload) -> Fixture {
         )
         .expect("benchmark partition cache"),
     );
-    let destinations = [nodes[nodes.len() - 1], nodes[nodes.len() / 2], nodes[0]];
+    let destinations = [
+        nodes[1],
+        nodes[nodes.len() - 1],
+        nodes[nodes.len() / 2],
+        nodes[0],
+    ];
     let request = RoutingRequest::new(
         nodes[0],
         destinations,

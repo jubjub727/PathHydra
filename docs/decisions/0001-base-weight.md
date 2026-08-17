@@ -30,14 +30,16 @@ later GPU backend.
 Binary32 covers the complete domain range with substantially more fractional
 resolution than the current normalized-distance contract requires. It is a
 native scalar on CPUs and GPUs, avoids a conversion-only durable type, and can
-be copied directly into a future routing snapshot. CPU/GPU routing agreement
+be copied directly into the current routing snapshot. CPU/GPU routing agreement
 will still be tested against one declared arithmetic policy when routing is
 implemented.
 
-## Deliberately unresolved
+## Resolved routing policies
 
-This decision covers only the stored base weight. It does not select the type
-or policy for request multipliers, effective-weight multiplication, path
-accumulation, rounding, overflow, disabled relation kinds, unreachable
-distances, or deterministic tie handling. Those choices belong to the routing
-slice and must not be inferred from this stored base-weight decision.
+This decision covers only the stored base weight. Decision 0002 subsequently
+selected request multipliers, separate binary64 effective-weight
+multiplication and path accumulation, rounding and overflow behavior, explicit
+disabled relation kinds, unreachable-distance representation, and stable
+predecessor tie handling. Decision 0013 closes the corresponding system-level
+implementation choices. Those routing policies are not inferred from this
+stored base-weight decision.

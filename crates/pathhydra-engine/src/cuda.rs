@@ -147,4 +147,6 @@ pub struct CudaRequestDiagnostics {
     pub destination_completion_duration: Duration,
     pub destination_count_checked: usize,
     pub atomic_cas_retries: u64,
+    pub first_destination_duration: Option<Duration>,
+    pub path_reconstruction_duration: Duration,
 }

@@ -26,11 +26,15 @@ pub struct BundleConfig {
     pub maximum_total_bundle_bytes: u64,
 }
 
-/// Opt-in scale generator for a two-node graph with ascending parallel edges.
-/// Every edge has weight one, so the analytic distance-only answer is `1.0`.
+/// Opt-in scale generator for a fan-out graph with ascending stable edge IDs.
+/// Every edge leaves node one, targets one of the configured destination
+/// nodes, and has weight one, so every present destination has analytic
+/// distance `1.0`. Spreading relaxation targets avoids turning the capacity
+/// proof into a single-address atomic-contention benchmark.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AnalyticParallelBundleConfig {
     pub adjacency_count: u64,
+    pub destination_count: u32,
     pub bundle: BundleConfig,
 }
 impl Default for BundleConfig {
@@ -502,6 +506,15 @@ pub fn generate_analytic_parallel_bundle(
             "analytic scale bundle must contain at least one edge",
         ));
     }
+    if generated.destination_count == 0 || generated.destination_count == u32::MAX {
+        return Err(invalid(
+            "analytic scale bundle destination count must fit with its source in the dense-node ABI",
+        ));
+    }
+    let node_count = generated
+        .destination_count
+        .checked_add(1)
+        .ok_or_else(|| invalid("analytic node count overflow"))?;
     if directory.exists() {
         if fs::read_dir(directory)?.next().is_some() {
             return Err(invalid("bundle output directory is not empty"));
@@ -509,9 +522,29 @@ pub fn generate_analytic_parallel_bundle(
     } else {
         fs::create_dir(directory)?;
     }
-    let mut identities = Vec::with_capacity(24);
-    put_u64(&mut identities, 1);
-    put_u64(&mut identities, 2);
+    let identity_count = u64::from(node_count)
+        .checked_add(1)
+        .ok_or_else(|| invalid("analytic identity count overflow"))?;
+    let identity_bytes = identity_count
+        .checked_mul(8)
+        .ok_or_else(|| invalid("analytic identity byte count overflow"))?;
+    if identity_bytes > config.maximum_total_bundle_bytes {
+        return Err(BundleError::Limit {
+            resource: "analytic identities",
+            required: identity_bytes,
+            limit: config.maximum_total_bundle_bytes,
+        });
+    }
+    let mut identities = Vec::new();
+    identities
+        .try_reserve_exact(
+            usize::try_from(identity_bytes)
+                .map_err(|_| invalid("analytic identities do not fit platform"))?,
+        )
+        .map_err(|_| invalid("analytic identity allocation failed"))?;
+    for node in 1..=u64::from(node_count) {
+        put_u64(&mut identities, node);
+    }
     put_u64(&mut identities, 1);
     write_sync(&directory.join("identities.bin"), &identities)?;
     let fixed = PARTITION_HEADER_BYTES
@@ -562,8 +595,10 @@ pub fn generate_analytic_parallel_bundle(
         put_u32(&mut top, 0);
         put_u32(&mut top, edge_count_u32);
         put_u32(&mut top, 0);
-        for _ in 0..edge_count {
-            put_u32(&mut top, 1);
+        for edge in first..first + edge_count {
+            let destination = u32::try_from(edge % u64::from(generated.destination_count) + 1)
+                .map_err(|_| invalid("analytic destination exceeds dense-node ABI"))?;
+            put_u32(&mut top, destination);
         }
         for _ in 0..edge_count {
             put_u32(&mut top, 0);
@@ -619,10 +654,27 @@ pub fn generate_analytic_parallel_bundle(
     topology.get_ref().sync_all()?;
     evidence.flush()?;
     evidence.get_ref().sync_all()?;
+    let directory_offset_count = u64::from(node_count)
+        .checked_add(1)
+        .ok_or_else(|| invalid("analytic directory offset count overflow"))?;
+    let directory_segment_bytes = partition_count
+        .checked_mul(SEGMENT_ENCODED_BYTES)
+        .ok_or_else(|| invalid("analytic directory segment byte count overflow"))?;
+    let directory_capacity = directory_offset_count
+        .checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(directory_segment_bytes))
+        .ok_or_else(|| invalid("analytic directory byte count overflow"))?;
     let mut directory_bytes = Vec::new();
+    directory_bytes
+        .try_reserve_exact(
+            usize::try_from(directory_capacity)
+                .map_err(|_| invalid("analytic directory does not fit platform"))?,
+        )
+        .map_err(|_| invalid("analytic directory allocation failed"))?;
     put_u64(&mut directory_bytes, 0);
-    put_u64(&mut directory_bytes, partition_count);
-    put_u64(&mut directory_bytes, partition_count);
+    for _ in 0..node_count {
+        put_u64(&mut directory_bytes, partition_count);
+    }
     for segment in &descriptors {
         put_u32(&mut directory_bytes, segment.source);
         put_u32(&mut directory_bytes, segment.partition);
@@ -634,7 +686,7 @@ pub fn generate_analytic_parallel_bundle(
     let manifest = BundleManifest {
         numeric_policy: NUMERIC_POLICY_ID.into(),
         tie_policy: TIE_POLICY_ID.into(),
-        node_count: 2,
+        node_count: u64::from(node_count),
         relation_kind_count: 1,
         adjacency_count: generated.adjacency_count,
         segment_count: partition_count,
@@ -679,7 +731,7 @@ pub fn generate_analytic_parallel_bundle(
     Ok((
         manifest,
         BundleBuildMetrics {
-            node_count: 2,
+            node_count: u64::from(node_count),
             relation_kind_count: 1,
             adjacency_count: generated.adjacency_count,
             segment_count: partition_count,

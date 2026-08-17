@@ -147,6 +147,37 @@ impl AdmissionController {
         Ok(())
     }
 
+    fn replace_reservation(&self, current: usize, replacement: usize) -> Result<(), EngineError> {
+        let mut state = self.state.lock().map_err(|_| EngineError::LockPoisoned {
+            lock: "route admission",
+        })?;
+        if replacement > self.maximum_bytes {
+            state.rejections = state.rejections.saturating_add(1);
+            return Err(EngineError::Admission(AdmissionRejection::RequestBytes {
+                requested: replacement,
+                maximum: self.maximum_bytes,
+            }));
+        }
+        let without_current = state.reserved.checked_sub(current).ok_or_else(|| {
+            state.rejections = state.rejections.saturating_add(1);
+            EngineError::Admission(AdmissionRejection::ArithmeticOverflow)
+        })?;
+        let total = without_current.checked_add(replacement).ok_or_else(|| {
+            state.rejections = state.rejections.saturating_add(1);
+            EngineError::Admission(AdmissionRejection::ArithmeticOverflow)
+        })?;
+        if total > self.maximum_bytes {
+            state.rejections = state.rejections.saturating_add(1);
+            return Err(EngineError::Admission(AdmissionRejection::TotalBytes {
+                requested_total: total,
+                maximum: self.maximum_bytes,
+            }));
+        }
+        state.reserved = total;
+        state.peak_reserved = state.peak_reserved.max(total);
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> Result<AdmissionSnapshot, EngineError> {
         let state = self.state.lock().map_err(|_| EngineError::LockPoisoned {
             lock: "route admission",
@@ -170,9 +201,13 @@ pub(crate) struct AdmissionPermit<'a> {
 
 impl AdmissionPermit<'_> {
     pub fn reserve(&mut self, bytes: usize) -> Result<(), EngineError> {
-        self.controller.reserve(bytes)?;
+        if self.admitted {
+            self.controller.replace_reservation(self.bytes, bytes)?;
+        } else {
+            self.controller.reserve(bytes)?;
+            self.admitted = true;
+        }
         self.bytes = bytes;
-        self.admitted = true;
         Ok(())
     }
 }
@@ -185,5 +220,29 @@ impl Drop for AdmissionPermit<'_> {
                 state.reserved = state.reserved.saturating_sub(self.bytes);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AdmissionController;
+
+    #[test]
+    fn replacing_a_cuda_admission_with_cpu_bytes_counts_once_and_releases_once() {
+        let controller = AdmissionController::new(1, 128);
+        let mut permit = controller.acquire_slot().unwrap();
+        permit.reserve(0).unwrap();
+        permit.reserve(64).unwrap();
+
+        let active = controller.snapshot().unwrap();
+        assert_eq!(active.active, 1);
+        assert_eq!(active.admissions, 1);
+        assert_eq!(active.reserved, 64);
+        drop(permit);
+
+        let released = controller.snapshot().unwrap();
+        assert_eq!(released.active, 0);
+        assert_eq!(released.admissions, 1);
+        assert_eq!(released.reserved, 0);
     }
 }

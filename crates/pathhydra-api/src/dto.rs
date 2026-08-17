@@ -626,6 +626,8 @@ pub struct CpuSearchDiagnosticsDto {
     pub missing_destinations: DecimalU64Dto,
     pub incomplete_destinations: DecimalU64Dto,
     pub path_reconstruction_steps: DecimalU64Dto,
+    pub first_destination_duration: Option<DurationDto>,
+    pub path_reconstruction_duration: DurationDto,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -679,6 +681,8 @@ pub struct CudaRequestDiagnosticsDto {
     pub destination_completion_duration: DurationDto,
     pub destination_count_checked: DecimalU64Dto,
     pub atomic_cas_retries: DecimalU64Dto,
+    pub first_destination_duration: Option<DurationDto>,
+    pub path_reconstruction_duration: DurationDto,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -696,6 +700,8 @@ pub struct RuntimeDiagnosticsDto {
     pub reserved_working_bytes: DecimalU64Dto,
     pub admission_duration: DurationDto,
     pub execution_duration: DurationDto,
+    pub first_destination_duration: Option<DurationDto>,
+    pub reconstruction_duration: DurationDto,
     pub completion_reason: CompletionReasonDto,
     pub search: CpuSearchDiagnosticsDto,
     pub partitioned_cpu: Option<PartitionedCpuDiagnosticsDto>,
@@ -763,12 +769,24 @@ pub struct HydratedEdgeResultDto {
     pub requested_edge_id: EdgeIdDto,
     pub state: HydratedEdgeStateDto,
 }
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HydrationDiagnosticsDto {
+    pub execution_duration: DurationDto,
+    pub requested_nodes: DecimalU64Dto,
+    pub requested_edges: DecimalU64Dto,
+    pub found_nodes: DecimalU64Dto,
+    pub missing_nodes: DecimalU64Dto,
+    pub found_edges: DecimalU64Dto,
+    pub missing_edges: DecimalU64Dto,
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HydrationResponseDto {
     pub nodes: Vec<HydratedNodeResultDto>,
     pub edges: Vec<HydratedEdgeResultDto>,
     pub profile: Option<RelationProfileDto>,
+    pub diagnostics: HydrationDiagnosticsDto,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -779,6 +797,7 @@ pub struct HydratedPathDto {
     pub numeric_policy: NumericPolicyDto,
     pub tie_policy: TiePolicyDto,
     pub profile: RelationProfileDto,
+    pub diagnostics: HydrationDiagnosticsDto,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -832,6 +851,7 @@ pub struct HydratedSubgraphDto {
     pub missing_edge_ids: Vec<EdgeIdDto>,
     pub profile: Option<RelationProfileDto>,
     pub complete: bool,
+    pub diagnostics: HydrationDiagnosticsDto,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -645,7 +645,8 @@ fn benchmark_worker_lanes(
 ) {
     use std::sync::{Arc, Barrier, atomic::AtomicBool};
 
-    let worker = Arc::new(pathhydra_cuda::CudaWorker::start(lanes, delay));
+    let worker =
+        Arc::new(pathhydra_cuda::CudaWorker::start(lanes, delay).expect("CUDA benchmark worker"));
     let barrier = Arc::new(Barrier::new(lanes));
     let mut threads = Vec::with_capacity(lanes);
     for submit_index in 0..lanes {

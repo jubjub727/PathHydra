@@ -6,6 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "cuda")]
+use std::collections::BTreeSet;
+
 use pathhydra_core::{
     BaseWeight, Candidate, CandidateId, ConfirmedRecord, EdgeId, EdgeRecord, NodeId, NodeName,
     NodePayload, NodeRecord, RelationId, RelationName, RelationRecord,
@@ -57,7 +60,7 @@ impl CudaRuntime {
         let worker = pathhydra_cuda::CudaWorker::start(
             config.maximum_batch_lanes,
             config.batch_collection_delay,
-        );
+        )?;
         let admission =
             pathhydra_cuda::CudaAdmissionController::new(pathhydra_cuda::CudaMemoryLimits {
                 maximum_search_bytes: config.maximum_reserved_search_bytes,
@@ -411,6 +414,8 @@ pub struct RuntimeDiagnostics {
     pub reserved_working_bytes: usize,
     pub admission_duration: Duration,
     pub execution_duration: Duration,
+    pub first_destination_duration: Option<Duration>,
+    pub reconstruction_duration: Duration,
     pub completion_reason: CompletionReason,
     pub search: CpuSearchDiagnostics,
     pub partitioned_cpu: Option<pathhydra_routing::PartitionedCpuDiagnostics>,
@@ -1457,10 +1462,16 @@ impl GraphEngine {
                         } else {
                             None
                         };
+                        let simultaneously_compacted_adjacencies = match &cuda_topology {
+                            CudaTopology::Resident(_) => manifest.adjacency_count(),
+                            CudaTopology::Partitioned(image) => {
+                                image.maximum_partition_adjacency_count()
+                            }
+                        };
                         let search_bytes = pathhydra_cuda::estimate_search_bytes_for_request(
                             manifest.node_count(),
                             manifest.relation_kind_count(),
-                            manifest.adjacency_count(),
+                            simultaneously_compacted_adjacencies,
                             request.destinations().len(),
                             algorithm,
                             cpu_evidence_working_bytes,
@@ -1473,6 +1484,13 @@ impl GraphEngine {
                         let reservation = runtime.admission.reserve(search_bytes);
                         match reservation {
                             Ok(reservation) => {
+                                // The outer engine admission tracks every
+                                // admitted route exactly once. CUDA owns its
+                                // separate byte reservation, so the common
+                                // controller records a zero-byte admission.
+                                // A later CPU fallback replaces this value
+                                // without incrementing the admission count.
+                                permit.reserve(0)?;
                                 let admission_duration = admission_started.elapsed();
                                 let execution_started = Instant::now();
                                 let routed = match &cuda_topology {
@@ -1510,6 +1528,8 @@ impl GraphEngine {
                                             }
                                         };
                                         let cuda = output.diagnostics;
+                                        let search =
+                                            cuda_search_diagnostics(&output.response, &cuda);
                                         let diagnostics = RuntimeDiagnostics {
                                             request_id,
                                             executor: Executor::NvidiaCuda,
@@ -1531,8 +1551,12 @@ impl GraphEngine {
                                             reserved_working_bytes: reservation.bytes(),
                                             admission_duration,
                                             execution_duration,
+                                            first_destination_duration: cuda
+                                                .first_destination_duration,
+                                            reconstruction_duration: cuda
+                                                .path_reconstruction_duration,
                                             completion_reason: output.response.completion_reason(),
-                                            search: CpuSearchDiagnostics::default(),
+                                            search,
                                             partitioned_cpu: None,
                                             cuda: Some(CudaRequestDiagnostics {
                                                 algorithm: algorithm_name,
@@ -1586,6 +1610,10 @@ impl GraphEngine {
                                                 destination_count_checked: cuda
                                                     .destination_count_checked,
                                                 atomic_cas_retries: cuda.atomic_cas_retries,
+                                                first_destination_duration: cuda
+                                                    .first_destination_duration,
+                                                path_reconstruction_duration: cuda
+                                                    .path_reconstruction_duration,
                                             }),
                                         };
                                         return Ok(EngineRoutingResponse {
@@ -1705,6 +1733,8 @@ impl GraphEngine {
             reserved_working_bytes: estimate.bytes(),
             admission_duration,
             execution_duration,
+            first_destination_duration: search.first_destination_duration,
+            reconstruction_duration: search.path_reconstruction_duration,
             completion_reason: response.completion_reason(),
             search,
             partitioned_cpu,
@@ -2534,6 +2564,62 @@ impl Drop for GraphEngine {
     }
 }
 
+#[cfg(feature = "cuda")]
+fn cuda_search_diagnostics(
+    response: &RoutingResponse,
+    cuda: &pathhydra_cuda::CudaRouteDiagnostics,
+) -> CpuSearchDiagnostics {
+    let mut present_destinations = BTreeSet::new();
+    let mut reconstructed_destinations = BTreeSet::new();
+    let mut exact_destinations = 0_usize;
+    let mut unreachable_destinations = 0_usize;
+    let mut missing_destinations = 0_usize;
+    let mut incomplete_destinations = 0_usize;
+    let mut path_reconstruction_steps = 0_u64;
+
+    for result in response.results() {
+        match result.state() {
+            DestinationState::Exact(exact) => {
+                exact_destinations += 1;
+                present_destinations.insert(result.destination());
+                if let Some(path) = exact.path()
+                    && reconstructed_destinations.insert(result.destination())
+                {
+                    path_reconstruction_steps = path_reconstruction_steps
+                        .saturating_add(u64::try_from(path.steps().len()).unwrap_or(u64::MAX));
+                }
+            }
+            DestinationState::Unreachable => {
+                unreachable_destinations += 1;
+                present_destinations.insert(result.destination());
+            }
+            DestinationState::MissingNode => missing_destinations += 1,
+            DestinationState::Incomplete => {
+                incomplete_destinations += 1;
+                present_destinations.insert(result.destination());
+            }
+        }
+    }
+
+    CpuSearchDiagnostics {
+        examined_edges: response.examined_edges(),
+        relaxation_updates: cuda.relaxation_updates,
+        finalized_nodes: response.finalized_nodes(),
+        // CUDA exposes compacted tasks and phase counts rather than the CPU
+        // heap frontier's entry high-water mark. Zero means not applicable,
+        // not an inferred CUDA frontier size.
+        frontier_high_water_mark: 0,
+        unique_present_destinations: present_destinations.len(),
+        exact_destinations,
+        unreachable_destinations,
+        missing_destinations,
+        incomplete_destinations,
+        path_reconstruction_steps,
+        first_destination_duration: cuda.first_destination_duration,
+        path_reconstruction_duration: cuda.path_reconstruction_duration,
+    }
+}
+
 fn saturating_increment(counter: &AtomicU64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_add(1))
@@ -2562,6 +2648,199 @@ mod tests {
             panic!()
         };
         node
+    }
+
+    #[test]
+    fn resource_configuration_zero_maximum_and_cross_field_boundaries_are_typed() {
+        macro_rules! assert_zero {
+            ($field:ident) => {{
+                let config = EngineConfig {
+                    $field: 0,
+                    ..EngineConfig::default()
+                };
+                assert!(matches!(
+                    config.validate(),
+                    Err(EngineConfigError::ZeroLimit { limit }) if limit == stringify!($field)
+                ));
+            }};
+        }
+        assert_zero!(max_concurrent_routes);
+        assert_zero!(max_reserved_route_bytes);
+        assert_zero!(max_destinations_per_request);
+        assert_zero!(max_hydration_handles_per_request);
+        assert_zero!(host_partition_cache_entries);
+        assert_zero!(routing_io_worker_count);
+        assert_zero!(maximum_queued_partition_reads);
+        assert_zero!(maximum_retired_bundle_count);
+        assert_zero!(maximum_concurrent_checkpoints);
+        assert_zero!(maximum_maintenance_workers);
+        assert_zero!(maximum_verification_records);
+        assert_zero!(max_total_bundle_bytes);
+        assert_zero!(target_partition_topology_bytes);
+        assert_zero!(hard_maximum_partition_topology_bytes);
+        assert_zero!(max_resident_image_metadata_bytes);
+        assert_zero!(host_partition_cache_bytes);
+        assert_zero!(maximum_retired_bundle_bytes);
+        assert_zero!(routing_io_staging_bytes);
+
+        // These are policies or thresholds rather than capacities: zero
+        // deliberately forces partitioned CPU topology, permits consuming all
+        // reported CUDA free memory, disables batch collection delay, and
+        // keeps maintenance caller-executed with no queue.
+        let valid_zero_thresholds = EngineConfig {
+            max_active_image_bytes: 0,
+            maximum_queued_maintenance: 0,
+            cuda: CudaConfig {
+                minimum_free_memory_headroom: 0,
+                batch_collection_delay: Duration::ZERO,
+                ..CudaConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+        assert!(valid_zero_thresholds.validate().is_ok());
+
+        for (field, configure) in [
+            (
+                "maximum_verification_duration",
+                (|config: &mut EngineConfig| {
+                    config.maximum_verification_duration = Duration::ZERO;
+                }) as fn(&mut EngineConfig),
+            ),
+            (
+                "shutdown_drain_timeout",
+                (|config: &mut EngineConfig| {
+                    config.shutdown_drain_timeout = Duration::ZERO;
+                }) as fn(&mut EngineConfig),
+            ),
+        ] {
+            let mut config = EngineConfig::default();
+            configure(&mut config);
+            assert!(matches!(
+                config.validate(),
+                Err(EngineConfigError::ZeroLimit { limit }) if limit == field
+            ));
+        }
+        for (field, configure) in [
+            (
+                "cuda.maximum_topology_bytes",
+                (|config: &mut EngineConfig| config.cuda.maximum_topology_bytes = 0)
+                    as fn(&mut EngineConfig),
+            ),
+            (
+                "cuda.maximum_partitioned_topology_cache_bytes",
+                (|config: &mut EngineConfig| {
+                    config.cuda.maximum_partitioned_topology_cache_bytes = 0;
+                }) as fn(&mut EngineConfig),
+            ),
+            (
+                "cuda.maximum_partitioned_topology_cache_slots",
+                (|config: &mut EngineConfig| {
+                    config.cuda.maximum_partitioned_topology_cache_slots = 0;
+                }) as fn(&mut EngineConfig),
+            ),
+            (
+                "cuda.maximum_partitioned_host_staging_bytes",
+                (|config: &mut EngineConfig| {
+                    config.cuda.maximum_partitioned_host_staging_bytes = 0;
+                }) as fn(&mut EngineConfig),
+            ),
+            (
+                "cuda.maximum_concurrent_searches",
+                (|config: &mut EngineConfig| config.cuda.maximum_concurrent_searches = 0)
+                    as fn(&mut EngineConfig),
+            ),
+            (
+                "cuda.maximum_batch_lanes",
+                (|config: &mut EngineConfig| config.cuda.maximum_batch_lanes = 0)
+                    as fn(&mut EngineConfig),
+            ),
+            (
+                "cuda.maximum_reserved_search_bytes",
+                (|config: &mut EngineConfig| config.cuda.maximum_reserved_search_bytes = 0)
+                    as fn(&mut EngineConfig),
+            ),
+        ] {
+            let mut config = EngineConfig::default();
+            configure(&mut config);
+            assert!(matches!(
+                config.validate(),
+                Err(EngineConfigError::ZeroLimit { limit }) if limit == field
+            ));
+        }
+
+        let queued = EngineConfig {
+            maximum_queued_maintenance: 1,
+            ..EngineConfig::default()
+        };
+        assert!(matches!(
+            queued.validate(),
+            Err(EngineConfigError::InvalidMaintenanceValue { .. })
+        ));
+        let partitions = EngineConfig {
+            target_partition_topology_bytes: 2,
+            hard_maximum_partition_topology_bytes: 1,
+            ..EngineConfig::default()
+        };
+        assert!(matches!(
+            partitions.validate(),
+            Err(EngineConfigError::InvalidRoutingImageValue { .. })
+        ));
+        let lanes = EngineConfig {
+            cuda: CudaConfig {
+                maximum_concurrent_searches: 1,
+                maximum_batch_lanes: 2,
+                ..CudaConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+        assert!(matches!(
+            lanes.validate(),
+            Err(EngineConfigError::InvalidCudaValue { .. })
+        ));
+        for delta in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+            let mut config = EngineConfig::default();
+            config.cuda.algorithm = CudaAlgorithmSelection::DeltaStepping { delta };
+            assert!(matches!(
+                config.validate(),
+                Err(EngineConfigError::InvalidCudaValue { field: "delta", .. })
+            ));
+        }
+
+        let maximum = EngineConfig {
+            max_active_image_bytes: usize::MAX,
+            max_concurrent_routes: usize::MAX,
+            max_reserved_route_bytes: usize::MAX,
+            max_destinations_per_request: usize::MAX,
+            max_hydration_handles_per_request: usize::MAX,
+            max_total_bundle_bytes: u64::MAX,
+            target_partition_topology_bytes: u64::MAX,
+            hard_maximum_partition_topology_bytes: u64::MAX,
+            max_resident_image_metadata_bytes: u64::MAX,
+            host_partition_cache_bytes: u64::MAX,
+            host_partition_cache_entries: usize::MAX,
+            routing_io_worker_count: usize::MAX,
+            maximum_queued_partition_reads: usize::MAX,
+            routing_io_staging_bytes: u64::MAX,
+            maximum_retired_bundle_bytes: u64::MAX,
+            maximum_retired_bundle_count: usize::MAX,
+            maximum_concurrent_checkpoints: usize::MAX,
+            maximum_maintenance_workers: usize::MAX,
+            maximum_verification_records: u64::MAX,
+            maximum_verification_duration: Duration::MAX,
+            shutdown_drain_timeout: Duration::MAX,
+            cuda: CudaConfig {
+                maximum_topology_bytes: usize::MAX,
+                maximum_partitioned_topology_cache_bytes: usize::MAX,
+                maximum_partitioned_topology_cache_slots: usize::MAX,
+                maximum_partitioned_host_staging_bytes: usize::MAX,
+                maximum_concurrent_searches: usize::MAX,
+                maximum_batch_lanes: usize::MAX,
+                maximum_reserved_search_bytes: usize::MAX,
+                ..CudaConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+        assert!(maximum.validate().is_ok());
     }
 
     #[test]
@@ -2725,20 +3004,23 @@ mod tests {
         }
 
         let first = engine.shutdown().unwrap();
-        assert!(!first.complete());
-        assert!(!first.drain.drained);
         assert_eq!(first.active_requests_signalled, 1);
         assert_eq!(first.newly_signalled_requests, 1);
-        assert_eq!(first.drain.remaining.routes, 1);
-        assert_eq!(first.failures[0].stage, ShutdownFailureStage::Drain);
         let _ = route.join().unwrap();
 
-        let retried = engine.shutdown().unwrap();
-        assert!(retried.complete(), "{:#?}", retried.failures);
-        assert!(retried.drain.drained);
-        assert_eq!(retried.active_before.routes, 1);
-        assert_eq!(retried.drained.routes, 1);
-        assert!(retried.partition_io_stopped);
+        let final_report = if first.complete() {
+            first
+        } else {
+            assert!(!first.drain.drained);
+            assert_eq!(first.drain.remaining.routes, 1);
+            assert_eq!(first.failures[0].stage, ShutdownFailureStage::Drain);
+            engine.shutdown().unwrap()
+        };
+        assert!(final_report.complete(), "{:#?}", final_report.failures);
+        assert!(final_report.drain.drained);
+        assert_eq!(final_report.active_before.routes, 1);
+        assert_eq!(final_report.drained.routes, 1);
+        assert!(final_report.partition_io_stopped);
     }
 
     #[test]

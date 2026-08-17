@@ -2,13 +2,43 @@ use std::fs;
 
 use pathhydra_core::ConfirmedRecord;
 use pathhydra_engine::{
-    EngineConfig, GraphEngine, PublicationOutcome, PublicationStage, RequestId,
-    StartupBundlePolicy, StartupImageOutcome,
+    EngineConfig, EngineRestoreRequest, GraphEngine, PublicationOutcome, PublicationStage,
+    RequestId, StartupBundlePolicy, StartupImageOutcome,
 };
 use pathhydra_routing::{
     DestinationState, RelationMultiplier, RelationProfile, RelationUse, RoutingRequest,
     SearchBudget, TiePolicy,
 };
+use pathhydra_store::{CheckpointRequest, RestoreRequest, VerificationLimits};
+
+fn directory_contents(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    fn visit(
+        root: &std::path::Path,
+        directory: &std::path::Path,
+        contents: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+    ) {
+        let mut entries = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                visit(root, &path, contents);
+            } else {
+                contents.push((
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(path).unwrap(),
+                ));
+            }
+        }
+    }
+
+    let mut contents = Vec::new();
+    visit(root, root, &mut contents);
+    contents
+}
 
 #[test]
 fn partitioned_cpu_routes_exactly_and_valid_bundle_reopens_without_rebuild() {
@@ -168,9 +198,20 @@ fn publication_process_crash_child() {
     let candidate = engine
         .insert_node_candidate("survives-process-crash")
         .unwrap();
-    engine
-        .publication_fault_injection()
-        .fail_at(PublicationStage::BeforeEngineSwap);
+    let stage = match std::env::var("PATHHYDRA_CRASH_HARNESS_STAGE")
+        .ok()
+        .as_deref()
+    {
+        Some("0") => PublicationStage::TemporaryDirectoryCreated,
+        Some("1") => PublicationStage::BundleFilesSynchronized,
+        Some("2") => PublicationStage::TemporaryBundleValidated,
+        Some("3") => PublicationStage::FinalDirectoryRenamed,
+        Some("4") => PublicationStage::DurablePointerCommitted,
+        Some("5") => PublicationStage::RuntimeRepresentationConstructed,
+        Some("6") | None => PublicationStage::BeforeEngineSwap,
+        Some(other) => panic!("unknown replayable crash stage {other}"),
+    };
+    engine.publication_fault_injection().fail_at(stage);
     let mutation = engine.confirm_validated_candidate(candidate).unwrap();
     assert!(matches!(
         mutation.publication(),
@@ -186,6 +227,7 @@ fn abrupt_process_exit_after_pointer_commit_reopens_the_complete_bundle() {
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "publication_process_crash_child", "--nocapture"])
         .env("PATHHYDRA_CRASH_HARNESS_DATABASE", &database)
+        .env("PATHHYDRA_CRASH_HARNESS_STAGE", "6")
         .status()
         .unwrap();
     assert!(!status.success());
@@ -196,6 +238,104 @@ fn abrupt_process_exit_after_pointer_commit_reopens_the_complete_bundle() {
         StartupImageOutcome::ValidatedBundle
     );
     assert_eq!(health.current_image_manifest.unwrap().node_count(), 1);
+}
+
+#[test]
+fn replayable_subprocess_crash_matrix_combines_checkpoint_restore_failures() {
+    let replay_seed = 0xd1b5_4a32_d192_ed03_u64;
+    eprintln!("subprocess crash-matrix replay seed={replay_seed:#018x}");
+    let mut order = [0_usize, 1, 2, 3, 4, 5, 6];
+    let mut random = replay_seed;
+    for index in (1..order.len()).rev() {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        order.swap(index, (random as usize) % (index + 1));
+    }
+
+    for stage in order {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join(format!("graph-stage-{stage}"));
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "publication_process_crash_child", "--nocapture"])
+            .env("PATHHYDRA_CRASH_HARNESS_DATABASE", &database)
+            .env("PATHHYDRA_CRASH_HARNESS_STAGE", stage.to_string())
+            .status()
+            .unwrap();
+        assert!(
+            !status.success(),
+            "stage {stage} did not terminate abruptly"
+        );
+
+        let reopened = GraphEngine::open(&database, EngineConfig::default()).unwrap();
+        assert_eq!(
+            reopened
+                .health()
+                .unwrap()
+                .current_image_manifest
+                .unwrap()
+                .node_count(),
+            1,
+            "stage {stage} lost the committed graph"
+        );
+        let checkpoint = temporary.path().join(format!("checkpoint-{stage}"));
+        let checkpoint_report = reopened
+            .create_checkpoint(&CheckpointRequest {
+                destination_root: temporary.path().to_path_buf(),
+                destination: checkpoint.clone(),
+                routing_image_root: None,
+                scratch_path: None,
+                available_destination_bytes: u64::MAX,
+                minimum_headroom_bytes: 0,
+            })
+            .unwrap();
+        assert!(checkpoint_report.file_count > 0);
+        assert!(reopened.shutdown().unwrap().complete());
+        let checkpoint_contents = directory_contents(&checkpoint);
+
+        let refused = temporary.path().join(format!("refused-restore-{stage}"));
+        fs::create_dir(&refused).unwrap();
+        fs::write(refused.join("operator-marker"), b"preserve").unwrap();
+        let request = |destination| EngineRestoreRequest {
+            store: RestoreRequest {
+                source_root: temporary.path().to_path_buf(),
+                source_checkpoint: checkpoint.clone(),
+                destination_root: temporary.path().to_path_buf(),
+                destination,
+                routing_image_root: None,
+                scratch_path: None,
+                available_destination_bytes: u64::MAX,
+                minimum_headroom_bytes: 0,
+                verification_limits: VerificationLimits {
+                    maximum_records: Some(10_000),
+                    maximum_duration: Some(std::time::Duration::from_secs(30)),
+                },
+            },
+            engine_config: EngineConfig::default(),
+        };
+        assert!(GraphEngine::restore_checkpoint(&request(refused.clone())).is_err());
+        assert_eq!(
+            fs::read(refused.join("operator-marker")).unwrap(),
+            b"preserve"
+        );
+        assert_eq!(directory_contents(&checkpoint), checkpoint_contents);
+
+        let restored = temporary.path().join(format!("restored-{stage}"));
+        let report = GraphEngine::restore_checkpoint(&request(restored.clone())).unwrap();
+        assert!(report.smoke_catalog_verified && report.smoke_route_verified);
+        let restored_engine = GraphEngine::open(restored, EngineConfig::default()).unwrap();
+        assert_eq!(
+            restored_engine
+                .health()
+                .unwrap()
+                .current_image_manifest
+                .unwrap()
+                .node_count(),
+            1
+        );
+        assert!(restored_engine.shutdown().unwrap().complete());
+        assert_eq!(directory_contents(&checkpoint), checkpoint_contents);
+    }
 }
 
 #[test]

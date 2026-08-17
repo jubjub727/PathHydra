@@ -8,10 +8,11 @@ use std::{
 use pathhydra_api::{
     ApiErrorCategory, ApiLimits, Binary32Dto, Binary64Dto, CancellationOutcomeDto, CandidateIdDto,
     CompletionReasonDto, ConfirmedRecordDto, DecimalU64Dto, DestinationResultDto,
-    DestinationStateDto, EdgeHandleDto, EdgeIdDto, EngineLifecycleStateDto, HydratedEdgeResultDto,
-    HydratedEdgeStateDto, HydratedNodeResultDto, HydratedNodeStateDto, HydrationRequestDto,
-    HydrationResponseDto, MutationDurableResultDto, NodeIdDto, NodeRecordDto, NumericPolicyDto,
-    PathHydra, PathStepDto, PayloadDto, PublicationOutcomeDto, RelationIdDto, RelationProfileDto,
+    DestinationStateDto, DurationDto, EdgeHandleDto, EdgeIdDto, EngineLifecycleStateDto,
+    HydratedEdgeResultDto, HydratedEdgeStateDto, HydratedNodeResultDto, HydratedNodeStateDto,
+    HydrationDiagnosticsDto, HydrationRequestDto, HydrationResponseDto, MutationDurableResultDto,
+    NodeIdDto, NodeRecordDto, NumericPolicyDto, PathHydra, PathHydraOpenConfig, PathStepDto,
+    PayloadDto, PublicationOutcomeDto, RelationIdDto, RelationKindRecordDto, RelationProfileDto,
     RelationProfileEntryDto, RelationUseDto, RequestIdAllocation, RoutePathDto, RoutingRequestDto,
     RoutingResponseDto, SearchBudgetDto, SubgraphHandlesDto, TiePolicyDto, VerificationLimitsDto,
     decode, encode,
@@ -84,6 +85,15 @@ fn hydration_workload() -> HydrationResponseDto {
             })
             .collect(),
         profile: None,
+        diagnostics: HydrationDiagnosticsDto {
+            execution_duration: DurationDto::default(),
+            requested_nodes: DecimalU64Dto::from_u64(128),
+            requested_edges: DecimalU64Dto::from_u64(128),
+            found_nodes: DecimalU64Dto::from_u64(128),
+            missing_nodes: DecimalU64Dto::from_u64(0),
+            found_edges: DecimalU64Dto::from_u64(0),
+            missing_edges: DecimalU64Dto::from_u64(128),
+        },
     }
 }
 
@@ -174,6 +184,180 @@ fn capabilities_report_the_facade_configured_api_limits() {
             .expect("canonical limit"),
         123
     );
+}
+
+#[test]
+fn adversarial_exact_names_survive_encoding_checkpoint_and_restore() {
+    let directory = tempfile::tempdir().expect("temporary root");
+    let database = directory.path().join("catalog");
+    let routing = directory.path().join("routing");
+    let checkpoints = directory.path().join("checkpoints");
+    let restores = directory.path().join("restores");
+    let scratch = directory.path().join("scratch");
+    let open = PathHydraOpenConfig::new(
+        database,
+        routing.clone(),
+        checkpoints.clone(),
+        restores.clone(),
+        scratch.clone(),
+    );
+    let api = PathHydra::open_with_config(open).expect("open facade");
+    let names = [
+        "Case",
+        "case",
+        " leading and trailing ",
+        "punctuation !?[]{}",
+        "embedded\0null",
+        "Latin e\u{301}",
+        "Latin é",
+        "Ελληνικά",
+        "日本語",
+        "long-名字-🙂-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    ];
+    let mut ids = Vec::new();
+    let mut relation_ids = Vec::new();
+    for name in names {
+        let candidate = api
+            .insert_node_candidate(name.to_owned(), PayloadDto::from_bytes(name.as_bytes()))
+            .expect("insert exact-name candidate");
+        let node = confirmed_node(
+            api.confirm_candidate(&candidate)
+                .expect("confirm exact-name candidate"),
+        );
+        let encoded = encode(&node, &api.limits()).expect("encode exact-name record");
+        let decoded: NodeRecordDto =
+            decode(&encoded, &api.limits()).expect("decode exact-name record");
+        assert_eq!(decoded.name, name);
+        let duplicate_candidate = api
+            .insert_node_candidate(
+                name.to_owned(),
+                PayloadDto::from_bytes(b"discarded duplicate payload"),
+            )
+            .expect("insert duplicate exact-name candidate");
+        let duplicate_outcome = api
+            .confirm_candidate(&duplicate_candidate)
+            .expect("consume duplicate exact-name candidate");
+        let duplicate_node = confirmed_node(duplicate_outcome.clone());
+        assert_eq!(duplicate_node.id, node.id);
+        assert!(matches!(
+            duplicate_outcome.publication,
+            PublicationOutcomeDto::Published { .. }
+                | PublicationOutcomeDto::RoutingUnavailable { .. }
+        ));
+        assert_eq!(
+            api.get_candidate(&duplicate_candidate)
+                .expect_err("duplicate exact-name candidate is consumed")
+                .category(),
+            ApiErrorCategory::MissingCandidate
+        );
+        ids.push(node.id);
+
+        let relation_candidate = api
+            .insert_relation_kind_candidate(name.to_owned())
+            .expect("insert exact relation-kind candidate");
+        let relation = confirmed_relation(
+            api.confirm_candidate(&relation_candidate)
+                .expect("confirm exact relation-kind candidate"),
+        );
+        let encoded = encode(&relation, &api.limits()).expect("encode exact relation-kind record");
+        let decoded: RelationKindRecordDto =
+            decode(&encoded, &api.limits()).expect("decode exact relation-kind record");
+        assert_eq!(decoded.name, name);
+        let duplicate_relation_candidate = api
+            .insert_relation_kind_candidate(name.to_owned())
+            .expect("insert duplicate exact relation-kind candidate");
+        let duplicate_relation_outcome = api
+            .confirm_candidate(&duplicate_relation_candidate)
+            .expect("consume duplicate exact relation-kind candidate");
+        let duplicate_relation = confirmed_relation(duplicate_relation_outcome.clone());
+        assert_eq!(duplicate_relation.id, relation.id);
+        assert!(matches!(
+            duplicate_relation_outcome.publication,
+            PublicationOutcomeDto::Published { .. }
+                | PublicationOutcomeDto::RoutingUnavailable { .. }
+        ));
+        assert_eq!(
+            api.get_candidate(&duplicate_relation_candidate)
+                .expect_err("duplicate exact relation-kind candidate is consumed")
+                .category(),
+            ApiErrorCategory::MissingCandidate
+        );
+        relation_ids.push(relation.id);
+    }
+    let verification = VerificationLimitsDto {
+        maximum_records: Some(DecimalU64Dto::from_u64(10_000)),
+        maximum_duration: None,
+    };
+    api.create_checkpoint(
+        "adversarial-names",
+        &DecimalU64Dto::from_u64(u64::MAX),
+        &DecimalU64Dto::from_u64(0),
+    )
+    .expect("checkpoint exact names");
+    let restored = api
+        .restore_checkpoint(
+            "adversarial-names",
+            "adversarial-names-restored",
+            &DecimalU64Dto::from_u64(u64::MAX),
+            &DecimalU64Dto::from_u64(0),
+            &verification,
+        )
+        .expect("restore exact names");
+    assert!(restored.smoke_catalog_verified);
+    assert_eq!(
+        restored.shutdown.state_after,
+        EngineLifecycleStateDto::ShutDown
+    );
+    assert!(restored.shutdown.failures.is_empty());
+    api.shutdown().expect("shut down source facade");
+
+    let restored_database = restores.join("adversarial-names-restored");
+    let restored_api = PathHydra::open_with_config(PathHydraOpenConfig::new(
+        restored_database,
+        routing.join("restored-adversarial-names-restored"),
+        directory.path().join("post-restore-checkpoints"),
+        directory.path().join("post-restore-restores"),
+        scratch.join("post-restore"),
+    ))
+    .expect("open restored facade");
+    for (name, id) in names.iter().zip(&ids) {
+        assert_eq!(
+            restored_api
+                .lookup_node_exact(name)
+                .expect("restored lookup"),
+            Some(id.clone())
+        );
+        let node = restored_api
+            .get_confirmed_node(id)
+            .expect("restored confirmed record");
+        let bytes = encode(&node, &restored_api.limits()).expect("encode restored record");
+        let decoded: NodeRecordDto =
+            decode(&bytes, &restored_api.limits()).expect("decode restored record");
+        assert_eq!(decoded.name, *name);
+        assert_eq!(
+            decoded.payload.decode().expect("canonical payload"),
+            name.as_bytes()
+        );
+    }
+    for (name, id) in names.iter().zip(&relation_ids) {
+        assert_eq!(
+            restored_api
+                .lookup_relation_kind_exact(name)
+                .expect("restored relation-kind lookup"),
+            Some(id.clone())
+        );
+        let relation = restored_api
+            .get_confirmed_relation_kind(id)
+            .expect("restored confirmed relation-kind record");
+        let bytes = encode(&relation, &restored_api.limits())
+            .expect("encode restored relation-kind record");
+        let decoded: RelationKindRecordDto =
+            decode(&bytes, &restored_api.limits()).expect("decode restored relation-kind record");
+        assert_eq!(decoded.name, *name);
+    }
+    let shutdown = restored_api.shutdown().expect("shutdown restored");
+    assert_eq!(shutdown.state_after, EngineLifecycleStateDto::ShutDown);
+    assert!(shutdown.failures.is_empty());
 }
 
 fn confirmed_node(value: pathhydra_api::MutationOutcomeDto) -> NodeRecordDto {
@@ -333,6 +517,15 @@ fn full_encoded_facade_lifecycle_and_current_state_hydration() {
         .expect("hydrate current path");
     assert_eq!(hydrated_path.nodes.len(), 2);
     assert_eq!(hydrated_path.edges.len(), 1);
+    assert!(
+        hydrated_path
+            .diagnostics
+            .execution_duration
+            .to_duration()
+            .is_ok()
+    );
+    assert_eq!(hydrated_path.diagnostics.requested_nodes.as_u64(), Ok(2));
+    assert_eq!(hydrated_path.diagnostics.requested_edges.as_u64(), Ok(1));
 
     let mut subgraph = api.new_subgraph();
     handle
@@ -341,10 +534,16 @@ fn full_encoded_facade_lifecycle_and_current_state_hydration() {
     let encoded = encode(&subgraph, &api.limits()).expect("encode subgraph");
     let decoded: SubgraphHandlesDto = decode(&encoded, &api.limits()).expect("decode subgraph");
     assert_eq!(decoded, subgraph);
+    let hydrated_subgraph = api
+        .hydrate_subgraph(&decoded, Some(&profile))
+        .expect("hydrate subgraph");
+    assert!(hydrated_subgraph.complete);
     assert!(
-        api.hydrate_subgraph(&decoded, Some(&profile))
-            .expect("hydrate subgraph")
-            .complete
+        hydrated_subgraph
+            .diagnostics
+            .execution_duration
+            .to_duration()
+            .is_ok()
     );
 
     let verification = VerificationLimitsDto {
@@ -412,6 +611,10 @@ fn full_encoded_facade_lifecycle_and_current_state_hydration() {
         current.edges[0].state,
         HydratedEdgeStateDto::Missing
     ));
+    assert_eq!(current.diagnostics.requested_nodes.as_u64(), Ok(2));
+    assert_eq!(current.diagnostics.found_nodes.as_u64(), Ok(2));
+    assert_eq!(current.diagnostics.requested_edges.as_u64(), Ok(1));
+    assert_eq!(current.diagnostics.missing_edges.as_u64(), Ok(1));
 
     api.compact_store().expect("compact fixed store scope");
     let health = api.health().expect("health");

@@ -8,7 +8,12 @@ examined-edge budgets remain CPU-only. The API is pre-release and concrete.
 
 ## Publication
 
-Provisional candidates cannot affect confirmed lookup, routing, or hydration, so inserting them does not publish. Every successful confirmed promotion, edge removal, or cascading node removal holds the publication write lock from before durable mutation through complete record capture and image publication. The replacement becomes visible only after compilation, validation, and the topology-byte check succeed.
+Provisional candidates cannot affect confirmed lookup, routing, or hydration,
+so inserting them does not publish. Every successful confirmed promotion, edge
+removal, or cascading node removal holds the publication write lock from before
+durable mutation through a consistent streaming confirmed scan, complete bundle
+compilation, validation, and image publication. The replacement becomes visible
+only after all configured topology/metadata limits and technical checks pass.
 
 The mutation result separates its durable result from `Published` or `RoutingUnavailable`. A post-commit failure therefore cannot encourage a caller to retry a consumed candidate. When unavailable, the catalog remains usable for inspection and repair. `rebuild_routing_image` explicitly retries a full build.
 
@@ -33,7 +38,17 @@ reconstruction; CUDA checks at safe host-visible launch boundaries.
 
 ## Diagnostics, capabilities, and health
 
-Every engine route returns its response plus executor, policies, image counts, reservation, monotonic durations, completion reason, examined edges, relaxations, finalized nodes, frontier high-water mark, destination state counts, and reconstruction steps. No payload is logged.
+Every engine route returns its response plus executor, policies, image counts,
+reservation, monotonic admission/execution timing, the first present
+destination's completion timestamp, path-reconstruction duration, completion
+reason, examined edges, relaxations, finalized nodes, frontier high-water mark,
+destination state counts, and reconstruction steps. Missing destinations do
+not manufacture a zero first-completion timestamp. The timestamp starts at
+entry into the selected executor and therefore includes its request mapping,
+profile packing, and fallible working-state allocation. A path-returning
+destination is complete only after its path evidence is reconstructed; an
+unreachable present destination completes when frontier exhaustion proves that
+state. No payload is logged.
 
 Capabilities report build and runtime CUDA facts independently, device
 identity, algorithms, path-evidence and finite-budget policy, and partitioned

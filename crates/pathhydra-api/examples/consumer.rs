@@ -5,7 +5,7 @@ use pathhydra_api::{
     TiePolicyDto, decode, encode,
 };
 
-fn external_decision_placeholder(_candidate: &pathhydra_api::CandidateDto) -> bool {
+fn external_decision_accepts(_candidate: &pathhydra_api::CandidateDto) -> bool {
     // The application owns factual validation. PathHydra only records the
     // explicit confirmation decision made here.
     true
@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         PayloadDto::from_bytes(b"caller-owned source payload"),
     )?;
     let candidate = api.get_candidate(&source_candidate)?;
-    assert!(external_decision_placeholder(&candidate));
+    assert!(external_decision_accepts(&candidate));
     let source = confirmed_node(api.confirm_candidate(&source_candidate)?);
 
     let destination_candidate = api.insert_node_candidate(

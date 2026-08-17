@@ -103,6 +103,57 @@ fn presignalled_cancellation_preserves_origin_and_missing_destinations() {
 }
 
 #[test]
+fn missing_only_request_has_no_present_destination_completion_timestamp() {
+    let (image, request) = fixture();
+    let missing_only = RoutingRequest::new(
+        request.origin(),
+        [NodeId::from_u64(98), NodeId::from_u64(99)],
+        request.profile().clone(),
+        true,
+        SearchBudget::Unlimited,
+        TiePolicy::StablePredecessor,
+    );
+    let (response, diagnostics) =
+        route_controlled(&image, &missing_only, &AtomicBool::new(false)).unwrap();
+    assert_eq!(
+        response.completion_reason(),
+        CompletionReason::AllDestinationsFinalized
+    );
+    assert!(
+        response
+            .results()
+            .iter()
+            .all(|result| matches!(result.state(), DestinationState::MissingNode))
+    );
+    assert_eq!(diagnostics.first_destination_duration, None);
+    assert!(diagnostics.path_reconstruction_duration.is_zero());
+}
+
+#[test]
+fn unreachable_only_request_completes_when_frontier_exhaustion_proves_it() {
+    let (image, request) = fixture();
+    let unreachable_only = RoutingRequest::new(
+        NodeId::from_u64(3),
+        [NodeId::from_u64(1)],
+        request.profile().clone(),
+        false,
+        SearchBudget::Unlimited,
+        TiePolicy::StablePredecessor,
+    );
+    let (response, diagnostics) =
+        route_controlled(&image, &unreachable_only, &AtomicBool::new(false)).unwrap();
+    assert_eq!(
+        response.completion_reason(),
+        CompletionReason::FrontierExhausted
+    );
+    assert!(matches!(
+        response.results()[0].state(),
+        DestinationState::Unreachable
+    ));
+    assert!(diagnostics.first_destination_duration.is_some());
+}
+
+#[test]
 fn topology_limit_is_checked_before_image_construction() {
     let (image, _) = fixture();
     let required = image.manifest().byte_counts().total();

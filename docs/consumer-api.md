@@ -137,6 +137,17 @@ API call error. Destination states keep exact, unreachable, missing, and
 incomplete distinct. Exact binary32 operands and binary64 distance evidence are
 stored as fixed bit text by their DTO wrappers.
 
+`EngineRoutingResponseDto.response.profile` preserves the exact canonical
+relation profile used for the route and is the selected context-profile
+identity. Runtime diagnostics do not duplicate that profile (or names, payloads,
+and paths), so their redaction does not remove it from the structured response.
+Their first-destination timestamp belongs to the same full request and excludes
+preclassified missing IDs. Requested paths must exist before an exact
+destination is complete, while an unreachable destination completes at
+frontier exhaustion; reconstruction duration measures only path-evidence
+construction. Canonical decoding rejects diagnostics whose nested search/CUDA
+timings, response-state counts, policies, or completion reason disagree.
+
 ## Hydration and subgraphs
 
 A completed request handle retains its point-in-time routing response so the
@@ -146,6 +157,12 @@ current confirmed records. If a returned node or edge was deleted after the
 route, `hydrate_path` returns typed `HydrationUnavailable` rather than stale
 records. Arbitrary `hydrate` and `hydrate_subgraph` preserve explicit missing
 states and IDs.
+
+Every facade hydration result carries canonical `HydrationDiagnosticsDto`:
+execution duration plus requested/found/missing node and edge counts. Path and
+subgraph hydration use the same shape, and canonical decoding rejects count or
+completeness mismatches. Timing begins immediately before the engine hydration
+operation and excludes caller-side encoding.
 
 `SubgraphHandlesDto` is a deterministic caller-owned value: node IDs and edge
 IDs are strictly increasing, and every directed edge carries source and

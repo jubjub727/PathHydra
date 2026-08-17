@@ -46,14 +46,16 @@ PathHydra is intended to provide:
 - traceable inference results;
 - a clean boundary between stored facts and inferred conclusions.
 
-The project is in its early design stage. Interfaces and storage formats are not yet stable.
+PathHydra has one current pre-release API, durable layout, routing-bundle
+layout, and canonical DTO representation. They carry no compatibility or
+migration promise before the first public release.
 
 ## Implementation status
 
 The complete CPU-side Rust engine now provides a durable graph store. It preserves
 opaque node payloads; exact node and relation-kind names; provisional node,
-relation-kind, and edge candidates; and confirmed typed, directed, normalized
-weighted edges. Promotion and deletion are atomic, parallel and self-edges
+relation-kind, and edge candidates; and confirmed typed, directed edges with
+canonical base weights. Promotion and deletion are atomic, parallel and self-edges
 have independent identities, node deletion cascades through both adjacency
 directions. Startup validates every confirmed record and index relationship.
 
@@ -83,8 +85,12 @@ remains conservative and no universal speedup is claimed. See [the CUDA build
 guide](docs/cuda-build.md), [routing contract](docs/cuda-routing.md), and
 [operations guide](docs/cuda-operations.md).
 
-BAML/bindings and a transport are not implemented yet. Durable routing bundles
-and exact partitioned CPU/CUDA execution are active engine paths.
+The selected consumer boundary is the synchronous in-process
+`pathhydra-api::PathHydra` facade with owned DTOs, process-local request handles,
+typed cancellation, bounded canonical JSON, current-state hydration, durable
+operations, and explicit shutdown. BAML application design remains outside the
+engine; no network transport is required or implied. See the
+[consumer API reference](docs/consumer-api.md).
 
 Operational selection uses independent limits. `max_active_image_bytes`
 selects resident versus partitioned CPU topology; host metadata,
@@ -119,8 +125,15 @@ cargo fmt --all --check
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+powershell -NoProfile -File Scripts/generate-dependency-inventory.ps1 -Check
+powershell -NoProfile -File Scripts/check-system-conformance.ps1
 ```
 
 CUDA-capable development additionally uses the explicitly installed pinned
 nightly described in `docs/cuda-build.md`; runtime deployment needs a compatible
 NVIDIA driver but not the CUDA toolkit.
+
+The [system conformance ledger](docs/system-conformance.md) maps the normative
+system shape to current code, decisions, tests, and operational evidence. The
+[dependency reference](docs/dependencies.md) records pinned Rust licences and
+the manually reviewed native/toolchain boundary.

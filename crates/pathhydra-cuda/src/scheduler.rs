@@ -84,6 +84,12 @@ pub struct CudaRouteDiagnostics {
     pub destination_completion_duration: Duration,
     pub destination_count_checked: usize,
     pub atomic_cas_retries: u64,
+    /// Time from route execution start until the first requested destination
+    /// could be classified as final. CUDA currently finalizes targets only
+    /// after its synchronized full-distance pass.
+    pub first_destination_duration: Option<Duration>,
+    /// Time spent in the same-image CPU path-evidence reconstruction pass.
+    pub path_reconstruction_duration: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +162,18 @@ struct WorkerCounters {
 }
 
 #[cfg(feature = "cuda")]
+struct ActiveLaneGuard {
+    counters: Arc<WorkerCounters>,
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for ActiveLaneGuard {
+    fn drop(&mut self) {
+        self.counters.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CudaWorkerSnapshot {
     pub queued_lanes: usize,
@@ -187,8 +205,14 @@ pub struct CudaWorkerShutdown {
 
 #[cfg(feature = "cuda")]
 impl CudaWorker {
-    #[must_use]
-    pub fn start(maximum_batch_lanes: usize, batch_delay: Duration) -> Self {
+    #[must_use = "CUDA worker creation failures must be handled"]
+    pub fn start(maximum_batch_lanes: usize, batch_delay: Duration) -> Result<Self, CudaError> {
+        if maximum_batch_lanes == 0 {
+            return Err(CudaError::new(
+                CudaFailureKind::Admission,
+                "maximum CUDA batch lanes must be nonzero",
+            ));
+        }
         let (sender, receiver) = mpsc::channel();
         let counters = Arc::new(WorkerCounters::default());
         let worker_counters = Arc::clone(&counters);
@@ -199,20 +223,25 @@ impl CudaWorker {
             .spawn(move || {
                 worker_loop(
                     receiver,
-                    maximum_batch_lanes.max(1),
+                    maximum_batch_lanes,
                     batch_delay,
                     worker_counters,
                     worker_stopping,
                 );
             })
-            .expect("the CUDA worker thread must be creatable");
-        Self {
+            .map_err(|_| {
+                CudaError::new(
+                    CudaFailureKind::Worker,
+                    "the CUDA worker thread could not be created",
+                )
+            })?;
+        Ok(Self {
             sender,
             thread: Some(thread),
             counters,
             stopping,
             shutdown: None,
-        }
+        })
     }
 
     pub fn submit(
@@ -376,7 +405,19 @@ fn worker_loop(
             }
         };
         let collected_at = Instant::now();
-        let mut batch = vec![first];
+        let mut batch = Vec::new();
+        if batch.try_reserve(1).is_err() {
+            reject_queued_with_error(
+                first,
+                &counters,
+                CudaError::new(
+                    CudaFailureKind::Allocation,
+                    "the CUDA worker could not allocate its batch queue",
+                ),
+            );
+            continue;
+        }
+        batch.push(first);
         while batch.len() < maximum_batch_lanes {
             let remaining = batch_delay.saturating_sub(collected_at.elapsed());
             if remaining.is_zero() {
@@ -393,6 +434,17 @@ fn worker_loop(
                 Ok(Command::Route(job))
                     if job.image.ptr_eq(&batch[0].image) && job.algorithm == batch[0].algorithm =>
                 {
+                    if batch.try_reserve(1).is_err() {
+                        reject_queued_with_error(
+                            job,
+                            &counters,
+                            CudaError::new(
+                                CudaFailureKind::Allocation,
+                                "the CUDA worker could not grow its batch queue",
+                            ),
+                        );
+                        break;
+                    }
                     batch.push(job);
                 }
                 Ok(command) => deferred.push_back(command),
@@ -400,48 +452,97 @@ fn worker_loop(
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
-        counters.batches.fetch_add(1, Ordering::Relaxed);
-        counters.active.store(batch.len(), Ordering::Relaxed);
-        let _ = counters
-            .peak_active
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |peak| {
-                Some(peak.max(batch.len()))
-            });
+        let batch_collection_duration = collected_at.elapsed();
         let width = batch.len();
         std::thread::scope(|scope| {
-            for (lane_index, job) in batch.into_iter().enumerate() {
-                let counters = Arc::clone(&counters);
-                scope.spawn(move || {
-                    counters.queued.fetch_sub(1, Ordering::Relaxed);
-                    let queue_duration = job.enqueued_at.elapsed();
-                    let mut output = job.image.route(
-                        &job.request,
-                        job.algorithm,
-                        &job.cancellation,
-                        job.reserved_search_bytes,
+            let mut spawned_lanes = Vec::new();
+            if spawned_lanes.try_reserve(width).is_err() {
+                for job in batch {
+                    reject_queued_with_error(
+                        job,
+                        &counters,
+                        CudaError::new(
+                            CudaFailureKind::Allocation,
+                            "the CUDA worker could not allocate its lane-join queue",
+                        ),
                     );
-                    match &mut output {
-                        Ok(output) => {
-                            output.diagnostics.queue_duration = queue_duration;
-                            output.diagnostics.batch_collection_duration = collected_at.elapsed();
-                            output.diagnostics.batch_width = width;
-                            output.diagnostics.lane_index = lane_index;
-                            counters
-                                .launches
-                                .fetch_add(output.diagnostics.kernel_launches, Ordering::Relaxed);
-                            if job.cancellation.load(Ordering::Acquire) {
-                                counters.cancellations.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
+            counters.batches.fetch_add(1, Ordering::Relaxed);
+            counters.active.store(width, Ordering::Relaxed);
+            let _ =
+                counters
+                    .peak_active
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |peak| {
+                        Some(peak.max(width))
+                    });
+            for (lane_index, job) in batch.into_iter().enumerate() {
+                let lane_counters = Arc::clone(&counters);
+                lane_counters.queued.fetch_sub(1, Ordering::Relaxed);
+                let fallback_counters = Arc::clone(&lane_counters);
+                let fallback_reply = job.reply.clone();
+                match thread::Builder::new()
+                    .name(format!("pathhydra-cuda-lane-{lane_index}"))
+                    .spawn_scoped(scope, move || {
+                        let _active_lane = ActiveLaneGuard {
+                            counters: Arc::clone(&lane_counters),
+                        };
+                        let queue_duration = job.enqueued_at.elapsed();
+                        let mut output = job.image.route(
+                            &job.request,
+                            job.algorithm,
+                            &job.cancellation,
+                            job.reserved_search_bytes,
+                        );
+                        match &mut output {
+                            Ok(output) => {
+                                output.diagnostics.first_destination_duration = output
+                                    .diagnostics
+                                    .first_destination_duration
+                                    .map(|duration| duration.saturating_add(queue_duration));
+                                output.diagnostics.queue_duration = queue_duration;
+                                output.diagnostics.batch_collection_duration =
+                                    batch_collection_duration;
+                                output.diagnostics.batch_width = width;
+                                output.diagnostics.lane_index = lane_index;
+                                lane_counters.launches.fetch_add(
+                                    output.diagnostics.kernel_launches,
+                                    Ordering::Relaxed,
+                                );
+                                if job.cancellation.load(Ordering::Acquire) {
+                                    lane_counters.cancellations.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            Err(_) => {
+                                lane_counters.failures.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        Err(_) => {
-                            counters.failures.fetch_add(1, Ordering::Relaxed);
-                        }
+                        let _ = job.reply.send(output);
+                    }) {
+                    Ok(handle) => {
+                        spawned_lanes.push((handle, fallback_counters, fallback_reply));
                     }
-                    let _ = job.reply.send(output);
-                });
+                    Err(_) => {
+                        fallback_counters.active.fetch_sub(1, Ordering::Relaxed);
+                        fallback_counters.failures.fetch_add(1, Ordering::Relaxed);
+                        let _ = fallback_reply.send(Err(CudaError::new(
+                            CudaFailureKind::Worker,
+                            "a CUDA batch lane thread could not be created",
+                        )));
+                    }
+                }
+            }
+            for (handle, fallback_counters, fallback_reply) in spawned_lanes {
+                if handle.join().is_err() {
+                    fallback_counters.failures.fetch_add(1, Ordering::Relaxed);
+                    let _ = fallback_reply.send(Err(CudaError::new(
+                        CudaFailureKind::Worker,
+                        "a CUDA batch lane panicked before returning a route",
+                    )));
+                }
             }
         });
-        counters.active.store(0, Ordering::Relaxed);
     }
 }
 
@@ -465,6 +566,13 @@ fn drain_queued(receiver: &Receiver<Command>, counters: &WorkerCounters) -> usiz
 fn reject_queued(job: RouteJob, counters: &WorkerCounters, message: &'static str) {
     counters.queued.fetch_sub(1, Ordering::Relaxed);
     let _ = job.reply.send(Err(worker_error(message)));
+}
+
+#[cfg(feature = "cuda")]
+fn reject_queued_with_error(job: RouteJob, counters: &WorkerCounters, error: CudaError) {
+    counters.queued.fetch_sub(1, Ordering::Relaxed);
+    counters.failures.fetch_add(1, Ordering::Relaxed);
+    let _ = job.reply.send(Err(error));
 }
 
 #[cfg(feature = "cuda")]

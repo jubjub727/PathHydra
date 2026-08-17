@@ -1,9 +1,9 @@
-#[cfg(feature = "cuda")]
-use pathhydra_cuda::CudaWorker;
 use pathhydra_cuda::{
     CudaAdmissionController, CudaAlgorithm, CudaMemoryLimits, estimate_search_bytes,
     estimate_search_bytes_for_request,
 };
+#[cfg(feature = "cuda")]
+use pathhydra_cuda::{CudaFailureKind, CudaWorker};
 
 #[test]
 fn lane_and_total_byte_limits_are_raii_and_do_not_leak() {
@@ -62,9 +62,38 @@ fn task_compaction_reservation_covers_host_and_device_overlap_per_edge() {
 }
 
 #[test]
+fn search_estimation_overflow_is_a_typed_refusal_before_reservation() {
+    assert!(
+        estimate_search_bytes(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            CudaAlgorithm::Frontier,
+        )
+        .is_err()
+    );
+    assert!(
+        estimate_search_bytes_for_request(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            CudaAlgorithm::Frontier,
+            Some(usize::MAX),
+        )
+        .is_err()
+    );
+}
+
+#[test]
 #[cfg(feature = "cuda")]
 fn explicit_worker_shutdown_is_joined_and_idempotent() {
-    let mut worker = CudaWorker::start(2, std::time::Duration::ZERO);
+    assert!(matches!(
+        CudaWorker::start(0, std::time::Duration::ZERO),
+        Err(error) if error.kind() == CudaFailureKind::Admission
+    ));
+    let mut worker = CudaWorker::start(2, std::time::Duration::ZERO).unwrap();
     let first = worker.shutdown();
     assert!(first.joined);
     assert_eq!(first.queued_at_request, 0);

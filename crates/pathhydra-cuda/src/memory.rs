@@ -145,14 +145,14 @@ impl CudaAdmissionController {
 pub fn estimate_search_bytes(
     node_count: usize,
     relation_count: usize,
-    adjacency_count: usize,
+    simultaneously_compacted_adjacencies: usize,
     destination_count: usize,
     algorithm: CudaAlgorithm,
 ) -> Result<usize, CudaError> {
     estimate_search_bytes_for_request(
         node_count,
         relation_count,
-        adjacency_count,
+        simultaneously_compacted_adjacencies,
         destination_count,
         algorithm,
         None,
@@ -162,7 +162,7 @@ pub fn estimate_search_bytes(
 pub fn estimate_search_bytes_for_request(
     node_count: usize,
     relation_count: usize,
-    adjacency_count: usize,
+    simultaneously_compacted_adjacencies: usize,
     destination_count: usize,
     algorithm: CudaAlgorithm,
     cpu_evidence_working_bytes: Option<usize>,
@@ -178,9 +178,12 @@ pub fn estimate_search_bytes_for_request(
     node_count
         .checked_mul(per_node)
         .and_then(|bytes| bytes.checked_add(relation_count.checked_mul(8)?))
-        // Worst overlap while resident task compaction uploads one u64 edge
-        // ordinal plus one u32 source per edge: host and device copies coexist.
-        .and_then(|bytes| bytes.checked_add(adjacency_count.checked_mul(24)?))
+        // Worst overlap while task compaction uploads one u64 edge ordinal
+        // plus one u32 source per edge: host and device copies coexist. A
+        // resident image passes its complete adjacency count. A partitioned
+        // image passes the largest single partition because partition-local
+        // task buffers are synchronized and released before the next upload.
+        .and_then(|bytes| bytes.checked_add(simultaneously_compacted_adjacencies.checked_mul(24)?))
         .and_then(|bytes| bytes.checked_add(destination_count.checked_mul(64)?))
         .and_then(|bytes| bytes.checked_add(cpu_evidence_working_bytes.unwrap_or(0)))
         .and_then(|bytes| bytes.checked_add(512))

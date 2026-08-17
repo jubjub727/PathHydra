@@ -19,12 +19,21 @@ segments schedules no topology. Reversed partition order is an agreement gate.
 Queued lanes remain separate in profile, origin, status, and counters. Zero
 cycles terminate because equal distances do not update.
 
+Scheduler diagnostics measure queue time from request enqueue to lane start.
+Batch-collection duration covers only the bounded window used to assemble the
+compatible batch; it is captured before any lane route executes and therefore
+does not absorb kernel or response work. Scoped lane creation and joins return
+typed worker failures and maintain the active-lane count on every exit.
+
 Partitioned delta-stepping scans sparse logical buckets, repeatedly processes
 the partitions named by the current bucket's source segments until same-bucket
 light closure, then processes the partitions named by the bucket's final
 removed set for heavy edges. It does not scan unrelated partitions. Host
 reads/copies are pending bucket work. Bucket indexes must fit `u64`; there is no
-clamp or approximation.
+clamp or approximation. If a finite distance divided by the selected delta is
+not representable, resident and partitioned execution both return a typed
+kernel-invariant failure and never construct a response from the intermediate
+labels.
 
 `frontier_compaction_duration` measures host task construction plus compact
 task upload, separately from device relation relaxation.
@@ -33,7 +42,25 @@ across frontier, delta-light, and delta-heavy phases; it is not a post-route
 count of reached states. Compact task bytes are included in host-to-device
 diagnostics, intermediate active/bucket state downloads are included in
 device-to-host diagnostics, and admission reserves the worst simultaneous host
-and device task-buffer footprint before any CUDA allocation.
+and device task-buffer footprint before any CUDA allocation. Resident
+admission uses the complete adjacency count; partitioned admission uses the
+largest single partition because each partition-local task buffer is
+synchronized and released before the next upload.
+
+CUDA currently classifies requested destinations after its synchronized
+distance pass. Consequently its first-destination timestamp may equal full
+distance completion. The worker adds the request's measured queue interval so
+the timestamp is relative to enqueue, not merely kernel entry; when paths are
+requested it also includes same-image CPU path reconstruction and verification.
+Path reconstruction remains a separate duration and both values are scoped by
+the outer engine execution duration.
+
+Examined-edge and relaxation-attempt diagnostics are accumulated once per
+thread block after the block leader validates its compacted task range. This
+preserves exact counts while avoiding a single global counter atomic for every
+edge. Compare-and-swap retries are added only when nonzero; successful updates
+remain individually counted. These aggregation rules change neither relation
+evaluation nor distance updates.
 
 Both algorithms use the CPU numeric policy: convert binary32 base weight and
 multiplier separately to binary64, multiply, then add. The PTX audit rejects a

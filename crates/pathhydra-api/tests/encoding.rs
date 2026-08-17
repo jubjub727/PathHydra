@@ -6,13 +6,13 @@ use pathhydra_api::{
     CudaIneligibilityDto, CudaRequestDiagnosticsDto, DecimalU64Dto, DestinationResultDto,
     DestinationStateDto, DurationDto, EdgeHandleDto, EdgeIdDto, EngineLifecycleStateDto,
     EngineRoutingResponseDto, ExecutorDto, ExecutorSelectionReasonDto, HealthDto,
-    HydratedNodeResultDto, HydratedNodeStateDto, HydrationResponseDto, ImageBuildOutcomeDto,
-    ImageBuildReportDto, LifecycleSnapshotDto, NodeIdDto, NodeRecordDto, NumericPolicyDto,
-    PartitionedCpuDiagnosticsDto, PathStepDto, PayloadDto, RelationIdDto, RelationProfileDto,
-    RelationProfileEntryDto, RelationUseDto, RequestIdDto, RetirementHealthDto, RoutePathDto,
-    RoutingHealthDto, RoutingRequestDto, RoutingResponseDto, RuntimeDiagnosticsDto,
-    SearchBudgetDto, SubgraphHandlesDto, TiePolicyDto, decode, decode_and_reencode,
-    decode_strict_canonical, encode,
+    HydratedNodeResultDto, HydratedNodeStateDto, HydrationDiagnosticsDto, HydrationResponseDto,
+    ImageBuildOutcomeDto, ImageBuildReportDto, LifecycleSnapshotDto, MalformedKind, NodeIdDto,
+    NodeRecordDto, NumericPolicyDto, PartitionedCpuDiagnosticsDto, PathStepDto, PayloadDto,
+    RelationIdDto, RelationProfileDto, RelationProfileEntryDto, RelationUseDto, RequestIdDto,
+    RetirementHealthDto, RoutePathDto, RoutingHealthDto, RoutingRequestDto, RoutingResponseDto,
+    RuntimeDiagnosticsDto, SearchBudgetDto, SubgraphHandlesDto, TiePolicyDto, decode,
+    decode_and_reencode, decode_strict_canonical, encode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -158,18 +158,28 @@ fn count(value: u64) -> DecimalU64Dto {
     DecimalU64Dto::from_u64(value)
 }
 
-fn search_diagnostics() -> CpuSearchDiagnosticsDto {
+fn search_diagnostics(
+    completion: CompletionReasonDto,
+    paths_requested: bool,
+) -> CpuSearchDiagnosticsDto {
+    let (unreachable, missing, incomplete, unique_present) = match completion {
+        CompletionReasonDto::AllDestinationsFinalized => (0, 3, 0, 1),
+        CompletionReasonDto::FrontierExhausted => (2, 1, 0, 3),
+        CompletionReasonDto::BudgetExhausted | CompletionReasonDto::Cancelled => (0, 1, 2, 3),
+    };
     CpuSearchDiagnosticsDto {
         examined_edges: count(13),
         relaxation_updates: count(8),
         finalized_nodes: count(5),
         frontier_high_water_mark: count(3),
-        unique_present_destinations: count(4),
+        unique_present_destinations: count(unique_present),
         exact_destinations: count(2),
-        unreachable_destinations: count(1),
-        missing_destinations: count(1),
-        incomplete_destinations: count(1),
-        path_reconstruction_steps: count(1),
+        unreachable_destinations: count(unreachable),
+        missing_destinations: count(missing),
+        incomplete_destinations: count(incomplete),
+        path_reconstruction_steps: count(u64::from(paths_requested)),
+        first_destination_duration: Some(DurationDto::default()),
+        path_reconstruction_duration: DurationDto::default(),
     }
 }
 
@@ -187,7 +197,7 @@ fn partitioned_diagnostics() -> PartitionedCpuDiagnosticsDto {
     }
 }
 
-fn cuda_diagnostics(partitions: u64) -> CudaRequestDiagnosticsDto {
+fn cuda_diagnostics(partitions: u64, paths_requested: bool) -> CudaRequestDiagnosticsDto {
     CudaRequestDiagnosticsDto {
         algorithm: "frontier".to_owned(),
         delta: None,
@@ -215,7 +225,11 @@ fn cuda_diagnostics(partitions: u64) -> CudaRequestDiagnosticsDto {
         reset_mode: "explicit_clear".to_owned(),
         target_mode: "sorted_sparse_host".to_owned(),
         profile_mode: "inline_exact".to_owned(),
-        path_evidence_mode: "cpu_pass_same_image".to_owned(),
+        path_evidence_mode: if paths_requested {
+            "cpu_pass_same_image".to_owned()
+        } else {
+            "not_requested".to_owned()
+        },
         state_initialization_duration: DurationDto::default(),
         partition_scheduling_duration: DurationDto::default(),
         relation_relaxation_duration: DurationDto::default(),
@@ -225,6 +239,8 @@ fn cuda_diagnostics(partitions: u64) -> CudaRequestDiagnosticsDto {
         destination_completion_duration: DurationDto::default(),
         destination_count_checked: count(5),
         atomic_cas_retries: count(2),
+        first_destination_duration: Some(DurationDto::default()),
+        path_reconstruction_duration: DurationDto::default(),
     }
 }
 
@@ -246,6 +262,13 @@ fn routing_response(paths_requested: bool, completion: CompletionReasonDto) -> R
             effective_weight: distance.clone(),
         }],
     });
+    let terminal_state = match completion {
+        CompletionReasonDto::AllDestinationsFinalized => DestinationStateDto::MissingNode,
+        CompletionReasonDto::FrontierExhausted => DestinationStateDto::Unreachable,
+        CompletionReasonDto::BudgetExhausted | CompletionReasonDto::Cancelled => {
+            DestinationStateDto::Incomplete
+        }
+    };
     RoutingResponseDto {
         origin,
         results: vec![
@@ -265,7 +288,7 @@ fn routing_response(paths_requested: bool, completion: CompletionReasonDto) -> R
             },
             DestinationResultDto {
                 destination: NodeIdDto::from_u64(3),
-                state: DestinationStateDto::Unreachable,
+                state: terminal_state.clone(),
             },
             DestinationResultDto {
                 destination: NodeIdDto::from_u64(4),
@@ -273,7 +296,7 @@ fn routing_response(paths_requested: bool, completion: CompletionReasonDto) -> R
             },
             DestinationResultDto {
                 destination: NodeIdDto::from_u64(5),
-                state: DestinationStateDto::Incomplete,
+                state: terminal_state,
             },
         ],
         profile: RelationProfileDto::default(),
@@ -292,6 +315,7 @@ fn runtime_diagnostics(
     completion: CompletionReasonDto,
     partitioned: bool,
     cuda: bool,
+    paths_requested: bool,
 ) -> RuntimeDiagnosticsDto {
     RuntimeDiagnosticsDto {
         request_id: RequestIdDto::from_u64(9),
@@ -307,10 +331,12 @@ fn runtime_diagnostics(
         reserved_working_bytes: count(8_192),
         admission_duration: DurationDto::default(),
         execution_duration: DurationDto::default(),
+        first_destination_duration: Some(DurationDto::default()),
+        reconstruction_duration: DurationDto::default(),
         completion_reason: completion,
-        search: search_diagnostics(),
+        search: search_diagnostics(completion, paths_requested),
         partitioned_cpu: partitioned.then(partitioned_diagnostics),
-        cuda: cuda.then(|| cuda_diagnostics(u64::from(partitioned) + 1)),
+        cuda: cuda.then(|| cuda_diagnostics(u64::from(partitioned) + 1, paths_requested)),
     }
 }
 
@@ -362,22 +388,23 @@ fn routing_states_policies_paths_and_runtime_diagnostics_round_trip() {
             ExecutorDto::NvidiaCuda,
             ExecutorSelectionReasonDto::RequiredCudaEligible,
             CompletionReasonDto::Cancelled,
-            true,
-            true,
-        ),
-        (
-            ExecutorDto::CpuReference,
-            ExecutorSelectionReasonDto::CpuFallback,
-            CompletionReasonDto::AllDestinationsFinalized,
             false,
-            false,
+            true,
         ),
     ];
     for (index, (executor, reason, completion, partitioned, cuda)) in cases.into_iter().enumerate()
     {
+        let paths_requested = index % 2 == 0;
         let value = EngineRoutingResponseDto {
-            response: routing_response(index % 2 == 0, completion),
-            diagnostics: runtime_diagnostics(executor, reason, completion, partitioned, cuda),
+            response: routing_response(paths_requested, completion),
+            diagnostics: runtime_diagnostics(
+                executor,
+                reason,
+                completion,
+                partitioned,
+                cuda,
+                paths_requested,
+            ),
         };
         let encoded = encode(&value, &limits).unwrap();
         assert_eq!(
@@ -405,6 +432,7 @@ fn routing_states_policies_paths_and_runtime_diagnostics_round_trip() {
             CompletionReasonDto::FrontierExhausted,
             false,
             false,
+            false,
         );
         diagnostics.attempted_cuda = true;
         diagnostics.cuda_fallback_reason = Some(fallback);
@@ -414,6 +442,138 @@ fn routing_states_policies_paths_and_runtime_diagnostics_round_trip() {
             diagnostics
         );
     }
+}
+
+#[test]
+fn runtime_diagnostic_timing_and_response_reconciliation_are_canonical_invariants() {
+    let limits = ApiLimits::default();
+    let mut value = EngineRoutingResponseDto {
+        response: routing_response(true, CompletionReasonDto::AllDestinationsFinalized),
+        diagnostics: runtime_diagnostics(
+            ExecutorDto::CpuReference,
+            ExecutorSelectionReasonDto::CpuOnlyPolicy,
+            CompletionReasonDto::AllDestinationsFinalized,
+            false,
+            false,
+            true,
+        ),
+    };
+    value.diagnostics.execution_duration = DurationDto {
+        seconds: count(1),
+        nanoseconds: 0,
+    };
+    value.diagnostics.reconstruction_duration = DurationDto {
+        seconds: count(2),
+        nanoseconds: 0,
+    };
+    value.diagnostics.search.path_reconstruction_duration =
+        value.diagnostics.reconstruction_duration.clone();
+    assert!(matches!(
+        encode(&value, &limits),
+        Err(ApiCodecError::Malformed {
+            kind: MalformedKind::ContextualValidation,
+            ..
+        })
+    ));
+
+    value.diagnostics.reconstruction_duration = DurationDto::default();
+    value.diagnostics.search.path_reconstruction_duration = DurationDto::default();
+    value.diagnostics.search.exact_destinations = count(1);
+    assert!(matches!(
+        encode(&value, &limits),
+        Err(ApiCodecError::Malformed {
+            kind: MalformedKind::ContextualValidation,
+            ..
+        })
+    ));
+
+    let mut invalid_completion = EngineRoutingResponseDto {
+        response: routing_response(true, CompletionReasonDto::AllDestinationsFinalized),
+        diagnostics: runtime_diagnostics(
+            ExecutorDto::CpuReference,
+            ExecutorSelectionReasonDto::CpuOnlyPolicy,
+            CompletionReasonDto::AllDestinationsFinalized,
+            false,
+            false,
+            true,
+        ),
+    };
+    invalid_completion.response.completion_reason = CompletionReasonDto::BudgetExhausted;
+    invalid_completion.diagnostics.completion_reason = CompletionReasonDto::BudgetExhausted;
+    assert!(matches!(
+        encode(&invalid_completion, &limits),
+        Err(ApiCodecError::Malformed {
+            kind: MalformedKind::ContextualValidation,
+            ..
+        })
+    ));
+
+    let mut missing_first = EngineRoutingResponseDto {
+        response: routing_response(true, CompletionReasonDto::AllDestinationsFinalized),
+        diagnostics: runtime_diagnostics(
+            ExecutorDto::CpuReference,
+            ExecutorSelectionReasonDto::CpuOnlyPolicy,
+            CompletionReasonDto::AllDestinationsFinalized,
+            false,
+            false,
+            true,
+        ),
+    };
+    missing_first.diagnostics.first_destination_duration = None;
+    missing_first.diagnostics.search.first_destination_duration = None;
+    assert!(matches!(
+        encode(&missing_first, &limits),
+        Err(ApiCodecError::Malformed {
+            kind: MalformedKind::ContextualValidation,
+            ..
+        })
+    ));
+
+    let mut invalid_cuda_scope = EngineRoutingResponseDto {
+        response: routing_response(false, CompletionReasonDto::AllDestinationsFinalized),
+        diagnostics: runtime_diagnostics(
+            ExecutorDto::NvidiaCuda,
+            ExecutorSelectionReasonDto::PreferredCudaEligible,
+            CompletionReasonDto::AllDestinationsFinalized,
+            false,
+            true,
+            false,
+        ),
+    };
+    invalid_cuda_scope.diagnostics.execution_duration = DurationDto {
+        seconds: count(1),
+        nanoseconds: 0,
+    };
+    invalid_cuda_scope
+        .diagnostics
+        .cuda
+        .as_mut()
+        .expect("CUDA diagnostics fixture")
+        .queue_duration = DurationDto {
+        seconds: count(2),
+        nanoseconds: 0,
+    };
+    assert!(matches!(
+        encode(&invalid_cuda_scope, &limits),
+        Err(ApiCodecError::Malformed {
+            kind: MalformedKind::ContextualValidation,
+            ..
+        })
+    ));
+
+    let invalid_hydration = HydrationDiagnosticsDto {
+        requested_nodes: count(1),
+        found_nodes: count(1),
+        missing_nodes: count(1),
+        ..HydrationDiagnosticsDto::default()
+    };
+    assert!(matches!(
+        encode(&invalid_hydration, &limits),
+        Err(ApiCodecError::Malformed {
+            kind: MalformedKind::ContextualValidation,
+            ..
+        })
+    ));
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -486,6 +646,15 @@ fn benchmark_corpus() -> Vec<(&'static str, BenchmarkDocument)> {
             .collect(),
         edges: Vec::new(),
         profile: None,
+        diagnostics: HydrationDiagnosticsDto {
+            execution_duration: DurationDto::default(),
+            requested_nodes: count(128),
+            requested_edges: count(0),
+            found_nodes: count(128),
+            missing_nodes: count(0),
+            found_edges: count(0),
+            missing_edges: count(0),
+        },
     };
     let health = benchmark_health();
     let subgraph = SubgraphHandlesDto {

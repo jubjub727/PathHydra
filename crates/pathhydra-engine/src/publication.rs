@@ -7,7 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use pathhydra_routing::{ChunkedRoutingImage, RoutingBundle, RoutingImage, RoutingImageManifest};
+use pathhydra_routing::{
+    ChunkedRoutingImage, PackedRelationProfile, ProfileError, RelationProfile, RoutingBundle,
+    RoutingImage, RoutingImageManifest,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -75,6 +78,7 @@ impl CpuTopology {
                 .expect("validated bundle counts remain representable"),
         }
     }
+    #[cfg(test)]
     pub fn resident(&self) -> Option<Arc<RoutingImage>> {
         match self {
             Self::Resident { image, .. } => Some(Arc::clone(image)),
@@ -97,6 +101,16 @@ impl CpuTopology {
         match self {
             Self::Resident { bundle, .. } => Arc::clone(bundle),
             Self::Partitioned(image) => Arc::clone(image.bundle()),
+        }
+    }
+
+    pub fn pack_profile(
+        &self,
+        profile: &RelationProfile,
+    ) -> Result<PackedRelationProfile, ProfileError> {
+        match self {
+            Self::Resident { image, .. } => profile.pack(image),
+            Self::Partitioned(image) => image.pack_profile(profile),
         }
     }
 
@@ -309,6 +323,7 @@ pub(crate) enum RoutingState {
 }
 
 impl RoutingState {
+    #[cfg(test)]
     pub fn image(&self) -> Result<Arc<RoutingImage>, RoutingUnavailableReason> {
         match self {
             Self::Available { image, .. } => image.cpu.resident().ok_or_else(|| {

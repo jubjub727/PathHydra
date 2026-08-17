@@ -159,6 +159,19 @@ impl CudaPartitionedImage {
         self.cpu_image.adjacency_count()
     }
 
+    /// Largest task set that can coexist for this partitioned image.
+    #[must_use]
+    pub fn maximum_partition_adjacency_count(&self) -> usize {
+        self.cpu_image
+            .bundle()
+            .manifest()
+            .partitions
+            .iter()
+            .map(|partition| usize::try_from(partition.edge_count).unwrap_or(usize::MAX))
+            .max()
+            .unwrap_or(0)
+    }
+
     #[must_use]
     pub fn allocated_bytes(&self) -> usize {
         self.cache.snapshot().current_bytes
@@ -186,10 +199,40 @@ impl CudaPartitionedImage {
         cancellation: &AtomicBool,
         reserved_search_bytes: usize,
     ) -> Result<CudaRouteOutput, CudaError> {
+        let route_started = Instant::now();
         if request.budget() != SearchBudget::Unlimited {
             return Err(CudaError::new(
                 CudaFailureKind::Admission,
                 "finite examined-edge budgets are unsupported by CUDA",
+            ));
+        }
+        let cpu_evidence_working_bytes = if request.return_paths() {
+            Some(
+                self.cpu_image
+                    .estimate_working_set(request)
+                    .map_err(|_| {
+                        CudaError::new(
+                            CudaFailureKind::Admission,
+                            "CPU path-evidence working bytes could not be estimated",
+                        )
+                    })?
+                    .bytes(),
+            )
+        } else {
+            None
+        };
+        let required_search_bytes = crate::estimate_search_bytes_for_request(
+            self.cpu_image.node_count(),
+            self.cpu_image.relation_kind_count(),
+            self.maximum_partition_adjacency_count(),
+            request.destinations().len(),
+            algorithm,
+            cpu_evidence_working_bytes,
+        )?;
+        if reserved_search_bytes < required_search_bytes {
+            return Err(CudaError::new(
+                CudaFailureKind::Admission,
+                "the caller-provided CUDA search reservation is smaller than the request estimate",
             ));
         }
         let origin = self
@@ -498,6 +541,9 @@ impl CudaPartitionedImage {
                 .filter(|&&bits| f64::from_bits(bits).is_finite())
                 .count() as u64
         };
+        let has_present_destination = mapped.iter().any(Option::is_some);
+        let first_destination_duration =
+            (!cancelled && has_present_destination).then(|| route_started.elapsed());
         let destination_started = Instant::now();
         let results: Vec<_> = request
             .destinations()
@@ -546,21 +592,33 @@ impl CudaPartitionedImage {
         timing.destination_completion = timing
             .destination_completion
             .saturating_add(destination_started.elapsed());
-        if request.return_paths() && !cancelled {
-            self.faults.trip(CudaFaultStage::PathEvidence)?;
-            self.faults.pause_path_evidence()?;
-            let (evidence, _, _) = pathhydra_routing::route_partitioned_controlled(
-                &self.cpu_image,
-                request,
-                cancellation,
-            )
-            .map_err(|error| {
-                invariant(&format!(
-                    "same-bundle CPU path evidence pass failed: {error}"
-                ))
-            })?;
+        let mut path_reconstruction_duration = Duration::ZERO;
+        let mut first_destination_duration = if request.return_paths() {
+            None
+        } else {
+            first_destination_duration
+        };
+        if request.return_paths() {
+            if !cancelled {
+                self.faults.trip(CudaFaultStage::PathEvidence)?;
+                self.faults.pause_path_evidence()?;
+            }
+            let (evidence, evidence_diagnostics, _) =
+                pathhydra_routing::route_partitioned_controlled(
+                    &self.cpu_image,
+                    request,
+                    cancellation,
+                )
+                .map_err(|error| {
+                    invariant(&format!(
+                        "same-bundle CPU path evidence pass failed: {error}"
+                    ))
+                })?;
+            path_reconstruction_duration = evidence_diagnostics.path_reconstruction_duration;
             if evidence.completion_reason() != CompletionReason::Cancelled {
                 launch::verify_path_evidence(&response, &evidence)?;
+                first_destination_duration =
+                    has_present_destination.then(|| route_started.elapsed());
             }
             response = evidence;
         }
@@ -614,6 +672,8 @@ impl CudaPartitionedImage {
                 destination_completion_duration: timing.destination_completion,
                 destination_count_checked: request.destinations().len(),
                 atomic_cas_retries,
+                first_destination_duration,
+                path_reconstruction_duration,
             },
         })
     }
@@ -757,6 +817,25 @@ impl CudaPartitionedImage {
                 .relation_relaxation
                 .saturating_add(relaxation_started.elapsed());
             *launches = launches.saturating_add(1);
+
+            // Task buffers are partition-local and can be released as soon as
+            // this stream has consumed them. Retaining every partition's task
+            // arrays until the phase-wide synchronization makes a high-degree
+            // split source accumulate O(E) device memory and can force WDDM
+            // paging on an otherwise bounded topology cache.
+            if queued {
+                if let Err(error) = self.faults.trip(CudaFaultStage::Synchronization) {
+                    self.synchronize_partition_work_after_failure();
+                    return Err(error);
+                }
+                let synchronization_started = Instant::now();
+                self.synchronize_partition_work()?;
+                timing.relation_relaxation = timing
+                    .relation_relaxation
+                    .saturating_add(synchronization_started.elapsed());
+                task_buffers.clear();
+                queued = false;
+            }
         }
         if queued {
             if let Err(error) = self.faults.trip(CudaFaultStage::Synchronization) {
@@ -917,6 +996,22 @@ impl CudaPartitionedImage {
                 .relation_relaxation
                 .saturating_add(relaxation_started.elapsed());
             *launches = launches.saturating_add(1);
+
+            // See the frontier path above: a partition task buffer has no
+            // lifetime beyond the synchronized launch that consumes it.
+            if queued {
+                if let Err(error) = self.faults.trip(CudaFaultStage::Synchronization) {
+                    self.synchronize_partition_work_after_failure();
+                    return Err(error);
+                }
+                let synchronization_started = Instant::now();
+                self.synchronize_partition_work()?;
+                timing.relation_relaxation = timing
+                    .relation_relaxation
+                    .saturating_add(synchronization_started.elapsed());
+                task_buffers.clear();
+                queued = false;
+            }
         }
         if queued {
             if let Err(error) = self.faults.trip(CudaFaultStage::Synchronization) {

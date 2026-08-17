@@ -1,6 +1,9 @@
 use pathhydra_api::{
-    ApiCodecError, ApiErrorCategoryDto, ApiErrorDto, ApiLimits, CanonicalDto, SubgraphHandlesDto,
-    decode, encode,
+    ApiCodecError, ApiErrorCategoryDto, ApiErrorDto, ApiLimits, Binary32Dto, Binary64Dto,
+    CanonicalDto, CodecLimit, EdgeHandleDto, EdgeIdDto, HydrationRequestDto, NodeIdDto,
+    PathStepDto, RelationIdDto, RelationProfileDto, RelationProfileEntryDto, RelationUseDto,
+    RoutePathDto, RoutingRequestDto, SearchBudgetDto, SubgraphHandlesDto, TiePolicyDto, decode,
+    encode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +79,136 @@ fn bounded_encoder_reports_limit_without_reserving_the_global_maximum() {
         encode(&fixture, &limited),
         Err(ApiCodecError::LimitExceeded { .. })
     ));
+}
+
+#[test]
+fn every_semantic_collection_limit_refuses_before_boundary_execution() {
+    fn assert_limit<T: CanonicalDto>(value: &T, limits: &ApiLimits, expected: CodecLimit) {
+        assert!(matches!(
+            encode(value, limits),
+            Err(ApiCodecError::LimitExceeded { limit, .. }) if limit == expected
+        ));
+    }
+
+    let routing = RoutingRequestDto {
+        origin: NodeIdDto::from_u64(1),
+        destinations: vec![NodeIdDto::from_u64(2), NodeIdDto::from_u64(3)],
+        profile: RelationProfileDto::default(),
+        return_paths: false,
+        budget: SearchBudgetDto::Unlimited,
+        tie_policy: TiePolicyDto::StablePredecessor,
+    };
+    assert_limit(
+        &routing,
+        &ApiLimits {
+            maximum_destinations: 1,
+            ..ApiLimits::default()
+        },
+        CodecLimit::Destinations,
+    );
+
+    let profile = RelationProfileDto {
+        entries: vec![
+            RelationProfileEntryDto {
+                relation_kind: RelationIdDto::from_u64(1),
+                relation_use: RelationUseDto::Disabled,
+            },
+            RelationProfileEntryDto {
+                relation_kind: RelationIdDto::from_u64(2),
+                relation_use: RelationUseDto::Disabled,
+            },
+        ],
+    };
+    assert_limit(
+        &profile,
+        &ApiLimits {
+            maximum_profile_entries: 1,
+            ..ApiLimits::default()
+        },
+        CodecLimit::ProfileEntries,
+    );
+
+    let one = Binary32Dto::from_bits(1.0_f32.to_bits());
+    let one64 = Binary64Dto::from_bits(1.0_f64.to_bits());
+    let path = RoutePathDto {
+        origin: NodeIdDto::from_u64(1),
+        destination: NodeIdDto::from_u64(3),
+        logical_distance: Binary64Dto::from_bits(2.0_f64.to_bits()),
+        steps: vec![
+            PathStepDto {
+                edge: EdgeIdDto::from_u64(1),
+                source: NodeIdDto::from_u64(1),
+                destination: NodeIdDto::from_u64(2),
+                relation_kind: RelationIdDto::from_u64(1),
+                base_weight: one.clone(),
+                multiplier: one.clone(),
+                effective_weight: one64.clone(),
+            },
+            PathStepDto {
+                edge: EdgeIdDto::from_u64(2),
+                source: NodeIdDto::from_u64(2),
+                destination: NodeIdDto::from_u64(3),
+                relation_kind: RelationIdDto::from_u64(1),
+                base_weight: one.clone(),
+                multiplier: one,
+                effective_weight: one64,
+            },
+        ],
+    };
+    assert_limit(
+        &path,
+        &ApiLimits {
+            maximum_path_steps: 1,
+            ..ApiLimits::default()
+        },
+        CodecLimit::PathSteps,
+    );
+
+    let hydration = HydrationRequestDto {
+        node_ids: vec![NodeIdDto::from_u64(1)],
+        edge_ids: vec![EdgeIdDto::from_u64(1)],
+        profile: None,
+    };
+    assert_limit(
+        &hydration,
+        &ApiLimits {
+            maximum_hydration_handles: 1,
+            ..ApiLimits::default()
+        },
+        CodecLimit::HydrationHandles,
+    );
+
+    let subgraph = SubgraphHandlesDto {
+        nodes: vec![NodeIdDto::from_u64(1), NodeIdDto::from_u64(2)],
+        edges: vec![
+            EdgeHandleDto {
+                edge: EdgeIdDto::from_u64(1),
+                source: NodeIdDto::from_u64(1),
+                destination: NodeIdDto::from_u64(2),
+            },
+            EdgeHandleDto {
+                edge: EdgeIdDto::from_u64(2),
+                source: NodeIdDto::from_u64(1),
+                destination: NodeIdDto::from_u64(2),
+            },
+        ],
+    };
+    assert_limit(
+        &subgraph,
+        &ApiLimits {
+            maximum_subgraph_nodes: 1,
+            ..ApiLimits::default()
+        },
+        CodecLimit::SubgraphNodes,
+    );
+    assert_limit(
+        &subgraph,
+        &ApiLimits {
+            maximum_subgraph_edges: 1,
+            ..ApiLimits::default()
+        },
+        CodecLimit::SubgraphEdges,
+    );
 }
 
 #[test]

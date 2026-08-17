@@ -3,6 +3,11 @@
 #![feature(stdarch_nvptx)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+//! Root-kernel safety invariant for every unsafe block in this module: the
+//! audited host ABI supplies aligned buffers with the declared lengths and
+//! retains them through synchronization; each thread checks its logical index
+//! before access. Submodules state their more specific invariants locally.
+
 mod arithmetic;
 mod atomic;
 mod benchmark;

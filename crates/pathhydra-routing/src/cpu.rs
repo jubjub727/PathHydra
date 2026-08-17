@@ -6,6 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
+    time::{Duration, Instant},
 };
 
 use pathhydra_core::{BaseWeight, EdgeId};
@@ -157,6 +158,12 @@ pub struct CpuSearchDiagnostics {
     pub missing_destinations: usize,
     pub incomplete_destinations: usize,
     pub path_reconstruction_steps: u64,
+    /// Elapsed executor time until the first present destination became final.
+    /// Request mapping/profile setup is included; missing destinations are
+    /// classified before search and are not counted.
+    pub first_destination_duration: Option<Duration>,
+    /// Time spent reconstructing exact path evidence, excluding search.
+    pub path_reconstruction_duration: Duration,
 }
 
 pub fn estimate_cpu_working_set(
@@ -186,12 +193,22 @@ pub(crate) fn estimate_topology_working_set(
         .adjacency_count()
         .checked_add(1)
         .ok_or(RoutingError::ResourceEstimateOverflow)?;
-    let unique_present = request
-        .destinations()
-        .iter()
-        .filter_map(|id| image.dense_node_id(*id))
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
+    // This estimator runs before the working-set admission is committed. Do
+    // not allocate a temporary set merely to count duplicate destinations:
+    // the caller-bounded destination list is small enough for an allocation-
+    // free exact prefix scan.
+    let mut unique_present = 0_usize;
+    for (index, destination) in request.destinations().iter().enumerate() {
+        let Some(dense) = image.dense_node_id(*destination) else {
+            continue;
+        };
+        if !request.destinations()[..index]
+            .iter()
+            .any(|previous| image.dense_node_id(*previous) == Some(dense))
+        {
+            unique_present += 1;
+        }
+    }
     let maximum_path_steps = if request.return_paths() {
         unique_present
             .checked_mul(nodes.saturating_sub(1))
@@ -267,6 +284,7 @@ pub(crate) fn route_topology_controlled(
     request: &RoutingRequest,
     cancellation: &impl CancellationSignal,
 ) -> Result<(RoutingResponse, CpuSearchDiagnostics), RoutingError> {
+    let route_started = Instant::now();
     let origin = image
         .dense_node_id(request.origin())
         .ok_or(RoutingError::MissingOrigin(request.origin()))?;
@@ -308,6 +326,10 @@ pub(crate) fn route_topology_controlled(
             response,
             CpuSearchDiagnostics {
                 missing_destinations: request.destinations().len(),
+                // Missing destinations are classified before the search and
+                // are deliberately excluded from the first present-target
+                // completion metric.
+                first_destination_duration: None,
                 ..CpuSearchDiagnostics::default()
             },
         ));
@@ -321,13 +343,16 @@ pub(crate) fn route_topology_controlled(
         .then(|| try_filled(node_count, None::<Predecessor>, "predecessor array"))
         .transpose()?;
     let mut frontier = BinaryHeap::new();
+    let maximum_frontier_entries = image
+        .adjacency_count()
+        .checked_add(1)
+        .ok_or(RoutingError::ResourceEstimateOverflow)?;
+    // Reserving the theoretical edge-count maximum up front can itself make
+    // a bounded out-of-core graph unroutable even when the actual frontier is
+    // node-sized. Start with the node bound and make every later growth
+    // fallible before `push`, preserving the typed allocation contract.
     frontier
-        .try_reserve(
-            image
-                .adjacency_count()
-                .checked_add(1)
-                .ok_or(RoutingError::ResourceEstimateOverflow)?,
-        )
+        .try_reserve(maximum_frontier_entries.min(node_count.max(1)))
         .map_err(|_| RoutingError::AllocationFailed {
             structure: "frontier",
         })?;
@@ -340,6 +365,7 @@ pub(crate) fn route_topology_controlled(
     let mut finalized_nodes = 0_u64;
     let mut relaxation_updates = 0_u64;
     let mut frontier_high_water_mark = 1_usize;
+    let mut first_destination_duration = None;
     let mut completion_reason;
 
     if cancellation.is_cancelled() {
@@ -368,6 +394,9 @@ pub(crate) fn route_topology_controlled(
             if pending[index] {
                 pending[index] = false;
                 pending_count -= 1;
+                if !request.return_paths() {
+                    first_destination_duration.get_or_insert_with(|| route_started.elapsed());
+                }
             }
             if pending_count == 0 {
                 completion_reason = CompletionReason::AllDestinationsFinalized;
@@ -419,10 +448,7 @@ pub(crate) fn route_topology_controlled(
                             edge.edge_id(),
                             adjacency,
                         );
-                        frontier.push(FrontierEntry {
-                            distance: candidate,
-                            node: destination,
-                        });
+                        push_frontier(&mut frontier, candidate, destination)?;
                         relaxation_updates = relaxation_updates.saturating_add(1);
                         frontier_high_water_mark = frontier_high_water_mark.max(frontier.len());
                     }
@@ -435,10 +461,7 @@ pub(crate) fn route_topology_controlled(
                             edge.edge_id(),
                             adjacency,
                         );
-                        frontier.push(FrontierEntry {
-                            distance: candidate,
-                            node: destination,
-                        });
+                        push_frontier(&mut frontier, candidate, destination)?;
                         relaxation_updates = relaxation_updates.saturating_add(1);
                         frontier_high_water_mark = frontier_high_water_mark.max(frontier.len());
                     }
@@ -463,8 +486,20 @@ pub(crate) fn route_topology_controlled(
         }
     }
 
+    // A present destination that is never reached becomes completed—not
+    // missing or incomplete—when exhaustion proves it unreachable. Record
+    // that proof as the first completed destination when no reachable target
+    // finalized earlier.
+    if first_destination_duration.is_none()
+        && completion_reason == CompletionReason::FrontierExhausted
+        && pending_count != 0
+    {
+        first_destination_duration = Some(route_started.elapsed());
+    }
+
     let mut results = try_vec(request.destinations().len(), "response entries")?;
     let mut path_reconstruction_steps = 0_u64;
+    let mut path_reconstruction_duration = Duration::ZERO;
     let mut path_cache = request
         .return_paths()
         .then(|| try_filled(node_count, None::<Arc<RoutePath>>, "shared path cache"))
@@ -482,6 +517,7 @@ pub(crate) fn route_topology_controlled(
                     if let Some(path) = &path_cache[dense.as_usize()] {
                         Some(Arc::clone(path))
                     } else {
+                        let reconstruction_started = Instant::now();
                         let path = reconstruct_path(
                             image,
                             &profile,
@@ -493,8 +529,10 @@ pub(crate) fn route_topology_controlled(
                             predecessors,
                             cancellation,
                             &mut path_reconstruction_steps,
-                        )?
-                        .map(Arc::new);
+                        )?;
+                        path_reconstruction_duration = path_reconstruction_duration
+                            .saturating_add(reconstruction_started.elapsed());
+                        let path = path.map(Arc::new);
                         if let Some(path) = &path {
                             path_cache[dense.as_usize()] = Some(Arc::clone(path));
                         } else {
@@ -505,6 +543,9 @@ pub(crate) fn route_topology_controlled(
                 } else {
                     None
                 };
+                if request.return_paths() && path.is_some() {
+                    first_destination_duration.get_or_insert_with(|| route_started.elapsed());
+                }
                 DestinationState::Exact(ExactRoute::new(distance, path))
             } else if matches!(
                 completion_reason,
@@ -542,6 +583,8 @@ pub(crate) fn route_topology_controlled(
             .filter(|r| matches!(r.state(), DestinationState::Incomplete))
             .count(),
         path_reconstruction_steps,
+        first_destination_duration,
+        path_reconstruction_duration,
     };
     let response = RoutingResponse::new(
         request.origin(),
@@ -553,6 +596,20 @@ pub(crate) fn route_topology_controlled(
         completion_reason,
     );
     Ok((response, diagnostics))
+}
+
+fn push_frontier(
+    frontier: &mut BinaryHeap<FrontierEntry>,
+    distance: f64,
+    node: DenseNodeId,
+) -> Result<(), RoutingError> {
+    frontier
+        .try_reserve(1)
+        .map_err(|_| RoutingError::AllocationFailed {
+            structure: "frontier",
+        })?;
+    frontier.push(FrontierEntry { distance, node });
+    Ok(())
 }
 
 fn try_vec<T>(capacity: usize, structure: &'static str) -> Result<Vec<T>, RoutingError> {
@@ -736,6 +793,9 @@ mod tests {
         .unwrap();
         assert_eq!(product, f64::from(subnormal) * f64::from(f32::MAX));
         assert_eq!(accumulate_distance(1.0, product).unwrap(), 1.0 + product);
+        let maximum_product =
+            effective_weight(BaseWeight::MAX, RelationMultiplier::new(f32::MAX).unwrap()).unwrap();
+        assert_eq!(maximum_product.to_bits(), f64::from(f32::MAX).to_bits());
         assert!(accumulate_distance(f64::MAX, f64::MAX).is_err());
     }
 }

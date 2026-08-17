@@ -159,10 +159,11 @@ PTX audit confirms the four phase entry points, `atom.global.cas.b64`, separate
 covers the six execution modes, 1,025 parallel relations from one source,
 forced source splits, normal and reverse partition schedules, sparse huge delta
 buckets, zero closure, cache churn, lane isolation, exact path evidence, and
-  new scratch/compaction/evidence faults. NVIDIA Compute Sanitizer 2026.2.1 ran
-  all 14 tests in that complete agreement binary through `memcheck` and
-  `racecheck` with the repository safety script. Racecheck uses its documented
-  blocking-launch mode because WDDM otherwise overflows the tool's launch
-  tracker during the deliberate concurrent-host-launch test; the ordinary CUDA
-  suite retains that concurrent scheduling coverage. Memcheck reported 0 errors,
-  and racecheck reported 0 hazards, 0 errors, and 0 warnings.
+new scratch/compaction/evidence faults. NVIDIA Compute Sanitizer 2026.2.1 ran
+the settled Plan 10 15-test agreement binary through `memcheck` and
+`racecheck` with the repository safety script. Racecheck uses its documented
+blocking-launch mode because WDDM otherwise overflows the tool's launch
+tracker during the deliberate concurrent-host-launch test; the ordinary CUDA
+suite retains that concurrent scheduling coverage. Memcheck reported 0 errors,
+and racecheck reported 0 hazards, 0 errors, and 0 warnings. The matrix includes
+the end-to-end unrepresentable-delta refusal case.

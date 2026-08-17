@@ -446,6 +446,7 @@ pub(crate) fn route(
     cancellation: &AtomicBool,
     reserved_search_bytes: usize,
 ) -> Result<CudaRouteOutput, CudaError> {
+    let route_started = Instant::now();
     if request.budget() != SearchBudget::Unlimited {
         return Err(CudaError::new(
             CudaFailureKind::Admission,
@@ -453,6 +454,34 @@ pub(crate) fn route(
         ));
     }
     let image = resident.cpu_image();
+    let cpu_evidence_working_bytes = if request.return_paths() {
+        Some(
+            pathhydra_routing::estimate_cpu_working_set(image, request)
+                .map_err(|_| {
+                    CudaError::new(
+                        CudaFailureKind::Admission,
+                        "CPU path-evidence working bytes could not be estimated",
+                    )
+                })?
+                .bytes(),
+        )
+    } else {
+        None
+    };
+    let required_search_bytes = crate::estimate_search_bytes_for_request(
+        image.node_count(),
+        image.relation_kind_count(),
+        image.adjacency_count(),
+        request.destinations().len(),
+        algorithm,
+        cpu_evidence_working_bytes,
+    )?;
+    if reserved_search_bytes < required_search_bytes {
+        return Err(CudaError::new(
+            CudaFailureKind::Admission,
+            "the caller-provided CUDA search reservation is smaller than the request estimate",
+        ));
+    }
     let origin = image.dense_node_id(request.origin()).ok_or_else(|| {
         CudaError::new(
             CudaFailureKind::KernelInvariant,
@@ -603,6 +632,9 @@ pub(crate) fn route(
             .filter(|&&bits| f64::from_bits(bits).is_finite())
             .count() as u64
     };
+    let has_present_destination = mapped_destinations.iter().any(Option::is_some);
+    let first_destination_duration =
+        (!cancelled && has_present_destination).then(|| route_started.elapsed());
     let destination_started = Instant::now();
     let results: Vec<DestinationResult> = request
         .destinations()
@@ -649,19 +681,31 @@ pub(crate) fn route(
         (counters[0], finalized_nodes),
         completion_reason,
     );
-    if request.return_paths() && !cancelled {
+    let mut path_reconstruction_duration = Duration::ZERO;
+    let mut first_destination_duration = if request.return_paths() {
+        None
+    } else {
+        first_destination_duration
+    };
+    if request.return_paths() {
         let faults = resident.fault_injection();
-        faults.trip(crate::CudaFaultStage::PathEvidence)?;
-        faults.pause_path_evidence()?;
-        let (evidence, _) = pathhydra_routing::route_controlled(image, request, cancellation)
-            .map_err(|error| {
+        if !cancelled {
+            faults.trip(crate::CudaFaultStage::PathEvidence)?;
+            faults.pause_path_evidence()?;
+        }
+        let (evidence, evidence_diagnostics) =
+            pathhydra_routing::route_controlled(image, request, cancellation).map_err(|error| {
                 CudaError::new(
                     CudaFailureKind::KernelInvariant,
                     format!("same-image CPU path evidence pass failed: {error}"),
                 )
             })?;
+        path_reconstruction_duration = evidence_diagnostics.path_reconstruction_duration;
         if evidence.completion_reason() != CompletionReason::Cancelled {
             verify_path_evidence(&response, &evidence)?;
+            // A requested path is not complete until its stable predecessor
+            // evidence has been reconstructed and verified.
+            first_destination_duration = has_present_destination.then(|| route_started.elapsed());
         }
         response = evidence;
     }
@@ -706,6 +750,8 @@ pub(crate) fn route(
             destination_completion_duration,
             destination_count_checked: request.destinations().len(),
             atomic_cas_retries,
+            first_destination_duration,
+            path_reconstruction_duration,
         },
     })
 }

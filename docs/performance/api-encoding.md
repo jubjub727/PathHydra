@@ -8,7 +8,7 @@ canonical JSON. Binary comparator: Postcard 1.1.3, dev-only.
 ## Reproduction
 
 ```powershell
-cargo test -p pathhydra-api --release --test encoding encoding_candidate_measurements -- --ignored --nocapture
+cargo test -p pathhydra-api --all-features --release --test encoding encoding_candidate_measurements -- --ignored --exact --nocapture
 ```
 
 The ignored evidence test uses seven samples of 50 iterations after release
@@ -22,16 +22,16 @@ decode could be timed.
 
 | workload | encoding | bytes | encode ns/op min / median / max | decode ns/op min / median / max | correct |
 | --- | --- | ---: | ---: | ---: | --- |
-| routing-request | JSON | 1,824 | 3,744 / 3,768 / 4,160 | 17,014 / 17,526 / 21,558 | true |
-| routing-request | Postcard | 563 | 880 / 882 / 934 | unsupported | false |
-| route-path | JSON | 42,071 | 392,042 / 405,536 / 490,036 | 668,884 / 687,704 / 760,532 | true |
-| route-path | Postcard | 14,461 | 9,934 / 9,960 / 10,292 | 169,418 / 172,788 / 178,712 | true |
-| hydration-response | JSON | 18,807 | 158,456 / 161,656 / 242,488 | 249,960 / 256,226 / 260,876 | true |
-| hydration-response | Postcard | 8,385 | 3,302 / 3,316 / 4,342 | unsupported | false |
-| health | JSON | 1,941 | 2,286 / 2,288 / 2,310 | 9,164 / 9,360 / 12,718 | true |
-| health | Postcard | 211 | 430 / 432 / 488 | unsupported | false |
-| large-subgraph | JSON | 679,980 | 11,884,702 / 12,166,512 / 12,508,110 | 18,636,218 / 18,858,926 / 20,288,900 | true |
-| large-subgraph | Postcard | 279,984 | 236,622 / 249,806 / 272,134 | 2,898,306 / 2,947,932 / 3,056,798 | true |
+| routing-request | JSON | 1,824 | 3,582 / 3,692 / 3,802 | 16,670 / 16,938 / 18,580 | true |
+| routing-request | Postcard | 563 | 806 / 806 / 834 | unsupported | false |
+| route-path | JSON | 42,071 | 379,030 / 380,492 / 529,770 | 634,232 / 636,700 / 644,654 | true |
+| route-path | Postcard | 14,461 | 9,934 / 9,942 / 10,326 | 165,524 / 166,810 / 167,646 | true |
+| hydration-response | JSON | 19,000 | 159,106 / 159,752 / 160,318 | 250,306 / 250,830 / 257,828 | true |
+| hydration-response | Postcard | 8,404 | 3,526 / 3,536 / 3,698 | unsupported | false |
+| health | JSON | 1,941 | 2,346 / 2,354 / 2,422 | 8,788 / 8,828 / 10,996 | true |
+| health | Postcard | 211 | 430 / 436 / 494 | unsupported | false |
+| large-subgraph | JSON | 679,980 | 10,086,098 / 10,226,252 / 10,351,308 | 17,915,424 / 18,117,438 / 18,770,526 | true |
+| large-subgraph | Postcard | 279,984 | 234,374 / 239,970 / 244,158 | 2,774,730 / 2,829,880 / 2,849,830 | true |
 
 The corpus shapes are:
 

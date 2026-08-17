@@ -185,12 +185,13 @@ impl GraphEngine {
             lock: "published routing state",
         })?;
         let canonical_profile = if let Some(profile) = &request.profile {
-            let image = published
-                .image()
+            let execution = published
+                .execution()
                 .map_err(HydrationError::RoutingUnavailable)?;
             Some(
-                profile
-                    .pack(&image)
+                execution
+                    .cpu
+                    .pack_profile(profile)
                     .map_err(|error| HydrationError::InvalidProfile(error.to_string()))?
                     .canonical()
                     .clone(),

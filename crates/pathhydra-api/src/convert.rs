@@ -410,8 +410,36 @@ fn hydrated_edge(value: &HydratedEdge) -> HydratedEdgeDto {
         },
     }
 }
+
+fn hydration_diagnostics(
+    requested_nodes: usize,
+    requested_edges: usize,
+    found_nodes: usize,
+    found_edges: usize,
+) -> HydrationDiagnosticsDto {
+    HydrationDiagnosticsDto {
+        execution_duration: DurationDto::default(),
+        requested_nodes: count(requested_nodes),
+        requested_edges: count(requested_edges),
+        found_nodes: count(found_nodes),
+        missing_nodes: count(requested_nodes.saturating_sub(found_nodes)),
+        found_edges: count(found_edges),
+        missing_edges: count(requested_edges.saturating_sub(found_edges)),
+    }
+}
+
 impl From<&HydrationResponse> for HydrationResponseDto {
     fn from(value: &HydrationResponse) -> Self {
+        let found_nodes = value
+            .nodes
+            .iter()
+            .filter(|result| matches!(&result.state, HydratedNodeState::Found(_)))
+            .count();
+        let found_edges = value
+            .edges
+            .iter()
+            .filter(|result| matches!(&result.state, HydratedEdgeState::Found(_)))
+            .count();
         Self {
             nodes: value
                 .nodes
@@ -440,6 +468,12 @@ impl From<&HydrationResponse> for HydrationResponseDto {
                 })
                 .collect(),
             profile: value.profile.as_ref().map(Into::into),
+            diagnostics: hydration_diagnostics(
+                value.nodes.len(),
+                value.edges.len(),
+                found_nodes,
+                found_edges,
+            ),
         }
     }
 }
@@ -452,6 +486,12 @@ impl From<&HydratedPath> for HydratedPathDto {
             numeric_policy: value.numeric_policy.into(),
             tie_policy: value.tie_policy.into(),
             profile: (&value.profile).into(),
+            diagnostics: hydration_diagnostics(
+                value.nodes.len(),
+                value.edges.len(),
+                value.nodes.len(),
+                value.edges.len(),
+            ),
         }
     }
 }
@@ -474,6 +514,18 @@ impl From<&HydratedSubgraph> for HydratedSubgraphDto {
                 .collect(),
             profile: value.profile.as_ref().map(Into::into),
             complete: value.complete,
+            diagnostics: hydration_diagnostics(
+                value
+                    .nodes
+                    .len()
+                    .saturating_add(value.missing_node_ids.len()),
+                value
+                    .edges
+                    .len()
+                    .saturating_add(value.missing_edge_ids.len()),
+                value.nodes.len(),
+                value.edges.len(),
+            ),
         }
     }
 }
@@ -564,6 +616,12 @@ impl From<&CpuSearchDiagnostics> for CpuSearchDiagnosticsDto {
             missing_destinations: count(value.missing_destinations),
             incomplete_destinations: count(value.incomplete_destinations),
             path_reconstruction_steps: DecimalU64Dto::from_u64(value.path_reconstruction_steps),
+            first_destination_duration: value
+                .first_destination_duration
+                .map(DurationDto::from_duration),
+            path_reconstruction_duration: DurationDto::from_duration(
+                value.path_reconstruction_duration,
+            ),
         }
     }
 }
@@ -635,6 +693,12 @@ impl From<&CudaRequestDiagnostics> for CudaRequestDiagnosticsDto {
             ),
             destination_count_checked: count(value.destination_count_checked),
             atomic_cas_retries: DecimalU64Dto::from_u64(value.atomic_cas_retries),
+            first_destination_duration: value
+                .first_destination_duration
+                .map(DurationDto::from_duration),
+            path_reconstruction_duration: DurationDto::from_duration(
+                value.path_reconstruction_duration,
+            ),
         }
     }
 }
@@ -654,6 +718,10 @@ impl From<&RuntimeDiagnostics> for RuntimeDiagnosticsDto {
             reserved_working_bytes: count(value.reserved_working_bytes),
             admission_duration: DurationDto::from_duration(value.admission_duration),
             execution_duration: DurationDto::from_duration(value.execution_duration),
+            first_destination_duration: value
+                .first_destination_duration
+                .map(DurationDto::from_duration),
+            reconstruction_duration: DurationDto::from_duration(value.reconstruction_duration),
             completion_reason: value.completion_reason.into(),
             search: (&value.search).into(),
             partitioned_cpu: value.partitioned_cpu.as_ref().map(Into::into),

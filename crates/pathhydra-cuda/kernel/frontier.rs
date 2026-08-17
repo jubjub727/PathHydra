@@ -1,3 +1,11 @@
+//! Frontier-kernel safety invariant for every unsafe block in this module:
+//! the audited host launch supplies aligned device arrays with the declared
+//! ABI lengths, retains them through synchronization, and grants mutation only
+//! for distance, active, status, and counter buffers. Matching count checks
+//! guard each task, node, relation, and edge access.
+
+use core::arch::nvptx::{_block_dim_x, _syncthreads, _thread_idx_x};
+
 use crate::{
     arithmetic::{global_thread_index, separate_add, separate_multiply},
     atomic::{add, distance_min, increment, load_u32, load_u64, store_u32},
@@ -10,6 +18,8 @@ pub const STATUS_COUNTER_OVERFLOW: u32 = 4;
 
 /// Relaxes one compacted resident frontier task per CUDA thread.
 #[no_mangle]
+/// # Safety
+/// All arguments satisfy the module frontier-kernel safety invariant.
 pub unsafe extern "ptx-kernel" fn pathhydra_frontier_phase(
     task_edges: *const u64,
     task_sources: *const u32,
@@ -29,6 +39,46 @@ pub unsafe extern "ptx-kernel" fn pathhydra_frontier_phase(
     counters: *mut u64,
 ) {
     let task = global_thread_index();
+    if unsafe { _thread_idx_x() } == 0 && unsafe { load_u32(status) } == STATUS_SUCCESS {
+        let end = task
+            .saturating_add(unsafe { _block_dim_x() } as usize)
+            .min(task_count as usize);
+        let mut attempts = 0_u64;
+        for index in task..end {
+            let edge = unsafe { *task_edges.add(index) };
+            if edge >= adjacency_count {
+                unsafe { store_u32(status, STATUS_INVALID_INDEX) };
+                break;
+            }
+            let source = unsafe { *task_sources.add(index) };
+            if source >= node_count {
+                unsafe { store_u32(status, STATUS_INVALID_INDEX) };
+                break;
+            }
+            let relation = unsafe { *relation_indexes.add(edge as usize) };
+            if relation >= relation_count {
+                unsafe { store_u32(status, STATUS_INVALID_INDEX) };
+                break;
+            }
+            let enabled = unsafe { *relation_enabled.add(relation as usize) };
+            if enabled > 1 {
+                unsafe { store_u32(status, STATUS_INVALID_ARITHMETIC) };
+                break;
+            }
+            attempts = attempts.saturating_add(u64::from(enabled));
+        }
+        if unsafe { load_u32(status) } == STATUS_SUCCESS {
+            let examined = (end - task) as u64;
+            let _ = unsafe { add(counters, 0, examined, status) };
+            if unsafe { load_u32(status) } == STATUS_SUCCESS {
+                let _ = unsafe { add(counters, 1, attempts, status) };
+            }
+        }
+    }
+    // Every thread must reach the barrier, including the inactive tail of the
+    // final block. The block leader has validated and accounted for the exact
+    // compacted task range before any thread relaxes an edge.
+    unsafe { _syncthreads() };
     if task >= task_count as usize || unsafe { load_u32(status) } != STATUS_SUCCESS {
         return;
     }
@@ -41,19 +91,30 @@ pub unsafe extern "ptx-kernel" fn pathhydra_frontier_phase(
         unsafe { store_u32(status, STATUS_INVALID_INDEX) };
         return;
     }
-    if unsafe { !increment(counters, 0, status) } {
-        return;
-    }
     unsafe {
         relax_one(
-            destinations, relation_indexes, base_weight_bits, edge as usize, node_count,
-            relation_enabled, multiplier_bits, relation_count, source, next_active_sources,
-            distance_bits, changed, status, counters,
+            destinations,
+            relation_indexes,
+            base_weight_bits,
+            edge as usize,
+            node_count,
+            relation_enabled,
+            multiplier_bits,
+            relation_count,
+            source,
+            next_active_sources,
+            distance_bits,
+            changed,
+            status,
+            counters,
         )
     }
 }
 
 #[allow(clippy::too_many_arguments)]
+/// # Safety
+/// All pointers satisfy the module invariant and the caller has checked
+/// `edge`, `source`, and the declared node/relation/adjacency counts.
 pub unsafe fn relax_one(
     destinations: *const u32,
     relation_indexes: *const u32,
@@ -83,9 +144,6 @@ pub unsafe fn relax_one(
     if enabled == 0 {
         return;
     }
-    if unsafe { !increment(counters, 1, status) } {
-        return;
-    }
     let destination = unsafe { *destinations.add(edge) };
     if destination >= node_count {
         unsafe { store_u32(status, STATUS_INVALID_INDEX) };
@@ -106,8 +164,9 @@ pub unsafe fn relax_one(
         unsafe { store_u32(status, STATUS_INVALID_ARITHMETIC) };
         return;
     }
-    let (updated, retries) = unsafe { distance_min(distance_bits.add(destination as usize), candidate) };
-    if unsafe { !add(counters, 4, retries, status) } {
+    let (updated, retries) =
+        unsafe { distance_min(distance_bits.add(destination as usize), candidate) };
+    if retries != 0 && unsafe { !add(counters, 4, retries, status) } {
         return;
     }
     if updated {
@@ -119,6 +178,9 @@ pub unsafe fn relax_one(
     }
 }
 
+/// # Safety
+/// `offsets` contains `node_count + 1` validated monotonic entries and remains
+/// live for this call; `edge` is checked against `adjacency_count`.
 pub unsafe fn csr_source(
     offsets: *const u64,
     node_count: u32,

@@ -21,7 +21,7 @@ mixed locality required 9 instead of 27. The result remained bit-exact. These
 figures demonstrate removal of unrelated partition work, not a general
 throughput claim.
 
-## Topology larger than local device residency
+## Historical Plan-06 topology proof
 
 The manual scale gate writes its generated bundle beneath the ignored `target`
 directory and defaults explicitly to the required 12-GiB target:
@@ -56,12 +56,44 @@ or device memory. This run used the explicit host-loading/copying/ready/in-use
 cache lifecycle and completion-event-gated eviction. The generated 12 GiB child was deleted after validation; it
 is reproducible and is intentionally not committed.
 
+## Superseded Plan-10 bundle regression after task compaction
+
+Plan 10 reran the capacity gate after graph-parallel task compaction. The
+two-node workload above had become an unhelpful single-address atomic hotspot,
+so the current generator retains one 644,245,096-edge origin expansion but
+fans it across 1,048,576 destinations. Every destination still has the exact
+analytic distance `1.0`, and every CPU/CUDA route still reads all 922
+partitions. The command was:
+
+```powershell
+cargo run -p pathhydra-bench --release --features cuda -- --suite scale target/pathhydra-scale-fanout-12gib 12
+```
+
+The 12,901,838,083-byte bundle generated in 56.100900 s. Cold/warm CPU routes
+were exact in 40.718706/40.576873 s. Partitioned CUDA Frontier was exact in
+50.670165 s and Delta 0.1 in 80.109480 s. All pre-cancelled rows returned
+`cancelled`; restart validation took 37.915033 s and reported `rebuilt=false`.
+Peak process working set was 213,684,224 bytes, observed device use increased
+by 1,267,204,096 bytes, host cache/staging high-water was
+55,923,904/13,980,976 bytes, and device cache high-water was 16,777,152 bytes.
+The run proved bounded partitioned execution over a bundle larger than device
+memory, but it did not prove the stricter Plan-10
+topology-larger-than-device condition. `topology.bin` was 7,730,974,344 bytes
+(about 7.2 GiB); the rest of the 12.9-GB bundle was CPU-only stable-edge
+evidence. The final generator therefore sizes CUDA-consumed topology bytes,
+uses a fresh directory, and must be rerun with:
+
+```powershell
+cargo run -p pathhydra-bench --release --features cuda -- --suite scale target/pathhydra-scale-topology-12gib 12
+```
+
 ## DirectStorage gate
 
-Conventional checked I/O was not the repeatable dominant stage in the scale
-result: the CPU file pass completed in about 35 seconds while partitioned CUDA
-processing took about 571 seconds. Device work, synchronization, and eviction
-amplification dominate this workload, so no DirectStorage spike or production
+The current scale report separates phases. Frontier's 50.670165 s comprised
+18.129746 s of partition scheduling/I/O, 1.343365 s of task compaction, and
+31.047982 s of relation relaxation. Delta's 80.109480 s comprised
+36.088368 s, 2.646607 s, and 41.098345 s in those stages. File transport is
+material but not repeatably dominant, so no DirectStorage spike or production
 dependency was added. Conventional bounded worker reads and explicit CUDA
 copies remain the portable correctness baseline. This result is a capacity and
 exactness proof only; it is explicitly not a CPU or CUDA speedup claim.
