@@ -1,6 +1,6 @@
 use std::{error::Error, fmt};
 
-use pathhydra_core::{InvalidBaseWeight, MAX_NODE_PAYLOAD_BYTES, NodeId, RelationId};
+use pathhydra_core::{CandidateId, InvalidBaseWeight, MAX_NODE_PAYLOAD_BYTES, NodeId, RelationId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecordKind {
@@ -53,6 +53,13 @@ pub enum CatalogError {
     MissingEdgeRelationKind {
         relation_kind_id: RelationId,
     },
+    InvalidBatch {
+        reason: String,
+    },
+    InvalidCandidateDependency {
+        candidate_id: CandidateId,
+        reason: String,
+    },
     CorruptRecord {
         key_space: &'static str,
         record_id: String,
@@ -99,6 +106,14 @@ impl fmt::Display for CatalogError {
             Self::MissingEdgeRelationKind { relation_kind_id } => write!(
                 formatter,
                 "edge relation kind {relation_kind_id} is not confirmed"
+            ),
+            Self::InvalidBatch { reason } => write!(formatter, "invalid candidate batch: {reason}"),
+            Self::InvalidCandidateDependency {
+                candidate_id,
+                reason,
+            } => write!(
+                formatter,
+                "invalid dependency for candidate {candidate_id}: {reason}"
             ),
             Self::CorruptRecord {
                 key_space,

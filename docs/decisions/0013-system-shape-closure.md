@@ -29,10 +29,12 @@ implementation; discarded alternatives have no compatibility status.
 
 ## Storage, publication, and hydration
 
-- Decision 0010 selects the default metadata family plus eight named column
+- Decision 0010 selected the default metadata family plus eight named column
   families, fixed big-endian durable keys, exact length-prefixed values, one
   outgoing and one incoming `(NodeId, EdgeId)` index entry per edge, four
   background jobs, and fixed prefix extraction on the adjacency families.
+- Decision 0014 extends the current pre-release layout with the ninth
+  `relation_popularity` family for atomic batch usage maintenance.
 - Decision 0008 selects immutable, independently checksummed source segments
   for the routing bundle, including bounded source splitting for high degree.
 - Decision 0010 retains complete deterministic bundle rebuild and one-operation

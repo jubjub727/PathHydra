@@ -11,7 +11,10 @@ mod name;
 mod payload;
 mod weight;
 
-pub use candidate::{Candidate, ConfirmedRecord, NodeRecord, RelationRecord};
+pub use candidate::{
+    Candidate, CandidateNodeReference, CandidateRelationReference, ConfirmedRecord, NodeRecord,
+    RelationRecord,
+};
 pub use edge::EdgeRecord;
 pub use id::{CandidateId, EdgeId, NodeId, RelationId};
 pub use name::{NodeName, RelationName};

@@ -18,26 +18,78 @@ use pathhydra_engine::{
 };
 use pathhydra_routing::{DestinationState, RelationProfile, RoutingRequest, RoutingResponse};
 use pathhydra_store::{
-    CheckpointRequest, OperationalPathRequest, PathTarget, ReadOnlyCatalog, ResourceKind,
-    RestoreRequest, VerificationLimits, validate_operational_paths,
+    BatchNodeReference, BatchRelationReference, CandidateBatchEntry, CheckpointRequest,
+    OperationalPathRequest, PathTarget, ReadOnlyCatalog, ResourceKind, RestoreRequest,
+    VerificationLimits, validate_operational_paths,
 };
 use pathhydra_subgraph::Subgraph;
 
 use crate::convert::{capabilities, edge_removal_outcome, node_removal_outcome};
 use crate::{
-    ApiError, ApiLimits, Binary32Dto, CancellationOutcomeDto, CandidateDto, CandidateIdDto,
-    CapabilitiesDto, CheckpointReportDto, CompactionReportDto, DecimalU64Dto, DurationDto,
-    EdgeIdDto, EdgeRecordDto, EngineRestoreReportDto, EngineRoutingResponseDto, HealthDto,
-    HydratedPathDto, HydratedSubgraphDto, HydrationRequestDto, HydrationResponseDto,
-    ImageBuildReportDto, LifecycleSnapshotDto, MutationOutcomeDto, NodeIdDto, NodeRecordDto,
-    PathHydraConfigDto, PayloadDto, RelationIdDto, RelationKindRecordDto, RelationProfileDto,
-    RequestIdDto, RoutingRequestDto, ShutdownReportDto, SubgraphHandlesDto, VerificationLimitsDto,
+    ApiError, ApiLimits, BatchNodeReferenceDto, BatchRelationReferenceDto, Binary32Dto,
+    CancellationOutcomeDto, CandidateBatchEntryDto, CandidateDto, CandidateIdDto, CapabilitiesDto,
+    CheckpointReportDto, CompactionReportDto, ConfirmCandidateBatchRequestDto,
+    ConfirmCandidateBatchResultDto, ConfirmedBatchEntryDto, DecimalU64Dto, DurationDto, EdgeIdDto,
+    EdgeRecordDto, EngineRestoreReportDto, EngineRoutingResponseDto, HealthDto, HydratedPathDto,
+    HydratedSubgraphDto, HydrationRequestDto, HydrationResponseDto, ImageBuildReportDto,
+    InsertCandidateBatchRequestDto, InsertCandidateBatchResultDto, LifecycleSnapshotDto,
+    MutationOutcomeDto, NodeIdDto, NodeRecordDto, PathHydraConfigDto, PayloadDto, RelationIdDto,
+    RelationKindRecordDto, RelationKindUsageResultDto, RelationProfileDto, RequestIdDto,
+    RoutingRequestDto, ShutdownReportDto, SubgraphHandlesDto, VerificationLimitsDto,
     VerificationReportDto,
 };
 
 const REQUEST_CREATED: u8 = 0;
 const REQUEST_EXECUTING: u8 = 1;
 const REQUEST_COMPLETE: u8 = 2;
+
+fn batch_limit_error() -> ApiError {
+    ApiError::new(
+        crate::ApiErrorCategory::ResourceLimit,
+        "candidate_batch_limit_exceeded",
+        "the candidate batch exceeds a configured aggregate limit",
+        false,
+    )
+}
+
+fn checked_batch_add(left: usize, right: usize) -> Result<usize, ApiError> {
+    left.checked_add(right).ok_or_else(batch_limit_error)
+}
+
+fn invalid_batch_reference(_owner: usize) -> ApiError {
+    ApiError::invalid_input(
+        "invalid_batch_reference",
+        "a batch-local reference has the wrong index or entry kind",
+    )
+}
+
+fn convert_batch_node_reference(
+    value: &BatchNodeReferenceDto,
+) -> Result<BatchNodeReference, ApiError> {
+    Ok(match value {
+        BatchNodeReferenceDto::ConfirmedNode { id } => {
+            BatchNodeReference::Confirmed(NodeId::try_from(id)?)
+        }
+        BatchNodeReferenceDto::BatchNode { entry_index } => BatchNodeReference::BatchNode(
+            usize::try_from(entry_index.as_u64()?).map_err(|_| invalid_batch_reference(0))?,
+        ),
+    })
+}
+
+fn convert_batch_relation_reference(
+    value: &BatchRelationReferenceDto,
+) -> Result<BatchRelationReference, ApiError> {
+    Ok(match value {
+        BatchRelationReferenceDto::ConfirmedRelationKind { id } => {
+            BatchRelationReference::Confirmed(RelationId::try_from(id)?)
+        }
+        BatchRelationReferenceDto::BatchRelationKind { entry_index } => {
+            BatchRelationReference::BatchRelationKind(
+                usize::try_from(entry_index.as_u64()?).map_err(|_| invalid_batch_reference(0))?,
+            )
+        }
+    })
+}
 
 struct RequestCompletion<'a>(&'a AtomicU8);
 
@@ -451,6 +503,125 @@ impl PathHydra {
         Ok(decoded)
     }
 
+    fn convert_candidate_batch_entries(
+        &self,
+        values: &[CandidateBatchEntryDto],
+    ) -> Result<Vec<CandidateBatchEntry>, ApiError> {
+        let limits = self.inner.limits;
+        if values.is_empty() || values.len() > limits.maximum_batch_entries {
+            return Err(ApiError::invalid_input(
+                "invalid_candidate_batch_size",
+                "the candidate batch must be nonempty and within the configured limit",
+            ));
+        }
+        let mut nodes = 0_usize;
+        let mut relations = 0_usize;
+        let mut edges = 0_usize;
+        let mut name_bytes = 0_usize;
+        let mut payload_bytes = 0_usize;
+        let mut references = 0_usize;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(values.len())
+            .map_err(|_| batch_limit_error())?;
+        for value in values {
+            match value {
+                CandidateBatchEntryDto::Node {
+                    exact_name,
+                    payload,
+                } => {
+                    self.validate_name(exact_name)?;
+                    let payload = self.decode_payload(payload)?;
+                    nodes = checked_batch_add(nodes, 1)?;
+                    name_bytes = checked_batch_add(name_bytes, exact_name.len())?;
+                    payload_bytes = checked_batch_add(payload_bytes, payload.len())?;
+                    output.push(CandidateBatchEntry::Node {
+                        name: NodeName::from(exact_name.clone()),
+                        payload: NodePayload::new(payload.into_boxed_slice()),
+                    });
+                }
+                CandidateBatchEntryDto::RelationKind { exact_name } => {
+                    self.validate_name(exact_name)?;
+                    relations = checked_batch_add(relations, 1)?;
+                    name_bytes = checked_batch_add(name_bytes, exact_name.len())?;
+                    output.push(CandidateBatchEntry::RelationKind {
+                        name: RelationName::from(exact_name.clone()),
+                    });
+                }
+                CandidateBatchEntryDto::Edge {
+                    source,
+                    destination,
+                    relation_kind,
+                    base_weight,
+                } => {
+                    edges = checked_batch_add(edges, 1)?;
+                    references = checked_batch_add(references, 3)?;
+                    output.push(CandidateBatchEntry::Edge {
+                        source: convert_batch_node_reference(source)?,
+                        destination: convert_batch_node_reference(destination)?,
+                        relation_kind: convert_batch_relation_reference(relation_kind)?,
+                        base_weight: BaseWeight::try_from(base_weight)?,
+                    });
+                }
+            }
+        }
+        if nodes > limits.maximum_batch_node_entries
+            || relations > limits.maximum_batch_relation_kind_entries
+            || edges > limits.maximum_batch_edge_entries
+            || name_bytes > limits.maximum_batch_name_bytes
+            || payload_bytes > limits.maximum_batch_payload_bytes
+            || references > limits.maximum_batch_references
+        {
+            return Err(batch_limit_error());
+        }
+        let estimated = checked_batch_add(name_bytes, payload_bytes)?;
+        let estimated = checked_batch_add(
+            estimated,
+            values
+                .len()
+                .checked_mul(128)
+                .ok_or_else(batch_limit_error)?,
+        )?;
+        if estimated > limits.maximum_batch_estimated_bytes {
+            return Err(batch_limit_error());
+        }
+        for (owner, value) in values.iter().enumerate() {
+            let CandidateBatchEntryDto::Edge {
+                source,
+                destination,
+                relation_kind,
+                ..
+            } = value
+            else {
+                continue;
+            };
+            for reference in [source, destination] {
+                if let BatchNodeReferenceDto::BatchNode { entry_index } = reference {
+                    let local = usize::try_from(entry_index.as_u64()?).map_err(|_| {
+                        ApiError::invalid_input(
+                            "invalid_batch_reference",
+                            "a batch-local reference is outside the supported range",
+                        )
+                    })?;
+                    if !matches!(values.get(local), Some(CandidateBatchEntryDto::Node { .. })) {
+                        return Err(invalid_batch_reference(owner));
+                    }
+                }
+            }
+            if let BatchRelationReferenceDto::BatchRelationKind { entry_index } = relation_kind {
+                let local = usize::try_from(entry_index.as_u64()?)
+                    .map_err(|_| invalid_batch_reference(owner))?;
+                if !matches!(
+                    values.get(local),
+                    Some(CandidateBatchEntryDto::RelationKind { .. })
+                ) {
+                    return Err(invalid_batch_reference(owner));
+                }
+            }
+        }
+        Ok(output)
+    }
+
     pub fn lookup_node_exact(&self, name: &str) -> Result<Option<NodeIdDto>, ApiError> {
         self.validate_name(name)?;
         self.inner
@@ -516,6 +687,19 @@ impl PathHydra {
             .map_err(Into::into)
     }
 
+    /// Atomically stores a bounded mixed batch as provisional candidates.
+    pub fn insert_candidate_batch(
+        &self,
+        request: &InsertCandidateBatchRequestDto,
+    ) -> Result<InsertCandidateBatchResultDto, ApiError> {
+        let entries = self.convert_candidate_batch_entries(&request.entries)?;
+        let result = self.inner.engine.insert_candidate_batch(&entries)?;
+        Ok(InsertCandidateBatchResultDto {
+            candidate_ids: result.candidate_ids.into_iter().map(Into::into).collect(),
+            counts: result.counts.into(),
+        })
+    }
+
     pub fn get_candidate(&self, id: &CandidateIdDto) -> Result<CandidateDto, ApiError> {
         let candidate = self
             .inner
@@ -534,6 +718,67 @@ impl PathHydra {
         Ok(MutationOutcomeDto::from(&mutation))
     }
 
+    /// Atomically promotes an externally validated dependency-complete batch.
+    pub fn confirm_candidate_batch(
+        &self,
+        request: &ConfirmCandidateBatchRequestDto,
+    ) -> Result<ConfirmCandidateBatchResultDto, ApiError> {
+        if request.candidate_ids.is_empty()
+            || request.candidate_ids.len() > self.inner.limits.maximum_batch_entries
+        {
+            return Err(ApiError::invalid_input(
+                "invalid_confirmation_batch_size",
+                "the confirmation batch must be nonempty and within the configured limit",
+            ));
+        }
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(request.candidate_ids.len())
+            .map_err(|_| {
+                ApiError::new(
+                    crate::ApiErrorCategory::ResourceLimit,
+                    "batch_allocation_refused",
+                    "the confirmation batch allocation was refused",
+                    false,
+                )
+            })?;
+        for id in &request.candidate_ids {
+            ids.push(CandidateId::try_from(id)?);
+        }
+        let mutation = self
+            .inner
+            .engine
+            .confirm_candidate_batch_with_response_limit(
+                &ids,
+                self.inner.limits.maximum_encoded_bytes,
+            )?;
+        let (result, publication) = mutation.into_parts();
+        let entries = request
+            .candidate_ids
+            .iter()
+            .cloned()
+            .zip(result.records.iter().map(Into::into))
+            .map(|(candidate_id, record)| ConfirmedBatchEntryDto {
+                candidate_id,
+                record,
+            })
+            .collect();
+        Ok(ConfirmCandidateBatchResultDto {
+            entries,
+            counts: result.counts.into(),
+            candidates_consumed: DecimalU64Dto::from_u64(
+                u64::try_from(request.candidate_ids.len()).unwrap_or(u64::MAX),
+            ),
+            created_nodes: DecimalU64Dto::from_u64(
+                u64::try_from(result.created_nodes).unwrap_or(u64::MAX),
+            ),
+            created_relation_kinds: DecimalU64Dto::from_u64(
+                u64::try_from(result.created_relation_kinds).unwrap_or(u64::MAX),
+            ),
+            graph_changed: result.graph_changed,
+            publication: (&publication).into(),
+        })
+    }
+
     pub fn get_confirmed_node(&self, id: &NodeIdDto) -> Result<NodeRecordDto, ApiError> {
         let record = self.inner.engine.get_node(NodeId::try_from(id)?)?;
         Ok(NodeRecordDto::from(&record))
@@ -550,6 +795,29 @@ impl PathHydra {
     pub fn get_confirmed_edge(&self, id: &EdgeIdDto) -> Result<EdgeRecordDto, ApiError> {
         let record = self.inner.engine.get_edge(EdgeId::try_from(id)?)?;
         Ok(EdgeRecordDto::from(&record))
+    }
+
+    pub fn most_used_relation_kinds(
+        &self,
+        maximum_results: usize,
+    ) -> Result<RelationKindUsageResultDto, ApiError> {
+        if maximum_results == 0
+            || maximum_results > self.inner.limits.maximum_relation_kind_usage_results
+        {
+            return Err(ApiError::invalid_input(
+                "invalid_relation_usage_limit",
+                "the relation-kind usage limit must be nonzero and within the configured limit",
+            ));
+        }
+        Ok(RelationKindUsageResultDto {
+            relation_kinds: self
+                .inner
+                .engine
+                .most_used_relation_kinds(maximum_results)?
+                .iter()
+                .map(Into::into)
+                .collect(),
+        })
     }
 
     pub fn remove_confirmed_edge(&self, id: &EdgeIdDto) -> Result<MutationOutcomeDto, ApiError> {

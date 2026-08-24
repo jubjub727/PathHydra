@@ -215,6 +215,15 @@ impl From<CatalogError> for ApiError {
                 "the exact name is already confirmed",
                 false,
             ),
+            CatalogError::InvalidBatch { .. } => {
+                Self::invalid_input("invalid_candidate_batch", "the candidate batch is invalid")
+            }
+            CatalogError::InvalidCandidateDependency { .. } => Self::new(
+                ApiErrorCategory::InvalidCandidateTransition,
+                "invalid_candidate_dependency",
+                "the candidate dependency closure is invalid",
+                false,
+            ),
             CatalogError::CorruptRecord { .. } => Self::new(
                 ApiErrorCategory::Corruption,
                 "durable_record_corrupt",

@@ -1,13 +1,15 @@
 use pathhydra_api::{
     ApiError, ApiErrorCategory, ApiErrorCategoryDto, ApiErrorDto, ApiLimits, ApiLimitsDto,
-    Binary32Dto, Binary64Dto, CandidateDto, ConfirmedRecordDto, DecimalU64Dto, DtoValidationError,
+    Binary32Dto, Binary64Dto, CandidateDto, CandidateNodeReferenceDto,
+    CandidateRelationReferenceDto, ConfirmedRecordDto, DecimalU64Dto, DtoValidationError,
     EdgeHandleDto, NodeIdDto, PathHydraConfigDto, PayloadDto, RelationIdDto, RelationProfileDto,
     RelationProfileEntryDto, RelationUseDto, RoutingRequestDto, SearchBudgetDto,
     SubgraphHandlesDto, TiePolicyDto, decode, encode,
 };
 use pathhydra_core::{
-    BaseWeight, Candidate, CandidateId, ConfirmedRecord, EdgeId, EdgeRecord, NodeId, NodeName,
-    NodePayload, NodeRecord, RelationId, RelationName, RelationRecord,
+    BaseWeight, Candidate, CandidateId, CandidateNodeReference, CandidateRelationReference,
+    ConfirmedRecord, EdgeId, EdgeRecord, NodeId, NodeName, NodePayload, NodeRecord, RelationId,
+    RelationName, RelationRecord,
 };
 use pathhydra_routing::{RelationUse, RoutingRequest, SearchBudget, TiePolicy};
 use pathhydra_subgraph::Subgraph;
@@ -191,6 +193,7 @@ fn api_limits_have_an_exact_owned_dto_round_trip() {
         maximum_diagnostic_text_bytes: 10,
         maximum_nesting_depth: 11,
         maximum_json_values: 12,
+        ..ApiLimits::default()
     };
     let dto = ApiLimitsDto::from(&limits);
     assert_eq!(dto.maximum_json_values.as_str(), "12");
@@ -209,26 +212,28 @@ fn every_candidate_and_confirmed_record_shape_is_owned_and_lossless() {
         id: CandidateId::from_u64(u64::MAX),
         name: NodeName::new("Token\u{301} !"),
         payload: NodePayload::from([0, 0xff, 1]),
+        incoming_reference_count: 0,
     };
     let relation_candidate = Candidate::Relation {
         id: CandidateId::from_u64(2),
         name: RelationName::new("RelATION?"),
+        incoming_reference_count: 0,
     };
     let edge_candidate = Candidate::Edge {
         id: CandidateId::from_u64(3),
-        source: NodeId::from_u64(4),
-        destination: NodeId::from_u64(5),
-        relation_kind: RelationId::from_u64(6),
+        source: CandidateNodeReference::Confirmed(NodeId::from_u64(4)),
+        destination: CandidateNodeReference::Confirmed(NodeId::from_u64(5)),
+        relation_kind: CandidateRelationReference::Confirmed(RelationId::from_u64(6)),
         base_weight: BaseWeight::new(0.25).unwrap(),
     };
     assert!(
-        matches!(CandidateDto::from(&node_candidate), CandidateDto::Node { id, name, payload } if id.as_str() == u64::MAX.to_string() && name == "Token\u{301} !" && payload.decode().unwrap() == [0, 0xff, 1])
+        matches!(CandidateDto::from(&node_candidate), CandidateDto::Node { id, name, payload, .. } if id.as_str() == u64::MAX.to_string() && name == "Token\u{301} !" && payload.decode().unwrap() == [0, 0xff, 1])
     );
     assert!(
-        matches!(CandidateDto::from(&relation_candidate), CandidateDto::RelationKind { id, name } if id.as_str() == "2" && name == "RelATION?")
+        matches!(CandidateDto::from(&relation_candidate), CandidateDto::RelationKind { id, name, .. } if id.as_str() == "2" && name == "RelATION?")
     );
     assert!(
-        matches!(CandidateDto::from(&edge_candidate), CandidateDto::Edge { id, source, destination, relation_kind, base_weight } if id.as_str() == "3" && source.as_str() == "4" && destination.as_str() == "5" && relation_kind.as_str() == "6" && base_weight.bits().unwrap() == 0.25_f32.to_bits())
+        matches!(CandidateDto::from(&edge_candidate), CandidateDto::Edge { id, source: CandidateNodeReferenceDto::ConfirmedNode { id: source }, destination: CandidateNodeReferenceDto::ConfirmedNode { id: destination }, relation_kind: CandidateRelationReferenceDto::ConfirmedRelationKind { id: relation_kind }, base_weight } if id.as_str() == "3" && source.as_str() == "4" && destination.as_str() == "5" && relation_kind.as_str() == "6" && base_weight.bits().unwrap() == 0.25_f32.to_bits())
     );
 
     let confirmed = [

@@ -20,9 +20,11 @@ use pathhydra_routing::{
     estimate_cpu_working_set, open_bundle, route_controlled, route_partitioned_controlled,
 };
 use pathhydra_store::{
-    ActiveRoutingImage, Catalog, CatalogConfig, CatalogSummary, CheckpointReport,
-    CheckpointRequest, CompactionReport, OperationalPathRequest, PathTarget, StoreMetricsSnapshot,
-    VerificationLimits, VerificationReport, validate_operational_paths,
+    ActiveRoutingImage, CandidateBatchConfirmation, CandidateBatchEntry,
+    CandidateBatchInsertResult, Catalog, CatalogConfig, CatalogSummary, CheckpointReport,
+    CheckpointRequest, CompactionReport, DeletionResult, OperationalPathRequest, PathTarget,
+    RelationKindUsage, StoreMetricsSnapshot, VerificationLimits, VerificationReport,
+    validate_operational_paths,
 };
 
 #[cfg(feature = "cuda")]
@@ -1805,6 +1807,13 @@ impl GraphEngine {
             )?)
         })
     }
+    pub fn insert_candidate_batch(
+        &self,
+        entries: &[CandidateBatchEntry],
+    ) -> Result<CandidateBatchInsertResult, EngineError> {
+        let _operation = self.lifecycle.begin_mutation()?;
+        self.with_catalog(|catalog| Ok(catalog.insert_candidate_batch(entries)?))
+    }
     pub fn get_candidate(&self, id: CandidateId) -> Result<Candidate, EngineError> {
         self.with_catalog(|catalog| Ok(catalog.get_candidate(id)?))
     }
@@ -1823,23 +1832,66 @@ impl GraphEngine {
     pub fn get_edge(&self, id: EdgeId) -> Result<EdgeRecord, EngineError> {
         self.with_catalog(|catalog| Ok(catalog.get_edge(id)?))
     }
+    pub fn most_used_relation_kinds(
+        &self,
+        maximum_results: usize,
+    ) -> Result<Vec<RelationKindUsage>, EngineError> {
+        self.with_catalog(|catalog| Ok(catalog.most_used_relation_kinds(maximum_results)?))
+    }
 
     pub fn confirm_validated_candidate(
         &self,
         id: CandidateId,
     ) -> Result<ConfirmedMutation<ConfirmedRecord>, EngineError> {
-        self.confirmed_mutation(|catalog| catalog.confirm_validated_candidate(id))
+        Ok(self.confirm_candidate_batch(&[id])?.map(|result| {
+            result
+                .records
+                .into_iter()
+                .next()
+                .expect("a successful singleton confirmation has one result")
+        }))
     }
-    pub fn remove_edge(&self, id: EdgeId) -> Result<ConfirmedMutation<()>, EngineError> {
+    pub fn confirm_candidate_batch(
+        &self,
+        ids: &[CandidateId],
+    ) -> Result<ConfirmedMutation<CandidateBatchConfirmation>, EngineError> {
+        self.confirm_candidate_batch_with_response_limit(ids, usize::MAX)
+    }
+    pub fn confirm_candidate_batch_with_response_limit(
+        &self,
+        ids: &[CandidateId],
+        maximum_response_bytes: usize,
+    ) -> Result<ConfirmedMutation<CandidateBatchConfirmation>, EngineError> {
+        self.confirmed_mutation_with_change(|catalog| {
+            let result =
+                catalog.confirm_candidate_batch_with_response_limit(ids, maximum_response_bytes)?;
+            let changed = result.graph_changed;
+            Ok((result, changed))
+        })
+    }
+    pub fn remove_edge(
+        &self,
+        id: EdgeId,
+    ) -> Result<ConfirmedMutation<DeletionResult>, EngineError> {
         self.confirmed_mutation(|catalog| catalog.remove_edge(id))
     }
-    pub fn remove_node(&self, id: NodeId) -> Result<ConfirmedMutation<()>, EngineError> {
+    pub fn remove_node(
+        &self,
+        id: NodeId,
+    ) -> Result<ConfirmedMutation<DeletionResult>, EngineError> {
         self.confirmed_mutation(|catalog| catalog.remove_node(id))
     }
 
     fn confirmed_mutation<T>(
         &self,
         mutation: impl FnOnce(&Catalog) -> Result<T, pathhydra_store::CatalogError>,
+    ) -> Result<ConfirmedMutation<T>, EngineError> {
+        self.confirmed_mutation_with_change(|catalog| mutation(catalog).map(|value| (value, true)))
+    }
+
+    fn confirmed_mutation_with_change<T>(
+        &self,
+        mutation: impl FnOnce(&Catalog) -> Result<(T, bool), pathhydra_store::CatalogError>,
     ) -> Result<ConfirmedMutation<T>, EngineError> {
         let _operation = self.lifecycle.begin_mutation()?;
         let mut state = self
@@ -1856,7 +1908,13 @@ impl GraphEngine {
             .as_ref()
             .cloned()
             .ok_or(crate::LifecycleError::ShutDown)?;
-        let durable_result = mutation(&catalog)?;
+        let (durable_result, graph_changed) = mutation(&catalog)?;
+        if !graph_changed {
+            return Ok(ConfirmedMutation::new(
+                durable_result,
+                PublicationOutcome::NotRequired,
+            ));
+        }
         let (compiled, report) = self.compile_current_image();
         let publication = match compiled {
             Ok(image) => {
@@ -2881,7 +2939,15 @@ mod tests {
             old_response.results()[0].state(),
             DestinationState::Exact(_)
         ));
-        let new_response = engine.route(RequestId::new(1), &request).unwrap();
+        let new_request = RoutingRequest::new(
+            source.id(),
+            [destination.id()],
+            RelationProfile::new([]),
+            false,
+            SearchBudget::Unlimited,
+            TiePolicy::StablePredecessor,
+        );
+        let new_response = engine.route(RequestId::new(1), &new_request).unwrap();
         assert!(matches!(
             new_response.response.results()[0].state(),
             DestinationState::MissingNode

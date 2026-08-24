@@ -9,13 +9,17 @@ rebuildable indexes owned by Plan 06, not backup authority.
 
 ## Current first-release layout
 
-Retain the default metadata family and the eight named families `candidates`,
+Retain the default metadata family and the eight then-current named families `candidates`,
 `nodes`, `node_names`, `relation_kinds`, `relation_names`, `edges`,
 `outgoing_edges`, and `incoming_edges`. Numeric keys are fixed-width big-endian
 integers. Exact-name keys contain their byte length and exact UTF-8 bytes.
 Outgoing and incoming adjacency each retain one 16-byte `(NodeId, EdgeId)` key
 and one eight-byte `EdgeId` value per directed edge. The fixed eight-byte node
 prefix is configured on both adjacency families.
+
+Decision 0014 subsequently extends the one current pre-release layout in place
+with the ninth `relation_popularity` family. This decision remains authoritative
+for the original families and RocksDB operational policy.
 
 This is one current, pre-release layout. There is no format marker, migration
 reader, graph revision, compatibility layout, or packed durable adjacency.

@@ -241,8 +241,7 @@ fn adversarial_exact_names_survive_encoding_checkpoint_and_restore() {
         assert_eq!(duplicate_node.id, node.id);
         assert!(matches!(
             duplicate_outcome.publication,
-            PublicationOutcomeDto::Published { .. }
-                | PublicationOutcomeDto::RoutingUnavailable { .. }
+            PublicationOutcomeDto::NotRequired
         ));
         assert_eq!(
             api.get_candidate(&duplicate_candidate)
@@ -273,8 +272,7 @@ fn adversarial_exact_names_survive_encoding_checkpoint_and_restore() {
         assert_eq!(duplicate_relation.id, relation.id);
         assert!(matches!(
             duplicate_relation_outcome.publication,
-            PublicationOutcomeDto::Published { .. }
-                | PublicationOutcomeDto::RoutingUnavailable { .. }
+            PublicationOutcomeDto::NotRequired
         ));
         assert_eq!(
             api.get_candidate(&duplicate_relation_candidate)
@@ -419,7 +417,7 @@ fn full_encoded_facade_lifecycle_and_current_state_hydration() {
     assert_eq!(duplicate_source.id, source.id);
     assert!(matches!(
         duplicate_outcome.publication,
-        PublicationOutcomeDto::Published { .. } | PublicationOutcomeDto::RoutingUnavailable { .. }
+        PublicationOutcomeDto::NotRequired
     ));
     assert_eq!(
         api.get_candidate(&duplicate_source_candidate)
@@ -604,7 +602,7 @@ fn full_encoded_facade_lifecycle_and_current_state_hydration() {
         .hydrate(&HydrationRequestDto {
             node_ids: vec![source.id.clone(), destination.id.clone()],
             edge_ids: vec![edge.id.clone()],
-            profile: Some(profile),
+            profile: None,
         })
         .expect("arbitrary hydration reports missing state");
     assert!(matches!(

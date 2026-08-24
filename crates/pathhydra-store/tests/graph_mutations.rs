@@ -10,7 +10,7 @@ use pathhydra_store::{
 use rocksdb::{DB, Options};
 use tempfile::TempDir;
 
-const COLUMN_FAMILIES: [&str; 8] = [
+const COLUMN_FAMILIES: [&str; 9] = [
     "candidates",
     "nodes",
     "node_names",
@@ -19,6 +19,7 @@ const COLUMN_FAMILIES: [&str; 8] = [
     "edges",
     "outgoing_edges",
     "incoming_edges",
+    "relation_popularity",
 ];
 
 #[test]
@@ -174,15 +175,13 @@ fn base_weight_boundaries_are_canonical_and_invalid_values_write_nothing() {
             Err(CatalogError::InvalidBaseWeight(_))
         ));
     }
+    let source = confirm_node(&catalog, "source", NodePayload::default());
+    let destination = confirm_node(&catalog, "destination", NodePayload::default());
+    let relation = confirm_relation(&catalog, "kind");
     let candidate = catalog
-        .insert_edge_candidate(
-            NodeId::from_u64(1),
-            NodeId::from_u64(2),
-            RelationId::from_u64(1),
-            -0.0,
-        )
+        .insert_edge_candidate(source.id(), destination.id(), relation.id(), -0.0)
         .unwrap();
-    assert_eq!(candidate.as_u64(), 1);
+    assert_eq!(candidate.as_u64(), 4);
     let Candidate::Edge { base_weight, .. } = catalog.get_candidate(candidate).unwrap() else {
         panic!("expected an edge candidate");
     };
@@ -212,25 +211,17 @@ fn failed_edge_promotion_preserves_candidate_counters_and_indexes() {
         ),
     ];
     for (candidate_source, candidate_destination, candidate_kind, endpoint) in cases {
-        let candidate = catalog
-            .insert_edge_candidate(candidate_source, candidate_destination, candidate_kind, 0.5)
-            .unwrap();
         assert!(matches!(
-            catalog.confirm_validated_candidate(candidate),
+            catalog.insert_edge_candidate(candidate_source, candidate_destination, candidate_kind, 0.5),
             Err(CatalogError::MissingEdgeEndpoint { endpoint: found, .. }) if found == endpoint
         ));
-        assert_eq!(catalog.get_candidate(candidate).unwrap().id(), candidate);
     }
 
-    let candidate = catalog
-        .insert_edge_candidate(source.id(), destination.id(), RelationId::from_u64(99), 0.5)
-        .unwrap();
     assert!(matches!(
-        catalog.confirm_validated_candidate(candidate),
+        catalog.insert_edge_candidate(source.id(), destination.id(), RelationId::from_u64(99), 0.5),
         Err(CatalogError::MissingEdgeRelationKind { relation_kind_id })
             if relation_kind_id == RelationId::from_u64(99)
     ));
-    assert_eq!(catalog.get_candidate(candidate).unwrap().id(), candidate);
 
     let valid = insert_and_confirm_edge(&catalog, source.id(), destination.id(), kind.id(), 0.5);
     assert_eq!(valid.id(), EdgeId::from_u64(1));
@@ -345,29 +336,39 @@ fn concurrent_promotions_and_delete_promotion_races_leave_a_valid_graph() {
     });
     let delete_catalog = Arc::clone(&catalog);
     let delete_barrier = Arc::clone(&barrier);
+    let source_id = source.id();
     let delete = thread::spawn(move || {
         delete_barrier.wait();
-        delete_catalog.remove_node(source.id())
+        delete_catalog.remove_node(source_id)
     });
     barrier.wait();
     let promotion = promote.join().unwrap();
-    assert!(delete.join().unwrap().is_ok());
+    let deletion = delete.join().unwrap();
+    assert!(
+        deletion.is_ok()
+            || matches!(
+                deletion,
+                Err(CatalogError::InvalidCandidateDependency { .. })
+            )
+    );
     assert!(
         promotion.is_ok() || matches!(promotion, Err(CatalogError::MissingEdgeEndpoint { .. }))
     );
     drop(catalog);
 
     let reopened = Catalog::open(directory.path()).unwrap();
-    assert!(
-        reopened
-            .incoming_edges(destination.id())
-            .unwrap()
-            .is_empty()
-    );
+    if reopened.get_node(source_id).is_err() {
+        assert!(
+            reopened
+                .incoming_edges(destination.id())
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
 
 #[test]
-fn provisional_edge_survives_node_removal_but_cannot_later_promote() {
+fn provisional_edge_prevents_dangling_confirmed_node_removal() {
     let directory = TempDir::new().unwrap();
     let catalog = Catalog::open(directory.path()).unwrap();
     let source = confirm_node(&catalog, "source", NodePayload::default());
@@ -376,16 +377,13 @@ fn provisional_edge_survives_node_removal_but_cannot_later_promote() {
     let candidate = catalog
         .insert_edge_candidate(source.id(), destination.id(), kind.id(), 0.5)
         .unwrap();
-    catalog.remove_node(source.id()).unwrap();
+    assert!(matches!(
+        catalog.remove_node(source.id()),
+        Err(CatalogError::InvalidCandidateDependency { .. })
+    ));
 
     assert_eq!(catalog.get_candidate(candidate).unwrap().id(), candidate);
-    assert!(matches!(
-        catalog.confirm_validated_candidate(candidate),
-        Err(CatalogError::MissingEdgeEndpoint {
-            endpoint: EdgeEndpoint::Source,
-            ..
-        })
-    ));
+    assert!(catalog.confirm_validated_candidate(candidate).is_ok());
 }
 
 #[test]

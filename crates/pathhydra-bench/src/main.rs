@@ -1,4 +1,5 @@
 mod fixtures;
+mod ingestion;
 mod operations;
 mod report;
 mod routing;
@@ -11,13 +12,25 @@ fn main() {
     if arguments.len() < 3 || arguments[1] != "--suite" {
         eprintln!(
             "usage: pathhydra-bench --suite SUITE [--format human|csv|json] [--repeats N] [--warmup N]\n\
-             suites: store-ingest, store-mutation, snapshot-build-load, cpu-routing, cuda-resident, cuda-out-of-core, concurrency, reconstruction-hydration, backup-restore, scale, all\n\
+             suites: batch-ingestion, store-ingest, store-mutation, snapshot-build-load, cpu-routing, cuda-resident, cuda-out-of-core, concurrency, reconstruction-hydration, backup-restore, scale, all\n\
              compatibility: baseline, out-of-core, parallel-strategy [repeat-count], operations, scale [directory] [target-gib]"
         );
         std::process::exit(2);
     }
     if arguments[2] == "operations" {
         operations::run();
+        return;
+    }
+    if arguments[2] == "batch-ingestion" {
+        let repeats = arguments
+            .windows(2)
+            .find(|pair| pair[0] == "--repeats")
+            .map_or(3, |pair| pair[1].parse().expect("repeats must be positive"));
+        if repeats == 0 {
+            eprintln!("repeats must be positive");
+            std::process::exit(2);
+        }
+        ingestion::run(repeats);
         return;
     }
     if arguments[2] == "parallel-strategy" {

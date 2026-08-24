@@ -1,5 +1,12 @@
 # PathHydra
 
+The in-process facade supports bounded atomic provisional batches containing
+nodes, relation kinds, and directed edges with request-local dependencies.
+Externally validated dependency-complete batches confirm in one durable graph
+commit and at most one routing publication. Confirmed relation kinds expose
+durable provisional/confirmed usage and a bounded deterministic popularity
+query.
+
 PathHydra is designed to store knowledge as nodes and typed, directed relations,
 then find the closest logical region of that graph for the current context.
 

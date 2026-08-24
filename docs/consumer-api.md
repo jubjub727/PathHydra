@@ -59,10 +59,11 @@ arbitrary store/image read:
 - exact identity: `lookup_node_exact`, `lookup_relation_kind_exact`;
 - provisional lifecycle: `insert_node_candidate`,
   `insert_relation_kind_candidate`, `insert_edge_candidate`, `get_candidate`,
-  `confirm_candidate`;
+  `confirm_candidate`, `insert_candidate_batch`, `confirm_candidate_batch`;
 - confirmed records and deletion: `get_confirmed_node`,
   `get_confirmed_relation_kind`, `get_confirmed_edge`,
   `remove_confirmed_edge`, `remove_confirmed_node`;
+- relation usage: `most_used_relation_kinds`;
 - routing and cancellation: `request_handle`, `cancel`,
   `RequestHandle::route`, `RequestHandle::cancel`;
 - current-state hydration: `hydrate`, `RequestHandle::hydrate_path`,
@@ -80,14 +81,53 @@ arbitrary store/image read:
 Candidate insertion stores provisional material only. It is excluded from exact
 confirmed lookup, routing, and hydration until the caller makes an external
 decision and calls `confirm_candidate`. Confirmation accepts no confidence
-score and does not claim to validate facts. `MutationOutcomeDto` reports the
+score and does not claim to validate facts. Batch insertion accepts one ordered
+array of node, relation-kind, and edge entries. An edge may use a confirmed ID
+or the zero-based position of a correctly typed entry in the same request;
+forward references are valid. The insertion result returns one `CandidateId`
+per input position.
+
+After external validation, `confirm_candidate_batch` accepts a unique ordered
+candidate-ID array. Every candidate dependency and every dependent edge of a
+selected node/relation-kind candidate must be present. Success returns one
+aligned confirmed record per candidate, aggregate counts, created-versus-
+existing counts, `graph_changed`, and one publication outcome. A changed batch
+performs one durable graph commit and one publication attempt. A duplicate-
+name-only batch consumes candidates with `not_required`; it does not rebuild
+the unchanged topology.
+
+For example, this edge entry refers forward to node entries 1 and 2 and a
+relation-kind entry 3:
+
+```json
+{"kind":"edge","source":{"kind":"batch_node","entry_index":"2"},"destination":{"kind":"batch_node","entry_index":"1"},"relation_kind":{"kind":"batch_relation_kind","entry_index":"3"},"base_weight":"0x3e800000"}
+```
+
+`get_candidate` exposes durable dependencies as either confirmed stable IDs or
+candidate IDs. Request-local positions never survive insertion. Provisional
+material remains absent from confirmed lookup, routing, hydration, and health
+topology counts even though direct relation references affect the usage query.
+
+`MutationOutcomeDto` reports the
 durable confirmed record or removed stable ID separately from routing-image
 publication outcome.
 
 Confirming a second node or relation-kind candidate with an already confirmed
 exact name consumes that candidate and returns the existing confirmed record
 with its original stable ID. It never creates a second confirmed identity; the
-same result also reports the routing publication outcome.
+same result reports `not_required` because confirmed topology did not change.
+
+`most_used_relation_kinds(max_results)` requires a nonzero bounded limit and
+returns complete confirmed relation-kind records with provisional, confirmed,
+and checked total counts. Ordering is total descending, confirmed descending,
+then `RelationId` ascending. Edge and node deletion outcomes list relation kinds
+automatically removed after both counts reached zero.
+
+Default batch bounds are 120,000 entries total (20,000 nodes, 10,000 relation
+kinds, 100,000 edges), 64 MiB aggregate exact names, 512 MiB decoded payload,
+300,000 references, and a 1 GiB estimated durable batch. The canonical document
+limit is 256 MiB and the popularity query limit is 100,000. Every limit is
+reported through `ApiLimitsDto` and can be reduced by the embedding process.
 
 Exact names are case-sensitive strings. The facade does not normalize, fold,
 correct, alias, fuzzy-match, or merge them. Opaque payload bytes use

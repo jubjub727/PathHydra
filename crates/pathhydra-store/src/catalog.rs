@@ -8,17 +8,19 @@ use std::{
 };
 
 use pathhydra_core::{
-    BaseWeight, Candidate, CandidateId, ConfirmedRecord, EdgeId, EdgeRecord, NodeId, NodeName,
-    NodePayload, NodeRecord, RelationId, RelationName, RelationRecord,
+    BaseWeight, Candidate, CandidateId, CandidateNodeReference, CandidateRelationReference,
+    ConfirmedRecord, EdgeId, EdgeRecord, NodeId, NodeName, NodePayload, NodeRecord, RelationId,
+    RelationName, RelationRecord,
 };
 use rocksdb::{ColumnFamily, DB, Direction, IteratorMode, WriteBatch};
 
 use crate::{
     codec::{
         CodecError, decode_adjacency_key, decode_adjacency_value, decode_candidate, decode_edge,
-        decode_id_key, decode_name_key, decode_node, decode_relation, decode_u64_record,
-        encode_adjacency_key, encode_adjacency_value, encode_candidate, encode_edge, encode_id_key,
-        encode_name_key, encode_node, encode_relation, encode_u64_record,
+        decode_id_key, decode_name_key, decode_node, decode_popularity_key, decode_relation,
+        decode_u64_record, encode_adjacency_key, encode_adjacency_value, encode_candidate,
+        encode_edge, encode_id_key, encode_name_key, encode_node, encode_popularity_key,
+        encode_relation, encode_u64_record,
     },
     column_families,
     error::{CatalogError, EdgeEndpoint, RecordKind, rocksdb_error},
@@ -34,9 +36,74 @@ const META_NEXT_RELATION_ID: &[u8] = b"next-relation-id";
 const META_NEXT_EDGE_ID: &[u8] = b"next-edge-id";
 pub(crate) const META_ACTIVE_ROUTING_IMAGE: &[u8] = b"active-routing-image";
 const INITIAL_ID: u64 = 1;
+pub const MAXIMUM_CANDIDATE_BATCH_ENTRIES: usize = 120_000;
+pub const MAXIMUM_CANDIDATE_BATCH_NAME_BYTES: usize = 64 * 1024 * 1024;
+pub const MAXIMUM_CANDIDATE_BATCH_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
+pub const MAXIMUM_CANDIDATE_BATCH_ESTIMATED_BYTES: usize = 1024 * 1024 * 1024;
 
 type NodeNameIndex = HashMap<Box<str>, NodeId>;
 type RelationNameIndex = HashMap<Box<str>, RelationId>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BatchNodeReference {
+    Confirmed(NodeId),
+    BatchNode(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BatchRelationReference {
+    Confirmed(RelationId),
+    BatchRelationKind(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CandidateBatchEntry {
+    Node {
+        name: NodeName,
+        payload: NodePayload,
+    },
+    RelationKind {
+        name: RelationName,
+    },
+    Edge {
+        source: BatchNodeReference,
+        destination: BatchNodeReference,
+        relation_kind: BatchRelationReference,
+        base_weight: BaseWeight,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CandidateBatchCounts {
+    pub nodes: usize,
+    pub relation_kinds: usize,
+    pub edges: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateBatchInsertResult {
+    pub candidate_ids: Vec<CandidateId>,
+    pub counts: CandidateBatchCounts,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateBatchConfirmation {
+    pub records: Vec<ConfirmedRecord>,
+    pub counts: CandidateBatchCounts,
+    pub graph_changed: bool,
+    pub created_nodes: usize,
+    pub created_relation_kinds: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationKindUsage {
+    pub relation_kind: RelationRecord,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DeletionResult {
+    pub removed_relation_kinds: Vec<RelationId>,
+}
 
 /// A self-contained, point-in-time read of every confirmed graph record.
 ///
@@ -447,10 +514,12 @@ impl Catalog {
         name: impl Into<NodeName>,
         payload: impl Into<NodePayload>,
     ) -> Result<CandidateId, CatalogError> {
-        self.insert_candidate(CandidateInput::Node {
-            name: name.into(),
-            payload: payload.into(),
-        })
+        Ok(self
+            .insert_candidate_batch(&[CandidateBatchEntry::Node {
+                name: name.into(),
+                payload: payload.into(),
+            }])?
+            .candidate_ids[0])
     }
 
     /// Inserts a provisional relation-kind candidate.
@@ -458,7 +527,9 @@ impl Catalog {
         &self,
         name: impl Into<RelationName>,
     ) -> Result<CandidateId, CatalogError> {
-        self.insert_candidate(CandidateInput::Relation(name.into()))
+        Ok(self
+            .insert_candidate_batch(&[CandidateBatchEntry::RelationKind { name: name.into() }])?
+            .candidate_ids[0])
     }
 
     /// Inserts a provisional directed edge candidate.
@@ -488,11 +559,261 @@ impl Catalog {
         relation_kind: RelationId,
         base_weight: BaseWeight,
     ) -> Result<CandidateId, CatalogError> {
-        self.insert_candidate(CandidateInput::Edge {
-            source,
-            destination,
-            relation_kind,
-            base_weight,
+        Ok(self
+            .insert_candidate_batch(&[CandidateBatchEntry::Edge {
+                source: BatchNodeReference::Confirmed(source),
+                destination: BatchNodeReference::Confirmed(destination),
+                relation_kind: BatchRelationReference::Confirmed(relation_kind),
+                base_weight,
+            }])?
+            .candidate_ids[0])
+    }
+
+    /// Atomically stores a bounded ordered batch of provisional candidates.
+    pub fn insert_candidate_batch(
+        &self,
+        entries: &[CandidateBatchEntry],
+    ) -> Result<CandidateBatchInsertResult, CatalogError> {
+        if entries.is_empty() {
+            return Err(CatalogError::InvalidBatch {
+                reason: "the batch is empty".to_owned(),
+            });
+        }
+        if entries.len() > MAXIMUM_CANDIDATE_BATCH_ENTRIES {
+            return Err(CatalogError::InvalidBatch {
+                reason: format!(
+                    "{} entries exceed the catalog limit {MAXIMUM_CANDIDATE_BATCH_ENTRIES}",
+                    entries.len()
+                ),
+            });
+        }
+        let mut name_bytes = 0_usize;
+        let mut payload_bytes = 0_usize;
+        for entry in entries {
+            match entry {
+                CandidateBatchEntry::Node { name, payload } => {
+                    name_bytes = name_bytes.checked_add(name.as_str().len()).ok_or(
+                        CatalogError::InvalidBatch {
+                            reason: "aggregate name bytes overflow".to_owned(),
+                        },
+                    )?;
+                    payload_bytes = payload_bytes.checked_add(payload.as_bytes().len()).ok_or(
+                        CatalogError::InvalidBatch {
+                            reason: "aggregate payload bytes overflow".to_owned(),
+                        },
+                    )?;
+                }
+                CandidateBatchEntry::RelationKind { name } => {
+                    name_bytes = name_bytes.checked_add(name.as_str().len()).ok_or(
+                        CatalogError::InvalidBatch {
+                            reason: "aggregate name bytes overflow".to_owned(),
+                        },
+                    )?;
+                }
+                CandidateBatchEntry::Edge { .. } => {}
+            }
+        }
+        let estimated = name_bytes
+            .checked_add(payload_bytes)
+            .and_then(|value| value.checked_add(entries.len().checked_mul(128)?))
+            .ok_or(CatalogError::InvalidBatch {
+                reason: "estimated durable batch bytes overflow".to_owned(),
+            })?;
+        if name_bytes > MAXIMUM_CANDIDATE_BATCH_NAME_BYTES
+            || payload_bytes > MAXIMUM_CANDIDATE_BATCH_PAYLOAD_BYTES
+            || estimated > MAXIMUM_CANDIDATE_BATCH_ESTIMATED_BYTES
+        {
+            return Err(CatalogError::InvalidBatch {
+                reason: "the batch exceeds an aggregate byte limit".to_owned(),
+            });
+        }
+        let _write = self.write_guard()?;
+        let first = read_metadata(&self.db, META_NEXT_CANDIDATE_ID, "next-candidate-id")?;
+        let length = u64::try_from(entries.len()).map_err(|_| CatalogError::CounterOverflow {
+            counter: "candidate ID",
+        })?;
+        let following = first
+            .checked_add(length)
+            .ok_or(CatalogError::CounterOverflow {
+                counter: "candidate ID",
+            })?;
+
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(entries.len())
+            .map_err(|_| CatalogError::StorageExhausted {
+                operation: "candidate batch allocation",
+            })?;
+        for offset in 0..entries.len() {
+            ids.push(CandidateId::from_u64(
+                first
+                    + u64::try_from(offset).map_err(|_| CatalogError::CounterOverflow {
+                        counter: "candidate ID",
+                    })?,
+            ));
+        }
+
+        let mut counts = CandidateBatchCounts::default();
+        let mut incoming = vec![0_u64; entries.len()];
+        let mut provisional_by_relation = BTreeMap::<RelationId, u64>::new();
+        let mut candidates = Vec::new();
+        candidates.try_reserve_exact(entries.len()).map_err(|_| {
+            CatalogError::StorageExhausted {
+                operation: "candidate batch allocation",
+            }
+        })?;
+        for (index, entry) in entries.iter().enumerate() {
+            let candidate = match entry {
+                CandidateBatchEntry::Node { name, payload } => {
+                    counts.nodes += 1;
+                    Candidate::Node {
+                        id: ids[index],
+                        name: name.clone(),
+                        payload: payload.clone(),
+                        incoming_reference_count: 0,
+                    }
+                }
+                CandidateBatchEntry::RelationKind { name } => {
+                    counts.relation_kinds += 1;
+                    Candidate::Relation {
+                        id: ids[index],
+                        name: name.clone(),
+                        incoming_reference_count: 0,
+                    }
+                }
+                CandidateBatchEntry::Edge {
+                    source,
+                    destination,
+                    relation_kind,
+                    base_weight,
+                } => {
+                    counts.edges += 1;
+                    let source = resolve_batch_node_reference(
+                        &self.db,
+                        entries,
+                        &ids,
+                        index,
+                        EdgeEndpoint::Source,
+                        *source,
+                        &mut incoming,
+                    )?;
+                    let destination = resolve_batch_node_reference(
+                        &self.db,
+                        entries,
+                        &ids,
+                        index,
+                        EdgeEndpoint::Destination,
+                        *destination,
+                        &mut incoming,
+                    )?;
+                    let relation_kind = match relation_kind {
+                        BatchRelationReference::Confirmed(id) => {
+                            require_relation_kind(&self.db, *id)?;
+                            let delta = provisional_by_relation.entry(*id).or_default();
+                            *delta = delta.checked_add(1).ok_or(CatalogError::CounterOverflow {
+                                counter: "provisional relation reference",
+                            })?;
+                            CandidateRelationReference::Confirmed(*id)
+                        }
+                        BatchRelationReference::BatchRelationKind(local) => {
+                            if !matches!(
+                                entries.get(*local),
+                                Some(CandidateBatchEntry::RelationKind { .. })
+                            ) {
+                                return Err(invalid_local_reference(
+                                    index,
+                                    *local,
+                                    "relation kind",
+                                ));
+                            }
+                            incoming[*local] = incoming[*local].checked_add(1).ok_or(
+                                CatalogError::CounterOverflow {
+                                    counter: "candidate incoming reference",
+                                },
+                            )?;
+                            CandidateRelationReference::Candidate(ids[*local])
+                        }
+                    };
+                    Candidate::Edge {
+                        id: ids[index],
+                        source,
+                        destination,
+                        relation_kind,
+                        base_weight: *base_weight,
+                    }
+                }
+            };
+            candidates.push(candidate);
+        }
+        for (index, count) in incoming.into_iter().enumerate() {
+            match &mut candidates[index] {
+                Candidate::Node {
+                    incoming_reference_count,
+                    ..
+                }
+                | Candidate::Relation {
+                    incoming_reference_count,
+                    ..
+                } => {
+                    *incoming_reference_count = count;
+                }
+                Candidate::Edge { .. } if count == 0 => {}
+                Candidate::Edge { .. } => {
+                    return Err(CatalogError::InvalidBatch {
+                        reason: format!("entry {index} cannot be referenced as a dependency"),
+                    });
+                }
+            }
+        }
+
+        let candidates_cf = column_family(&self.db, column_families::CANDIDATES)?;
+        let relations_cf = column_family(&self.db, column_families::RELATION_KINDS)?;
+        let popularity_cf = column_family(&self.db, column_families::RELATION_POPULARITY)?;
+        let mut batch = WriteBatch::default();
+        for candidate in &candidates {
+            batch.put_cf(
+                candidates_cf,
+                encode_id_key(candidate.id().as_u64()),
+                encode_candidate(candidate).map_err(codec_input_error)?,
+            );
+        }
+        for (id, delta) in provisional_by_relation {
+            let old = get_relation_from_db(&self.db, id)?;
+            let provisional = old.provisional_reference_count().checked_add(delta).ok_or(
+                CatalogError::CounterOverflow {
+                    counter: "provisional relation reference",
+                },
+            )?;
+            provisional.checked_add(old.confirmed_edge_count()).ok_or(
+                CatalogError::CounterOverflow {
+                    counter: "total relation reference",
+                },
+            )?;
+            let new = RelationRecord::with_usage(
+                id,
+                old.name().clone(),
+                provisional,
+                old.confirmed_edge_count(),
+            );
+            batch.delete_cf(
+                popularity_cf,
+                encode_popularity_key(&old).map_err(codec_input_error)?,
+            );
+            batch.put_cf(
+                relations_cf,
+                encode_id_key(id.as_u64()),
+                encode_relation(&new).map_err(codec_input_error)?,
+            );
+            batch.put_cf(
+                popularity_cf,
+                encode_popularity_key(&new).map_err(codec_input_error)?,
+                encode_u64_record(id.as_u64()),
+            );
+        }
+        batch.put(META_NEXT_CANDIDATE_ID, encode_u64_record(following));
+        self.commit_batch(batch, WriteOperationClass::CandidateInsertion)?;
+        Ok(CandidateBatchInsertResult {
+            candidate_ids: ids,
+            counts,
         })
     }
 
@@ -514,18 +835,436 @@ impl Catalog {
         &self,
         id: CandidateId,
     ) -> Result<ConfirmedRecord, CatalogError> {
+        Ok(self
+            .confirm_candidate_batch(&[id])?
+            .records
+            .into_iter()
+            .next()
+            .expect("a successful non-empty confirmation has one result"))
+    }
+
+    /// Atomically promotes a dependency-complete ordered candidate selection.
+    pub fn confirm_candidate_batch(
+        &self,
+        candidate_ids: &[CandidateId],
+    ) -> Result<CandidateBatchConfirmation, CatalogError> {
+        self.confirm_candidate_batch_with_response_limit(candidate_ids, usize::MAX)
+    }
+
+    pub fn confirm_candidate_batch_with_response_limit(
+        &self,
+        candidate_ids: &[CandidateId],
+        maximum_response_bytes: usize,
+    ) -> Result<CandidateBatchConfirmation, CatalogError> {
+        if candidate_ids.is_empty() {
+            return Err(CatalogError::InvalidBatch {
+                reason: "the confirmation batch is empty".to_owned(),
+            });
+        }
+        if candidate_ids.len() > MAXIMUM_CANDIDATE_BATCH_ENTRIES {
+            return Err(CatalogError::InvalidBatch {
+                reason: format!(
+                    "{} candidates exceed the catalog limit {MAXIMUM_CANDIDATE_BATCH_ENTRIES}",
+                    candidate_ids.len()
+                ),
+            });
+        }
         let _write = self.write_guard()?;
-        match self.get_candidate(id)? {
-            Candidate::Node { id, name, payload } => self.confirm_node(id, name, payload),
-            Candidate::Relation { id, name } => self.confirm_relation(id, name),
-            Candidate::Edge {
-                id,
+        let mut selected = HashMap::new();
+        selected
+            .try_reserve(candidate_ids.len())
+            .map_err(|_| CatalogError::StorageExhausted {
+                operation: "candidate confirmation planning",
+            })?;
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve_exact(candidate_ids.len())
+            .map_err(|_| CatalogError::StorageExhausted {
+                operation: "candidate confirmation planning",
+            })?;
+        for (index, id) in candidate_ids.iter().copied().enumerate() {
+            if selected.insert(id, index).is_some() {
+                return Err(CatalogError::InvalidBatch {
+                    reason: format!("candidate {id} is listed more than once"),
+                });
+            }
+            candidates.push(get_candidate_from_db(&self.db, id)?);
+        }
+
+        let mut counts = CandidateBatchCounts::default();
+        let mut selected_incoming = HashMap::<CandidateId, u64>::new();
+        selected_incoming
+            .try_reserve(candidate_ids.len())
+            .map_err(|_| CatalogError::StorageExhausted {
+                operation: "candidate dependency planning",
+            })?;
+        for candidate in &candidates {
+            match candidate {
+                Candidate::Node { .. } => counts.nodes += 1,
+                Candidate::Relation { .. } => counts.relation_kinds += 1,
+                Candidate::Edge {
+                    id,
+                    source,
+                    destination,
+                    relation_kind,
+                    ..
+                } => {
+                    counts.edges += 1;
+                    validate_selected_node_dependency(
+                        &self.db,
+                        &candidates,
+                        &selected,
+                        *id,
+                        *source,
+                        &mut selected_incoming,
+                    )?;
+                    validate_selected_node_dependency(
+                        &self.db,
+                        &candidates,
+                        &selected,
+                        *id,
+                        *destination,
+                        &mut selected_incoming,
+                    )?;
+                    match relation_kind {
+                        CandidateRelationReference::Confirmed(id) => {
+                            require_relation_kind(&self.db, *id)?;
+                        }
+                        CandidateRelationReference::Candidate(dependency) => {
+                            let Some(index) = selected.get(dependency).copied() else {
+                                return Err(CatalogError::InvalidCandidateDependency {
+                                    candidate_id: *id,
+                                    reason: format!(
+                                        "relation-kind candidate {dependency} is not selected"
+                                    ),
+                                });
+                            };
+                            if !matches!(candidates[index], Candidate::Relation { .. }) {
+                                return Err(CatalogError::InvalidCandidateDependency {
+                                    candidate_id: *id,
+                                    reason: format!(
+                                        "candidate {dependency} is not a relation kind"
+                                    ),
+                                });
+                            }
+                            checked_increment_candidate_reference(
+                                &mut selected_incoming,
+                                *dependency,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        for candidate in &candidates {
+            let (id, durable) = match candidate {
+                Candidate::Node {
+                    id,
+                    incoming_reference_count,
+                    ..
+                }
+                | Candidate::Relation {
+                    id,
+                    incoming_reference_count,
+                    ..
+                } => (*id, *incoming_reference_count),
+                Candidate::Edge { .. } => continue,
+            };
+            let selected_count = selected_incoming.get(&id).copied().unwrap_or(0);
+            if durable != selected_count {
+                return Err(CatalogError::InvalidCandidateDependency {
+                    candidate_id: id,
+                    reason: format!(
+                        "complete dependent closure is required ({durable} durable references, {selected_count} selected)"
+                    ),
+                });
+            }
+        }
+
+        // Global lock order is catalog mutation -> node names -> relation names.
+        let mut node_index = self.node_index_write()?;
+        let mut relation_index = self.relation_index_write()?;
+        node_index
+            .try_reserve(counts.nodes)
+            .map_err(|_| CatalogError::StorageExhausted {
+                operation: "node-name index reservation",
+            })?;
+        relation_index
+            .try_reserve(counts.relation_kinds)
+            .map_err(|_| CatalogError::StorageExhausted {
+                operation: "relation-name index reservation",
+            })?;
+
+        let next_node = read_metadata(&self.db, META_NEXT_NODE_ID, "next-node-id")?;
+        let next_relation = read_metadata(&self.db, META_NEXT_RELATION_ID, "next-relation-id")?;
+        let next_edge = read_metadata(&self.db, META_NEXT_EDGE_ID, "next-edge-id")?;
+        let mut following_node = next_node;
+        let mut following_relation = next_relation;
+        let mut following_edge = next_edge;
+        let mut planned_node_names = HashMap::<Box<str>, NodeRecord>::new();
+        let mut planned_relation_names = HashMap::<Box<str>, RelationRecord>::new();
+        planned_node_names.try_reserve(counts.nodes).map_err(|_| {
+            CatalogError::StorageExhausted {
+                operation: "node confirmation planning",
+            }
+        })?;
+        planned_relation_names
+            .try_reserve(counts.relation_kinds)
+            .map_err(|_| CatalogError::StorageExhausted {
+                operation: "relation confirmation planning",
+            })?;
+        let mut resolved_nodes = HashMap::<CandidateId, NodeRecord>::new();
+        let mut resolved_relations = HashMap::<CandidateId, RelationRecord>::new();
+        resolved_nodes
+            .try_reserve(counts.nodes)
+            .map_err(|_| CatalogError::StorageExhausted {
+                operation: "node confirmation planning",
+            })?;
+        resolved_relations
+            .try_reserve(counts.relation_kinds)
+            .map_err(|_| CatalogError::StorageExhausted {
+                operation: "relation confirmation planning",
+            })?;
+        let mut created_nodes = Vec::new();
+        let mut created_relations = Vec::new();
+        let mut aligned = vec![None; candidates.len()];
+        for (index, candidate) in candidates.iter().enumerate() {
+            match candidate {
+                Candidate::Node {
+                    id, name, payload, ..
+                } => {
+                    let record = if let Some(existing) = node_index.get(name.as_str()) {
+                        get_node_from_db(&self.db, *existing)?
+                    } else if let Some(existing) = planned_node_names.get(name.as_str()) {
+                        existing.clone()
+                    } else {
+                        let id = NodeId::from_u64(following_node);
+                        following_node = following_node
+                            .checked_add(1)
+                            .ok_or(CatalogError::CounterOverflow { counter: "node ID" })?;
+                        let record = NodeRecord::new(id, name.clone(), payload.clone());
+                        planned_node_names.insert(name.as_str().into(), record.clone());
+                        created_nodes.push(record.clone());
+                        record
+                    };
+                    resolved_nodes.insert(*id, record.clone());
+                    aligned[index] = Some(ConfirmedRecord::Node(record));
+                }
+                Candidate::Relation { id, name, .. } => {
+                    let record = if let Some(existing) = relation_index.get(name.as_str()) {
+                        get_relation_from_db(&self.db, *existing)?
+                    } else if let Some(existing) = planned_relation_names.get(name.as_str()) {
+                        existing.clone()
+                    } else {
+                        let id = RelationId::from_u64(following_relation);
+                        following_relation = following_relation.checked_add(1).ok_or(
+                            CatalogError::CounterOverflow {
+                                counter: "relation ID",
+                            },
+                        )?;
+                        let record = RelationRecord::new(id, name.clone());
+                        planned_relation_names.insert(name.as_str().into(), record.clone());
+                        created_relations.push(record.clone());
+                        record
+                    };
+                    resolved_relations.insert(*id, record.clone());
+                    aligned[index] = Some(ConfirmedRecord::Relation(record));
+                }
+                Candidate::Edge { .. } => {}
+            }
+        }
+
+        let mut created_edges = Vec::new();
+        let mut usage = BTreeMap::<RelationId, RelationRecord>::new();
+        for (index, candidate) in candidates.iter().enumerate() {
+            let Candidate::Edge {
                 source,
                 destination,
                 relation_kind,
                 base_weight,
-            } => self.confirm_edge(id, source, destination, relation_kind, base_weight),
+                ..
+            } = candidate
+            else {
+                continue;
+            };
+            let source = resolve_confirmed_node(*source, &resolved_nodes)?;
+            let destination = resolve_confirmed_node(*destination, &resolved_nodes)?;
+            let relation_id = resolve_confirmed_relation(*relation_kind, &resolved_relations)?;
+            let old = if let Some(record) = usage.get(&relation_id) {
+                record.clone()
+            } else if let Some(record) = created_relations.iter().find(|r| r.id() == relation_id) {
+                record.clone()
+            } else {
+                get_relation_from_db(&self.db, relation_id)?
+            };
+            let provisional = match relation_kind {
+                CandidateRelationReference::Confirmed(_) => old
+                    .provisional_reference_count()
+                    .checked_sub(1)
+                    .ok_or_else(|| {
+                        corrupt(
+                            column_families::RELATION_KINDS,
+                            relation_id.to_string(),
+                            "provisional reference count underflow during confirmation",
+                        )
+                    })?,
+                CandidateRelationReference::Candidate(_) => old.provisional_reference_count(),
+            };
+            let confirmed =
+                old.confirmed_edge_count()
+                    .checked_add(1)
+                    .ok_or(CatalogError::CounterOverflow {
+                        counter: "confirmed relation edge",
+                    })?;
+            provisional
+                .checked_add(confirmed)
+                .ok_or(CatalogError::CounterOverflow {
+                    counter: "total relation reference",
+                })?;
+            usage.insert(
+                relation_id,
+                RelationRecord::with_usage(relation_id, old.name().clone(), provisional, confirmed),
+            );
+            let edge = EdgeRecord::new(
+                EdgeId::from_u64(following_edge),
+                source,
+                destination,
+                relation_id,
+                *base_weight,
+            );
+            following_edge = following_edge
+                .checked_add(1)
+                .ok_or(CatalogError::CounterOverflow { counter: "edge ID" })?;
+            aligned[index] = Some(ConfirmedRecord::Edge(edge.clone()));
+            created_edges.push(edge);
         }
+
+        let mut estimated_response_bytes = 256_usize;
+        for record in aligned.iter().flatten() {
+            let record_bytes = match record {
+                ConfirmedRecord::Node(record) => record
+                    .name()
+                    .as_str()
+                    .len()
+                    .checked_add(record.payload().as_bytes().len())
+                    .and_then(|value| value.checked_add(128)),
+                ConfirmedRecord::Relation(record) => record.name().as_str().len().checked_add(96),
+                ConfirmedRecord::Edge(_) => Some(160),
+            }
+            .ok_or(CatalogError::InvalidBatch {
+                reason: "estimated success response bytes overflow".to_owned(),
+            })?;
+            estimated_response_bytes = estimated_response_bytes.checked_add(record_bytes).ok_or(
+                CatalogError::InvalidBatch {
+                    reason: "estimated success response bytes overflow".to_owned(),
+                },
+            )?;
+        }
+        if estimated_response_bytes > maximum_response_bytes {
+            return Err(CatalogError::InvalidBatch {
+                reason: "the required success response exceeds its configured byte limit"
+                    .to_owned(),
+            });
+        }
+
+        let candidates_cf = column_family(&self.db, column_families::CANDIDATES)?;
+        let nodes_cf = column_family(&self.db, column_families::NODES)?;
+        let node_names_cf = column_family(&self.db, column_families::NODE_NAMES)?;
+        let relations_cf = column_family(&self.db, column_families::RELATION_KINDS)?;
+        let relation_names_cf = column_family(&self.db, column_families::RELATION_NAMES)?;
+        let popularity_cf = column_family(&self.db, column_families::RELATION_POPULARITY)?;
+        let edges_cf = column_family(&self.db, column_families::EDGES)?;
+        let outgoing_cf = column_family(&self.db, column_families::OUTGOING_EDGES)?;
+        let incoming_cf = column_family(&self.db, column_families::INCOMING_EDGES)?;
+        let mut batch = WriteBatch::default();
+        for candidate in &candidates {
+            batch.delete_cf(candidates_cf, encode_id_key(candidate.id().as_u64()));
+        }
+        for record in &created_nodes {
+            batch.put_cf(
+                nodes_cf,
+                encode_id_key(record.id().as_u64()),
+                encode_node(record).map_err(codec_input_error)?,
+            );
+            batch.put_cf(
+                node_names_cf,
+                encode_name_key(record.name().as_str()).map_err(codec_input_error)?,
+                encode_u64_record(record.id().as_u64()),
+            );
+        }
+        let mut final_relations = BTreeMap::<RelationId, RelationRecord>::new();
+        for record in &created_relations {
+            final_relations.insert(record.id(), record.clone());
+        }
+        final_relations.extend(usage);
+        for (id, record) in &final_relations {
+            if !created_relations.iter().any(|created| created.id() == *id) {
+                let old = get_relation_from_db(&self.db, *id)?;
+                batch.delete_cf(
+                    popularity_cf,
+                    encode_popularity_key(&old).map_err(codec_input_error)?,
+                );
+            } else {
+                batch.put_cf(
+                    relation_names_cf,
+                    encode_name_key(record.name().as_str()).map_err(codec_input_error)?,
+                    encode_u64_record(id.as_u64()),
+                );
+            }
+            batch.put_cf(
+                relations_cf,
+                encode_id_key(id.as_u64()),
+                encode_relation(record).map_err(codec_input_error)?,
+            );
+            batch.put_cf(
+                popularity_cf,
+                encode_popularity_key(record).map_err(codec_input_error)?,
+                encode_u64_record(id.as_u64()),
+            );
+        }
+        for edge in &created_edges {
+            batch.put_cf(
+                edges_cf,
+                encode_id_key(edge.id().as_u64()),
+                encode_edge(edge),
+            );
+            batch.put_cf(
+                outgoing_cf,
+                encode_adjacency_key(edge.source(), edge.id()),
+                encode_adjacency_value(edge.id()),
+            );
+            batch.put_cf(
+                incoming_cf,
+                encode_adjacency_key(edge.destination(), edge.id()),
+                encode_adjacency_value(edge.id()),
+            );
+        }
+        let graph_changed =
+            !created_nodes.is_empty() || !created_relations.is_empty() || !created_edges.is_empty();
+        if graph_changed {
+            batch.delete(META_ACTIVE_ROUTING_IMAGE);
+        }
+        batch.put(META_NEXT_NODE_ID, encode_u64_record(following_node));
+        batch.put(META_NEXT_RELATION_ID, encode_u64_record(following_relation));
+        batch.put(META_NEXT_EDGE_ID, encode_u64_record(following_edge));
+        self.commit_batch(batch, WriteOperationClass::ConfirmedPromotion)?;
+        for record in &created_nodes {
+            node_index.insert(record.name().as_str().into(), record.id());
+        }
+        for record in &created_relations {
+            relation_index.insert(record.name().as_str().into(), record.id());
+        }
+        let records = aligned
+            .into_iter()
+            .map(|record| record.expect("every selected candidate receives an aligned result"))
+            .collect();
+        Ok(CandidateBatchConfirmation {
+            records,
+            counts,
+            graph_changed,
+            created_nodes: created_nodes.len(),
+            created_relation_kinds: created_relations.len(),
+        })
     }
 
     /// Resolves a confirmed node by complete, case-sensitive string equality.
@@ -674,28 +1413,153 @@ impl Catalog {
         )
     }
 
+    /// Returns a bounded current popularity snapshot in durable index order.
+    pub fn most_used_relation_kinds(
+        &self,
+        maximum_results: usize,
+    ) -> Result<Vec<RelationKindUsage>, CatalogError> {
+        if maximum_results == 0 || maximum_results > MAXIMUM_CANDIDATE_BATCH_ENTRIES {
+            return Err(CatalogError::InvalidBatch {
+                reason: "the popularity result limit must be nonzero and bounded".to_owned(),
+            });
+        }
+        let snapshot = self.db.snapshot();
+        let cf = column_family(&self.db, column_families::RELATION_POPULARITY)?;
+        let mut results = Vec::new();
+        results
+            .try_reserve(maximum_results.min(1024))
+            .map_err(|_| CatalogError::StorageExhausted {
+                operation: "relation popularity result allocation",
+            })?;
+        for entry in snapshot
+            .iterator_cf(cf, IteratorMode::Start)
+            .take(maximum_results)
+        {
+            let (key, value) = entry?;
+            let (total, confirmed, id) = decode_popularity_key(&key).map_err(|error| {
+                record_error(column_families::RELATION_POPULARITY, bytes_id(&key), error)
+            })?;
+            let value_id = decode_u64_record(&value).map_err(|error| {
+                record_error(column_families::RELATION_POPULARITY, bytes_id(&key), error)
+            })?;
+            if value_id != id.as_u64() {
+                return Err(corrupt(
+                    column_families::RELATION_POPULARITY,
+                    bytes_id(&key),
+                    "index value does not match relation ID",
+                ));
+            }
+            let relations = column_family(&self.db, column_families::RELATION_KINDS)?;
+            let record_bytes = snapshot
+                .get_cf(relations, encode_id_key(id.as_u64()))?
+                .ok_or_else(|| {
+                    corrupt(
+                        column_families::RELATION_POPULARITY,
+                        id.to_string(),
+                        "indexed relation kind is missing from the snapshot",
+                    )
+                })?;
+            let record = decode_relation(&record_bytes, id.as_u64()).map_err(|error| {
+                record_error(column_families::RELATION_KINDS, id.to_string(), error)
+            })?;
+            if record.total_reference_count() != Some(total)
+                || record.confirmed_edge_count() != confirmed
+            {
+                return Err(corrupt(
+                    column_families::RELATION_POPULARITY,
+                    id.to_string(),
+                    "index counts do not match the relation-kind record",
+                ));
+            }
+            results.push(RelationKindUsage {
+                relation_kind: record,
+            });
+        }
+        Ok(results)
+    }
+
     /// Removes one exact confirmed edge and both adjacency entries atomically.
-    pub fn remove_edge(&self, id: EdgeId) -> Result<(), CatalogError> {
+    pub fn remove_edge(&self, id: EdgeId) -> Result<DeletionResult, CatalogError> {
         let _write = self.write_guard()?;
         let edge = self.get_edge(id)?;
         validate_exact_adjacency(&self.db, &edge)?;
 
+        let relation = get_relation_from_db(&self.db, edge.relation_kind())?;
+        let confirmed = relation
+            .confirmed_edge_count()
+            .checked_sub(1)
+            .ok_or_else(|| {
+                corrupt(
+                    column_families::RELATION_KINDS,
+                    relation.id().to_string(),
+                    "confirmed edge count underflow during edge deletion",
+                )
+            })?;
+        let updated = RelationRecord::with_usage(
+            relation.id(),
+            relation.name().clone(),
+            relation.provisional_reference_count(),
+            confirmed,
+        );
+        let remove_relation = updated.provisional_reference_count() == 0 && confirmed == 0;
+        let mut relation_index = self.relation_index_write()?;
+
         let edges = column_family(&self.db, column_families::EDGES)?;
         let outgoing = column_family(&self.db, column_families::OUTGOING_EDGES)?;
         let incoming = column_family(&self.db, column_families::INCOMING_EDGES)?;
+        let relations = column_family(&self.db, column_families::RELATION_KINDS)?;
+        let relation_names = column_family(&self.db, column_families::RELATION_NAMES)?;
+        let popularity = column_family(&self.db, column_families::RELATION_POPULARITY)?;
         let mut batch = WriteBatch::default();
         batch.delete(META_ACTIVE_ROUTING_IMAGE);
         batch.delete_cf(edges, encode_id_key(id.as_u64()));
         batch.delete_cf(outgoing, encode_adjacency_key(edge.source(), id));
         batch.delete_cf(incoming, encode_adjacency_key(edge.destination(), id));
-        self.commit_batch(batch, WriteOperationClass::EdgeDeletion)
+        batch.delete_cf(
+            popularity,
+            encode_popularity_key(&relation).map_err(codec_input_error)?,
+        );
+        if remove_relation {
+            batch.delete_cf(relations, encode_id_key(relation.id().as_u64()));
+            batch.delete_cf(
+                relation_names,
+                encode_name_key(relation.name().as_str()).map_err(codec_input_error)?,
+            );
+        } else {
+            batch.put_cf(
+                relations,
+                encode_id_key(updated.id().as_u64()),
+                encode_relation(&updated).map_err(codec_input_error)?,
+            );
+            batch.put_cf(
+                popularity,
+                encode_popularity_key(&updated).map_err(codec_input_error)?,
+                encode_u64_record(updated.id().as_u64()),
+            );
+        }
+        self.commit_batch(batch, WriteOperationClass::EdgeDeletion)?;
+        if remove_relation {
+            relation_index.remove(relation.name().as_str());
+        }
+        Ok(DeletionResult {
+            removed_relation_kinds: remove_relation
+                .then_some(relation.id())
+                .into_iter()
+                .collect(),
+        })
     }
 
     /// Removes a confirmed node, every incident confirmed edge, and the exact
     /// node-name mapping in one atomic batch.
-    pub fn remove_node(&self, id: NodeId) -> Result<(), CatalogError> {
+    pub fn remove_node(&self, id: NodeId) -> Result<DeletionResult, CatalogError> {
         let _write = self.write_guard()?;
         let node = self.get_node(id)?;
+        if let Some(candidate_id) = provisional_edge_referencing_confirmed_node(&self.db, id)? {
+            return Err(CatalogError::InvalidCandidateDependency {
+                candidate_id,
+                reason: format!("confirmed node {id} is still referenced provisionally"),
+            });
+        }
         let outgoing_edges = incident_edges(&self.db, column_families::OUTGOING_EDGES, id, true)?;
         let incoming_edges = incident_edges(&self.db, column_families::INCOMING_EDGES, id, false)?;
         let mut incident = HashMap::new();
@@ -714,13 +1578,27 @@ impl Catalog {
             validate_exact_adjacency(&self.db, edge)?;
         }
 
+        let mut relation_decrements = BTreeMap::<RelationId, u64>::new();
+        for edge in incident.values() {
+            let decrement = relation_decrements.entry(edge.relation_kind()).or_default();
+            *decrement = decrement
+                .checked_add(1)
+                .ok_or(CatalogError::CounterOverflow {
+                    counter: "confirmed relation edge",
+                })?;
+        }
+
         let name_key = encode_name_key(node.name().as_str()).map_err(codec_input_error)?;
         let nodes = column_family(&self.db, column_families::NODES)?;
         let names = column_family(&self.db, column_families::NODE_NAMES)?;
         let edges = column_family(&self.db, column_families::EDGES)?;
         let outgoing = column_family(&self.db, column_families::OUTGOING_EDGES)?;
         let incoming = column_family(&self.db, column_families::INCOMING_EDGES)?;
+        let relations = column_family(&self.db, column_families::RELATION_KINDS)?;
+        let relation_names = column_family(&self.db, column_families::RELATION_NAMES)?;
+        let popularity = column_family(&self.db, column_families::RELATION_POPULARITY)?;
         let mut index = self.node_index_write()?;
+        let mut relation_index = self.relation_index_write()?;
         if index.get(node.name().as_str()) != Some(&id) {
             return Err(corrupt(
                 column_families::NODE_NAMES,
@@ -739,191 +1617,62 @@ impl Catalog {
                 encode_adjacency_key(edge.destination(), edge.id()),
             );
         }
+        let mut removed_relation_records = Vec::new();
+        for (relation_id, decrement) in relation_decrements {
+            let old = get_relation_from_db(&self.db, relation_id)?;
+            let confirmed = old
+                .confirmed_edge_count()
+                .checked_sub(decrement)
+                .ok_or_else(|| {
+                    corrupt(
+                        column_families::RELATION_KINDS,
+                        relation_id.to_string(),
+                        "confirmed edge count underflow during node deletion",
+                    )
+                })?;
+            let updated = RelationRecord::with_usage(
+                relation_id,
+                old.name().clone(),
+                old.provisional_reference_count(),
+                confirmed,
+            );
+            batch.delete_cf(
+                popularity,
+                encode_popularity_key(&old).map_err(codec_input_error)?,
+            );
+            if updated.provisional_reference_count() == 0 && confirmed == 0 {
+                batch.delete_cf(relations, encode_id_key(relation_id.as_u64()));
+                batch.delete_cf(
+                    relation_names,
+                    encode_name_key(old.name().as_str()).map_err(codec_input_error)?,
+                );
+                removed_relation_records.push(old);
+            } else {
+                batch.put_cf(
+                    relations,
+                    encode_id_key(relation_id.as_u64()),
+                    encode_relation(&updated).map_err(codec_input_error)?,
+                );
+                batch.put_cf(
+                    popularity,
+                    encode_popularity_key(&updated).map_err(codec_input_error)?,
+                    encode_u64_record(relation_id.as_u64()),
+                );
+            }
+        }
         batch.delete_cf(nodes, encode_id_key(id.as_u64()));
         batch.delete_cf(names, name_key);
         self.commit_batch(batch, WriteOperationClass::NodeDeletion)?;
         index.remove(node.name().as_str());
-        Ok(())
-    }
-
-    fn insert_candidate(&self, input: CandidateInput) -> Result<CandidateId, CatalogError> {
-        let _write = self.write_guard()?;
-        let next_id = read_metadata(&self.db, META_NEXT_CANDIDATE_ID, "next-candidate-id")?;
-        let following_id = next_id
-            .checked_add(1)
-            .ok_or(CatalogError::CounterOverflow {
-                counter: "candidate ID",
-            })?;
-        let id = CandidateId::from_u64(next_id);
-        let candidate = match input {
-            CandidateInput::Node { name, payload } => Candidate::Node { id, name, payload },
-            CandidateInput::Relation(name) => Candidate::Relation { id, name },
-            CandidateInput::Edge {
-                source,
-                destination,
-                relation_kind,
-                base_weight,
-            } => Candidate::Edge {
-                id,
-                source,
-                destination,
-                relation_kind,
-                base_weight,
-            },
-        };
-        let encoded = encode_candidate(&candidate).map_err(codec_input_error)?;
-
-        let candidates = column_family(&self.db, column_families::CANDIDATES)?;
-        let mut batch = WriteBatch::default();
-        batch.put_cf(candidates, encode_id_key(next_id), encoded);
-        batch.put(META_NEXT_CANDIDATE_ID, encode_u64_record(following_id));
-        self.commit_batch(batch, WriteOperationClass::CandidateInsertion)?;
-        Ok(id)
-    }
-
-    fn confirm_node(
-        &self,
-        candidate_id: CandidateId,
-        name: NodeName,
-        payload: NodePayload,
-    ) -> Result<ConfirmedRecord, CatalogError> {
-        let name_key = encode_name_key(name.as_str()).map_err(codec_input_error)?;
-        let names_cf = column_family(&self.db, column_families::NODE_NAMES)?;
-        if let Some(value) = self.db.get_cf(names_cf, &name_key)? {
-            let existing = decode_u64_record(&value)
-                .map_err(|error| record_error(column_families::NODE_NAMES, name.as_str(), error))?;
-            let record = get_node_from_db(&self.db, NodeId::from_u64(existing))?;
-            if record.name() != &name {
-                return Err(corrupt(
-                    column_families::NODE_NAMES,
-                    name.as_str(),
-                    "exact-name mapping resolves to a node with a different name",
-                ));
-            }
-            let candidates = column_family(&self.db, column_families::CANDIDATES)?;
-            let mut batch = WriteBatch::default();
-            batch.delete_cf(candidates, encode_id_key(candidate_id.as_u64()));
-            self.commit_batch(batch, WriteOperationClass::ConfirmedPromotion)?;
-            return Ok(ConfirmedRecord::Node(record));
+        for record in &removed_relation_records {
+            relation_index.remove(record.name().as_str());
         }
-
-        let next_id = read_metadata(&self.db, META_NEXT_NODE_ID, "next-node-id")?;
-        let following_id = next_id
-            .checked_add(1)
-            .ok_or(CatalogError::CounterOverflow { counter: "node ID" })?;
-        let record = NodeRecord::new(NodeId::from_u64(next_id), name, payload);
-        let encoded_record = encode_node(&record).map_err(codec_input_error)?;
-        let mut index = self.node_index_write()?;
-
-        let candidates = column_family(&self.db, column_families::CANDIDATES)?;
-        let nodes = column_family(&self.db, column_families::NODES)?;
-        let mut batch = WriteBatch::default();
-        batch.delete(META_ACTIVE_ROUTING_IMAGE);
-        batch.put_cf(nodes, encode_id_key(next_id), encoded_record);
-        batch.put_cf(names_cf, &name_key, encode_u64_record(next_id));
-        batch.delete_cf(candidates, encode_id_key(candidate_id.as_u64()));
-        batch.put(META_NEXT_NODE_ID, encode_u64_record(following_id));
-        self.commit_batch(batch, WriteOperationClass::ConfirmedPromotion)?;
-
-        index.insert(record.name().as_str().into(), record.id());
-        Ok(ConfirmedRecord::Node(record))
-    }
-
-    fn confirm_relation(
-        &self,
-        candidate_id: CandidateId,
-        name: RelationName,
-    ) -> Result<ConfirmedRecord, CatalogError> {
-        let name_key = encode_name_key(name.as_str()).map_err(codec_input_error)?;
-        let names_cf = column_family(&self.db, column_families::RELATION_NAMES)?;
-        if let Some(value) = self.db.get_cf(names_cf, &name_key)? {
-            let existing = decode_u64_record(&value).map_err(|error| {
-                record_error(column_families::RELATION_NAMES, name.as_str(), error)
-            })?;
-            let record = get_relation_from_db(&self.db, RelationId::from_u64(existing))?;
-            if record.name() != &name {
-                return Err(corrupt(
-                    column_families::RELATION_NAMES,
-                    name.as_str(),
-                    "exact-name mapping resolves to a relation kind with a different name",
-                ));
-            }
-            let candidates = column_family(&self.db, column_families::CANDIDATES)?;
-            let mut batch = WriteBatch::default();
-            batch.delete_cf(candidates, encode_id_key(candidate_id.as_u64()));
-            self.commit_batch(batch, WriteOperationClass::ConfirmedPromotion)?;
-            return Ok(ConfirmedRecord::Relation(record));
-        }
-
-        let next_id = read_metadata(&self.db, META_NEXT_RELATION_ID, "next-relation-id")?;
-        let following_id = next_id
-            .checked_add(1)
-            .ok_or(CatalogError::CounterOverflow {
-                counter: "relation ID",
-            })?;
-        let record = RelationRecord::new(RelationId::from_u64(next_id), name);
-        let encoded_record = encode_relation(&record).map_err(codec_input_error)?;
-        let mut index = self.relation_index_write()?;
-
-        let candidates = column_family(&self.db, column_families::CANDIDATES)?;
-        let relations = column_family(&self.db, column_families::RELATION_KINDS)?;
-        let mut batch = WriteBatch::default();
-        batch.delete(META_ACTIVE_ROUTING_IMAGE);
-        batch.put_cf(relations, encode_id_key(next_id), encoded_record);
-        batch.put_cf(names_cf, &name_key, encode_u64_record(next_id));
-        batch.delete_cf(candidates, encode_id_key(candidate_id.as_u64()));
-        batch.put(META_NEXT_RELATION_ID, encode_u64_record(following_id));
-        self.commit_batch(batch, WriteOperationClass::ConfirmedPromotion)?;
-
-        index.insert(record.name().as_str().into(), record.id());
-        Ok(ConfirmedRecord::Relation(record))
-    }
-
-    fn confirm_edge(
-        &self,
-        candidate_id: CandidateId,
-        source: NodeId,
-        destination: NodeId,
-        relation_kind: RelationId,
-        base_weight: BaseWeight,
-    ) -> Result<ConfirmedRecord, CatalogError> {
-        require_node(&self.db, source, EdgeEndpoint::Source)?;
-        require_node(&self.db, destination, EdgeEndpoint::Destination)?;
-        require_relation_kind(&self.db, relation_kind)?;
-
-        let next_id = read_metadata(&self.db, META_NEXT_EDGE_ID, "next-edge-id")?;
-        let following_id = next_id
-            .checked_add(1)
-            .ok_or(CatalogError::CounterOverflow { counter: "edge ID" })?;
-        let record = EdgeRecord::new(
-            EdgeId::from_u64(next_id),
-            source,
-            destination,
-            relation_kind,
-            base_weight,
-        );
-
-        let candidates = column_family(&self.db, column_families::CANDIDATES)?;
-        let edges = column_family(&self.db, column_families::EDGES)?;
-        let outgoing = column_family(&self.db, column_families::OUTGOING_EDGES)?;
-        let incoming = column_family(&self.db, column_families::INCOMING_EDGES)?;
-        let mut batch = WriteBatch::default();
-        batch.delete(META_ACTIVE_ROUTING_IMAGE);
-        batch.put_cf(edges, encode_id_key(next_id), encode_edge(&record));
-        batch.put_cf(
-            outgoing,
-            encode_adjacency_key(source, record.id()),
-            encode_adjacency_value(record.id()),
-        );
-        batch.put_cf(
-            incoming,
-            encode_adjacency_key(destination, record.id()),
-            encode_adjacency_value(record.id()),
-        );
-        batch.delete_cf(candidates, encode_id_key(candidate_id.as_u64()));
-        batch.put(META_NEXT_EDGE_ID, encode_u64_record(following_id));
-        self.commit_batch(batch, WriteOperationClass::ConfirmedPromotion)?;
-        Ok(ConfirmedRecord::Edge(record))
+        Ok(DeletionResult {
+            removed_relation_kinds: removed_relation_records
+                .into_iter()
+                .map(|record| record.id())
+                .collect(),
+        })
     }
 
     pub(crate) fn write_guard(&self) -> Result<MutexGuard<'_, ()>, CatalogError> {
@@ -939,11 +1688,12 @@ impl Catalog {
         batch: WriteBatch,
         class: WriteOperationClass,
     ) -> Result<(), CatalogError> {
+        let entries = batch.len();
         let bytes = batch.size_in_bytes();
         self.metrics.record_write_attempt(class);
         match self.db.write_opt(batch, &options::write_options()) {
             Ok(()) => {
-                self.metrics.record_write_success(class, bytes);
+                self.metrics.record_write_success(class, entries, bytes);
                 Ok(())
             }
             Err(error) => {
@@ -972,18 +1722,114 @@ impl Catalog {
     }
 }
 
-enum CandidateInput {
-    Node {
-        name: NodeName,
-        payload: NodePayload,
-    },
-    Relation(RelationName),
-    Edge {
-        source: NodeId,
-        destination: NodeId,
-        relation_kind: RelationId,
-        base_weight: BaseWeight,
-    },
+fn invalid_local_reference(owner: usize, local: usize, expected: &'static str) -> CatalogError {
+    CatalogError::InvalidBatch {
+        reason: format!(
+            "entry {owner} local reference {local} does not identify a {expected} entry"
+        ),
+    }
+}
+
+fn resolve_batch_node_reference(
+    db: &DB,
+    entries: &[CandidateBatchEntry],
+    ids: &[CandidateId],
+    owner: usize,
+    endpoint: EdgeEndpoint,
+    reference: BatchNodeReference,
+    incoming: &mut [u64],
+) -> Result<CandidateNodeReference, CatalogError> {
+    match reference {
+        BatchNodeReference::Confirmed(id) => {
+            require_node(db, id, endpoint)?;
+            Ok(CandidateNodeReference::Confirmed(id))
+        }
+        BatchNodeReference::BatchNode(local) => {
+            if !matches!(entries.get(local), Some(CandidateBatchEntry::Node { .. })) {
+                return Err(invalid_local_reference(owner, local, "node"));
+            }
+            incoming[local] =
+                incoming[local]
+                    .checked_add(1)
+                    .ok_or(CatalogError::CounterOverflow {
+                        counter: "candidate incoming reference",
+                    })?;
+            Ok(CandidateNodeReference::Candidate(ids[local]))
+        }
+    }
+}
+
+fn checked_increment_candidate_reference(
+    counts: &mut HashMap<CandidateId, u64>,
+    id: CandidateId,
+) -> Result<(), CatalogError> {
+    let count = counts.entry(id).or_default();
+    *count = count.checked_add(1).ok_or(CatalogError::CounterOverflow {
+        counter: "candidate incoming reference",
+    })?;
+    Ok(())
+}
+
+fn validate_selected_node_dependency(
+    db: &DB,
+    candidates: &[Candidate],
+    selected: &HashMap<CandidateId, usize>,
+    owner: CandidateId,
+    reference: CandidateNodeReference,
+    incoming: &mut HashMap<CandidateId, u64>,
+) -> Result<(), CatalogError> {
+    match reference {
+        CandidateNodeReference::Confirmed(id) => require_node(db, id, EdgeEndpoint::Source),
+        CandidateNodeReference::Candidate(dependency) => {
+            let Some(index) = selected.get(&dependency).copied() else {
+                return Err(CatalogError::InvalidCandidateDependency {
+                    candidate_id: owner,
+                    reason: format!("node candidate {dependency} is not selected"),
+                });
+            };
+            if !matches!(candidates[index], Candidate::Node { .. }) {
+                return Err(CatalogError::InvalidCandidateDependency {
+                    candidate_id: owner,
+                    reason: format!("candidate {dependency} is not a node"),
+                });
+            }
+            checked_increment_candidate_reference(incoming, dependency)
+        }
+    }
+}
+
+fn resolve_confirmed_node(
+    reference: CandidateNodeReference,
+    resolved: &HashMap<CandidateId, NodeRecord>,
+) -> Result<NodeId, CatalogError> {
+    match reference {
+        CandidateNodeReference::Confirmed(id) => Ok(id),
+        CandidateNodeReference::Candidate(id) => {
+            resolved
+                .get(&id)
+                .map(NodeRecord::id)
+                .ok_or(CatalogError::InvalidCandidateDependency {
+                    candidate_id: id,
+                    reason: "selected node dependency has no resolution".to_owned(),
+                })
+        }
+    }
+}
+
+fn resolve_confirmed_relation(
+    reference: CandidateRelationReference,
+    resolved: &HashMap<CandidateId, RelationRecord>,
+) -> Result<RelationId, CatalogError> {
+    match reference {
+        CandidateRelationReference::Confirmed(id) => Ok(id),
+        CandidateRelationReference::Candidate(id) => resolved
+            .get(&id)
+            .map(RelationRecord::id)
+            .ok_or(CatalogError::InvalidCandidateDependency {
+                candidate_id: id,
+                reason: "selected relation-kind dependency has no resolution".to_owned(),
+            }),
+    }
 }
 
 fn initialize_metadata(db: &DB) -> Result<(), CatalogError> {
@@ -1088,6 +1934,7 @@ pub(crate) fn rebuild_indexes_and_validate_with(
     let nodes = rebuild_node_index(db, check)?;
     let relations = rebuild_relation_index(db, check)?;
     validate_edges_and_adjacency(db, check)?;
+    validate_relation_usage_and_candidate_dependencies(db, check)?;
     validate_next_id_counters(db, check)?;
     Ok((nodes, relations))
 }
@@ -1336,6 +2183,175 @@ fn validate_edges_and_adjacency(
     Ok(())
 }
 
+fn validate_relation_usage_and_candidate_dependencies(
+    db: &DB,
+    check: &mut impl FnMut() -> Result<(), CatalogError>,
+) -> Result<(), CatalogError> {
+    let candidates_cf = column_family(db, column_families::CANDIDATES)?;
+    let mut candidates = BTreeMap::<CandidateId, Candidate>::new();
+    for entry in db.iterator_cf(candidates_cf, IteratorMode::Start) {
+        check()?;
+        let (key, value) = entry?;
+        let raw_id = decode_id_key(&key)
+            .map_err(|error| record_error(column_families::CANDIDATES, bytes_id(&key), error))?;
+        let id = CandidateId::from_u64(raw_id);
+        let candidate = decode_candidate(&value, raw_id).map_err(|error| {
+            record_error(column_families::CANDIDATES, raw_id.to_string(), error)
+        })?;
+        candidates.insert(id, candidate);
+    }
+    let mut incoming = HashMap::<CandidateId, u64>::new();
+    let mut provisional = HashMap::<RelationId, u64>::new();
+    for candidate in candidates.values() {
+        let Candidate::Edge {
+            id,
+            source,
+            destination,
+            relation_kind,
+            ..
+        } = candidate
+        else {
+            continue;
+        };
+        for reference in [source, destination] {
+            match reference {
+                CandidateNodeReference::Confirmed(node) => {
+                    get_node_from_db(db, *node).map_err(|_| {
+                        corrupt(
+                            column_families::CANDIDATES,
+                            id.to_string(),
+                            format!("confirmed node dependency {node} is missing"),
+                        )
+                    })?;
+                }
+                CandidateNodeReference::Candidate(dependency) => {
+                    if !matches!(candidates.get(dependency), Some(Candidate::Node { .. })) {
+                        return Err(corrupt(
+                            column_families::CANDIDATES,
+                            id.to_string(),
+                            format!(
+                                "node candidate dependency {dependency} is missing or mistyped"
+                            ),
+                        ));
+                    }
+                    checked_increment_candidate_reference(&mut incoming, *dependency)?;
+                }
+            }
+        }
+        match relation_kind {
+            CandidateRelationReference::Confirmed(relation) => {
+                get_relation_from_db(db, *relation).map_err(|_| {
+                    corrupt(
+                        column_families::CANDIDATES,
+                        id.to_string(),
+                        format!("confirmed relation-kind dependency {relation} is missing"),
+                    )
+                })?;
+                let count = provisional.entry(*relation).or_default();
+                *count = count.checked_add(1).ok_or_else(|| {
+                    corrupt(
+                        column_families::RELATION_KINDS,
+                        relation.to_string(),
+                        "recomputed provisional usage overflow",
+                    )
+                })?;
+            }
+            CandidateRelationReference::Candidate(dependency) => {
+                if !matches!(candidates.get(dependency), Some(Candidate::Relation { .. })) {
+                    return Err(corrupt(
+                        column_families::CANDIDATES,
+                        id.to_string(),
+                        format!(
+                            "relation-kind candidate dependency {dependency} is missing or mistyped"
+                        ),
+                    ));
+                }
+                checked_increment_candidate_reference(&mut incoming, *dependency)?;
+            }
+        }
+    }
+    for candidate in candidates.values() {
+        let (id, stored) = match candidate {
+            Candidate::Node {
+                id,
+                incoming_reference_count,
+                ..
+            }
+            | Candidate::Relation {
+                id,
+                incoming_reference_count,
+                ..
+            } => (*id, *incoming_reference_count),
+            Candidate::Edge { .. } => continue,
+        };
+        if incoming.get(&id).copied().unwrap_or(0) != stored {
+            return Err(corrupt(
+                column_families::CANDIDATES,
+                id.to_string(),
+                "stored incoming reference count does not match edge candidates",
+            ));
+        }
+    }
+    let mut confirmed = HashMap::<RelationId, u64>::new();
+    for edge in all_edges_with(db, check)? {
+        let count = confirmed.entry(edge.relation_kind()).or_default();
+        *count = count.checked_add(1).ok_or_else(|| {
+            corrupt(
+                column_families::RELATION_KINDS,
+                edge.relation_kind().to_string(),
+                "recomputed confirmed usage overflow",
+            )
+        })?;
+    }
+    let relations = all_relation_kinds(db)?;
+    let mut expected_popularity = BTreeSet::new();
+    for record in &relations {
+        let expected_provisional = provisional.get(&record.id()).copied().unwrap_or(0);
+        let expected_confirmed = confirmed.get(&record.id()).copied().unwrap_or(0);
+        if record.provisional_reference_count() != expected_provisional
+            || record.confirmed_edge_count() != expected_confirmed
+        {
+            return Err(corrupt(
+                column_families::RELATION_KINDS,
+                record.id().to_string(),
+                "stored usage counts do not match candidates and canonical edges",
+            ));
+        }
+        expected_popularity.insert(
+            encode_popularity_key(record)
+                .map_err(codec_input_error)?
+                .to_vec(),
+        );
+    }
+    let popularity_cf = column_family(db, column_families::RELATION_POPULARITY)?;
+    let mut actual_popularity = BTreeSet::new();
+    for entry in db.iterator_cf(popularity_cf, IteratorMode::Start) {
+        check()?;
+        let (key, value) = entry?;
+        let (_, _, id) = decode_popularity_key(&key).map_err(|error| {
+            record_error(column_families::RELATION_POPULARITY, bytes_id(&key), error)
+        })?;
+        let value_id = decode_u64_record(&value).map_err(|error| {
+            record_error(column_families::RELATION_POPULARITY, bytes_id(&key), error)
+        })?;
+        if value_id != id.as_u64() || !actual_popularity.insert(key.to_vec()) {
+            return Err(corrupt(
+                column_families::RELATION_POPULARITY,
+                bytes_id(&key),
+                "duplicate or mismatched popularity entry",
+            ));
+        }
+    }
+    if actual_popularity != expected_popularity {
+        return Err(corrupt(
+            column_families::RELATION_POPULARITY,
+            "index",
+            "popularity entries do not exactly match relation-kind usage",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_adjacency_family(
     db: &DB,
     name: &'static str,
@@ -1456,6 +2472,44 @@ fn get_node_from_db(db: &DB, id: NodeId) -> Result<NodeRecord, CatalogError> {
         })?;
     decode_node(&value, id.as_u64())
         .map_err(|error| record_error(column_families::NODES, id.to_string(), error))
+}
+
+fn get_candidate_from_db(db: &DB, id: CandidateId) -> Result<Candidate, CatalogError> {
+    let cf = column_family(db, column_families::CANDIDATES)?;
+    let value = db
+        .get_cf(cf, encode_id_key(id.as_u64()))?
+        .ok_or(CatalogError::NotFound {
+            kind: RecordKind::Candidate,
+            id: id.as_u64(),
+        })?;
+    decode_candidate(&value, id.as_u64())
+        .map_err(|error| record_error(column_families::CANDIDATES, id.to_string(), error))
+}
+
+fn provisional_edge_referencing_confirmed_node(
+    db: &DB,
+    node: NodeId,
+) -> Result<Option<CandidateId>, CatalogError> {
+    let cf = column_family(db, column_families::CANDIDATES)?;
+    for entry in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, value) = entry?;
+        let raw_id = decode_id_key(&key)
+            .map_err(|error| record_error(column_families::CANDIDATES, bytes_id(&key), error))?;
+        let candidate = decode_candidate(&value, raw_id).map_err(|error| {
+            record_error(column_families::CANDIDATES, raw_id.to_string(), error)
+        })?;
+        if let Candidate::Edge {
+            source,
+            destination,
+            ..
+        } = candidate
+            && (source == CandidateNodeReference::Confirmed(node)
+                || destination == CandidateNodeReference::Confirmed(node))
+        {
+            return Ok(Some(CandidateId::from_u64(raw_id)));
+        }
+    }
+    Ok(None)
 }
 
 fn get_relation_from_db(db: &DB, id: RelationId) -> Result<RelationRecord, CatalogError> {

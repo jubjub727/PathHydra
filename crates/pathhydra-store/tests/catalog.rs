@@ -8,7 +8,7 @@ use pathhydra_store::{Candidate, Catalog, CatalogError, ConfirmedRecord, RecordK
 use rocksdb::{DB, Options};
 use tempfile::TempDir;
 
-const COLUMN_FAMILIES: [&str; 8] = [
+const COLUMN_FAMILIES: [&str; 9] = [
     "candidates",
     "nodes",
     "node_names",
@@ -17,6 +17,7 @@ const COLUMN_FAMILIES: [&str; 8] = [
     "edges",
     "outgoing_edges",
     "incoming_edges",
+    "relation_popularity",
 ];
 const EXACT_NAMES: [&str; 7] = [
     "token",
@@ -41,6 +42,7 @@ fn node_candidate_lifecycle_preserves_exact_identity_across_restart() {
             id: candidate_id,
             name: "token ".into(),
             payload: Default::default(),
+            incoming_reference_count: 0,
         }
     );
 
@@ -79,6 +81,7 @@ fn relation_candidate_lifecycle_preserves_exact_identity_across_restart() {
         Candidate::Relation {
             id: candidate_id,
             name: "tokén".into(),
+            incoming_reference_count: 0,
         }
     );
 

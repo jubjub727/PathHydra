@@ -139,6 +139,7 @@ fn run_case(graph_nodes: usize, scenario: Scenario, sample: usize) {
 
 fn publication_duration<T>(mutation: ConfirmedMutation<T>) -> std::time::Duration {
     match mutation.publication() {
+        PublicationOutcome::NotRequired => std::time::Duration::ZERO,
         PublicationOutcome::Published(report)
         | PublicationOutcome::RoutingUnavailable(_, report) => report.duration(),
     }

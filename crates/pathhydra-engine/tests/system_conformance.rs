@@ -270,7 +270,17 @@ fn materialize(engine: &GraphEngine, spec: &GraphSpec) -> MaterializedGraph {
         .map(|index| confirm_relation(engine, format!("seed-{:016x}-relation-{index}", spec.seed)))
         .collect::<Vec<_>>();
 
-    let removed = confirm_edge(engine, nodes[0].id(), nodes[0].id(), relations[0].id(), 1.0);
+    let tombstone_relation = confirm_relation(
+        engine,
+        format!("seed-{:016x}-tombstone-relation", spec.seed),
+    );
+    let removed = confirm_edge(
+        engine,
+        nodes[0].id(),
+        nodes[0].id(),
+        tombstone_relation.id(),
+        1.0,
+    );
     engine.remove_edge(removed.id()).unwrap();
 
     let edges = spec
@@ -286,6 +296,10 @@ fn materialize(engine: &GraphEngine, spec: &GraphSpec) -> MaterializedGraph {
             )
         })
         .collect::<Vec<_>>();
+    let relations = relations
+        .into_iter()
+        .map(|relation| engine.get_relation(relation.id()).unwrap())
+        .collect();
     assert!(nodes[0].id().as_u64() > 1);
     assert!(edges[0].id().as_u64() > 1);
     MaterializedGraph {
@@ -1171,9 +1185,17 @@ fn checkpoint_restore_equivalence(use_cuda: bool) {
         assert_eq!(&restored_engine.get_node(node.id()).unwrap(), node);
     }
     for relation in &graph.relations {
+        let restored = restored_engine.get_relation(relation.id()).unwrap();
+        assert_eq!(restored.id(), relation.id());
+        assert_eq!(restored.name(), relation.name());
         assert_eq!(
-            &restored_engine.get_relation(relation.id()).unwrap(),
-            relation
+            restored.confirmed_edge_count(),
+            relation.confirmed_edge_count()
+        );
+        assert_eq!(
+            restored.provisional_reference_count(),
+            relation.provisional_reference_count()
+                + u64::from(relation.id() == graph.relations[0].id())
         );
     }
     for edge in &graph.edges {

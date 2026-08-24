@@ -277,6 +277,7 @@ impl ImageBuildReport {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PublicationOutcome {
+    NotRequired,
     Published(ImageBuildReport),
     RoutingUnavailable(RoutingUnavailableReason, ImageBuildReport),
 }
@@ -304,6 +305,13 @@ impl<T> ConfirmedMutation<T> {
     #[must_use]
     pub fn into_parts(self) -> (T, PublicationOutcome) {
         (self.durable_result, self.publication)
+    }
+
+    pub(crate) fn map<U>(self, map: impl FnOnce(T) -> U) -> ConfirmedMutation<U> {
+        ConfirmedMutation {
+            durable_result: map(self.durable_result),
+            publication: self.publication,
+        }
     }
 }
 

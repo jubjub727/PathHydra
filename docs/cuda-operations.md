@@ -1,5 +1,12 @@
 # CUDA operations
 
+Atomic confirmed candidate batches retain the existing complete-image CUDA
+ownership boundary. One graph-changing batch compiles one CPU/bundle image and
+attempts CUDA residency once; it never uploads after each entry. Requests that
+already leased the old image may finish, while later admission observes the
+complete replacement or the one typed routing-unavailable state. Provisional
+and duplicate-name-only batches do not touch CUDA residency.
+
 Routing bundles are rebuildable and survive CUDA context loss. Reinitializing CUDA never changes confirmed records or bundle bytes. Operators size complete CUDA topology separately from host identity/directory metadata, the host partition cache, and CPU/device search reservations. A corrupt or unreadable partition is an image failure that triggers a controlled RocksDB rebuild, never an unreachable route.
 
 CUDA is disabled by default. Enable `EngineConfig.cuda`, choose device ordinal

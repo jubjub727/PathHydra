@@ -374,6 +374,15 @@ fn concurrent_partitioned_routes_observe_only_complete_old_or_new_publications()
     else {
         panic!()
     };
+    let keeper_candidate = engine.insert_node_candidate("keeper").unwrap();
+    let ConfirmedRecord::Node(keeper) = engine
+        .confirm_validated_candidate(keeper_candidate)
+        .unwrap()
+        .into_parts()
+        .0
+    else {
+        panic!()
+    };
     let relation_candidate = engine.insert_relation_candidate("kind").unwrap();
     let ConfirmedRecord::Relation(relation) = engine
         .confirm_validated_candidate(relation_candidate)
@@ -387,6 +396,10 @@ fn concurrent_partitioned_routes_observe_only_complete_old_or_new_publications()
         .insert_edge_candidate(source.id(), destination.id(), relation.id(), 1.0)
         .unwrap();
     engine.confirm_validated_candidate(edge).unwrap();
+    let keeper_edge = engine
+        .insert_edge_candidate(keeper.id(), source.id(), relation.id(), 1.0)
+        .unwrap();
+    engine.confirm_validated_candidate(keeper_edge).unwrap();
     let request = std::sync::Arc::new(RoutingRequest::new(
         source.id(),
         [destination.id()],

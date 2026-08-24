@@ -1,4 +1,4 @@
-use pathhydra_store::{Catalog, ConfirmedRecord, NodePayload};
+use pathhydra_store::{Catalog, ConfirmedRecord, NodePayload, RelationRecord};
 use tempfile::TempDir;
 
 #[test]
@@ -22,7 +22,15 @@ fn confirmed_graph_read_is_sorted_complete_and_excludes_every_candidate_kind() {
 
     let records = catalog.confirmed_graph_records().unwrap();
     assert_eq!(records.nodes(), [first.clone(), third.clone()]);
-    assert_eq!(records.relation_kinds(), std::slice::from_ref(&relation));
+    assert_eq!(
+        records.relation_kinds(),
+        [RelationRecord::with_usage(
+            relation.id(),
+            relation.name().clone(),
+            1,
+            1,
+        )]
+    );
     assert_eq!(records.edges(), std::slice::from_ref(&edge));
     for candidate in [provisional_node, provisional_relation, provisional_edge] {
         assert_eq!(catalog.get_candidate(candidate).unwrap().id(), candidate);

@@ -101,11 +101,13 @@ pub(crate) fn metric_json(metrics: &StoreMetricsSnapshot) -> String {
         if let Some(value) = metrics.writes.get(&class) {
             let _ = write!(
                 writes,
-                "{{\"attempts\":{},\"failures\":{},\"committed_bytes\":{}}}",
-                value.attempts, value.failures, value.committed_bytes
+                "{{\"attempts\":{},\"failures\":{},\"committed_entries\":{},\"committed_bytes\":{}}}",
+                value.attempts, value.failures, value.committed_entries, value.committed_bytes
             );
         } else {
-            writes.push_str("{\"attempts\":0,\"failures\":0,\"committed_bytes\":0}");
+            writes.push_str(
+                "{\"attempts\":0,\"failures\":0,\"committed_entries\":0,\"committed_bytes\":0}",
+            );
         }
     }
     writes.push('}');

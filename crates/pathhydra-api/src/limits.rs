@@ -17,11 +17,20 @@ pub struct ApiLimits {
     pub maximum_diagnostic_text_bytes: usize,
     pub maximum_nesting_depth: usize,
     pub maximum_json_values: usize,
+    pub maximum_batch_entries: usize,
+    pub maximum_batch_node_entries: usize,
+    pub maximum_batch_relation_kind_entries: usize,
+    pub maximum_batch_edge_entries: usize,
+    pub maximum_batch_name_bytes: usize,
+    pub maximum_batch_payload_bytes: usize,
+    pub maximum_batch_references: usize,
+    pub maximum_batch_estimated_bytes: usize,
+    pub maximum_relation_kind_usage_results: usize,
 }
 
 impl ApiLimits {
     pub const DEFAULT: Self = Self {
-        maximum_encoded_bytes: 16 * 1024 * 1024,
+        maximum_encoded_bytes: 256 * 1024 * 1024,
         maximum_name_bytes: 64 * 1024,
         maximum_payload_bytes: 8 * 1024 * 1024,
         maximum_destinations: 100_000,
@@ -33,6 +42,15 @@ impl ApiLimits {
         maximum_diagnostic_text_bytes: 64 * 1024,
         maximum_nesting_depth: 64,
         maximum_json_values: 4_000_000,
+        maximum_batch_entries: 120_000,
+        maximum_batch_node_entries: 20_000,
+        maximum_batch_relation_kind_entries: 10_000,
+        maximum_batch_edge_entries: 100_000,
+        maximum_batch_name_bytes: 64 * 1024 * 1024,
+        maximum_batch_payload_bytes: 512 * 1024 * 1024,
+        maximum_batch_references: 300_000,
+        maximum_batch_estimated_bytes: 1024 * 1024 * 1024,
+        maximum_relation_kind_usage_results: 100_000,
     };
 
     /// Replace the three generic syntactic limits while retaining semantic

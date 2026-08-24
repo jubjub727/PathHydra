@@ -61,7 +61,7 @@ markers, compatibility records, or migration paths.
 
 ## Database layout
 
-One RocksDB database contains the default column family and eight named column
+One RocksDB database contains the default column family and nine named column
 families:
 
 | Column family | Key | Value |
@@ -70,11 +70,12 @@ families:
 | `candidates` | candidate ID | node, relation-kind, or edge candidate |
 | `nodes` | node ID | embedded ID, exact name, and opaque payload |
 | `node_names` | encoded exact node name | node ID |
-| `relation_kinds` | relation-kind ID | embedded ID and exact name |
+| `relation_kinds` | relation-kind ID | embedded ID, exact name, provisional-reference count, confirmed-edge count |
 | `relation_names` | encoded exact relation-kind name | relation-kind ID |
 | `edges` | edge ID | canonical directed edge record |
 | `outgoing_edges` | source node ID, edge ID | edge ID |
 | `incoming_edges` | destination node ID, edge ID | edge ID |
+| `relation_popularity` | complemented total, complemented confirmed count, relation-kind ID | relation-kind ID |
 
 The default column family contains `next-candidate-id`, `next-node-id`,
 `next-relation-id`, and `next-edge-id`. New catalogs initialize every next ID
@@ -102,23 +103,52 @@ eight-byte candidate ID.
 
 | Kind | Tag | Remaining fields |
 | --- | --- | --- |
-| Node | `1` | exact name, opaque payload |
-| Relation kind | `2` | exact name |
-| Edge | `3` | source node ID, destination node ID, relation-kind ID, base weight |
+| Node | `1` | exact name, opaque payload, incoming candidate-reference `u64` |
+| Relation kind | `2` | exact name, incoming candidate-reference `u64` |
+| Edge | `3` | source node reference, destination node reference, relation-kind reference, base weight |
 
 An edge candidate is provisional. It has no edge ID, canonical edge record, or
-adjacency entry. Its referenced confirmed records may disappear while it is
-provisional; promotion checks them again.
+adjacency entry. Each reference is a one-byte tag (`1` confirmed, `2`
+candidate) and one big-endian eight-byte stable ID. Node references therefore
+carry a `NodeId` or node `CandidateId`; relation references carry a
+`RelationId` or relation-kind `CandidateId`. Request-local positions are never
+durable. The incoming count on node/relation-kind candidates equals the exact
+number of durable edge-candidate reference fields that name that candidate.
+
+Insertion requires every confirmed identity to exist and every local
+reference to identify the correct entry kind. Node deletion refuses while a
+provisional edge directly references that confirmed node. Strict open and
+verification reject missing, consumed, or mistyped candidate dependencies.
 
 ## Confirmed record values
 
 - A node value is the embedded node ID, exact name, and payload.
-- A relation-kind value is the embedded relation-kind ID and exact name.
+- A relation-kind value is the embedded relation-kind ID, exact name, an
+  eight-byte provisional direct-reference count, and an eight-byte confirmed
+  canonical-edge count. Their checked sum must fit `u64`.
 - An edge value is the embedded edge ID, source node ID, destination node ID,
   relation-kind ID, and base weight.
 
 Edge IDs identify individual directed edges. Parallel edges, identical-looking
 edges, and self-edges each have independent IDs and canonical records.
+
+## Relation-kind popularity index
+
+Every confirmed relation kind has exactly one 24-byte popularity key:
+
+```text
+big_endian(!total_reference_count)
+|| big_endian(!confirmed_edge_count)
+|| big_endian(RelationId)
+```
+
+Its value is the same `RelationId` as eight big-endian bytes. RocksDB forward
+iteration yields total use descending, confirmed use descending, then stable
+ID ascending. Zero-use kinds are indexed after used kinds. Candidate and edge
+mutation replaces the old key and relation record atomically. Verification
+independently recomputes provisional counts from edge candidates, incoming
+candidate counts from candidate references, confirmed counts from canonical
+edges, and the complete popularity key set.
 
 ## Adjacency indexes and invariants
 
@@ -162,20 +192,30 @@ remains a distinct background failure.
 
 ## Atomic mutations
 
-Candidate insertion writes only the candidate and advances the candidate
-counter.
+Candidate batch insertion validates and encodes the complete bounded request,
+allocates one contiguous candidate-ID range, resolves local positions to those
+IDs, aggregates dependency/provisional counts, and writes all candidates,
+count/index replacements, and the final candidate counter in one `WriteBatch`.
+Singleton insertion uses a one-entry batch.
 
-Successful promotion of a node or relation kind writes its canonical record
-and exact-name mapping, removes the candidate, and advances its stable-ID
-counter in one `WriteBatch`.
+Batch confirmation preflights a unique dependency-complete selection. It
+simulates exact-name resolution and all node/relation/edge ID allocation before
+writing. One `WriteBatch` creates every new record/name/adjacency entry,
+transfers provisional use to confirmed use, replaces popularity entries,
+removes every selected candidate, stores final counters, and invalidates the
+routing pointer only when topology changed. Duplicate-name-only confirmation
+still consumes all selected candidates but does not invalidate routing.
 
-Successful edge promotion first verifies both confirmed endpoint nodes and the
-confirmed relation kind. One `WriteBatch` then writes the canonical edge and
-both adjacency entries, removes the candidate, and advances `next-edge-id`. A
-failed promotion changes none of them.
+An incomplete dependency closure, missing identity, counter overflow,
+allocation refusal, response-limit refusal, encoding error, or RocksDB failure
+changes no candidate, counter, confirmed record, index, or routing pointer.
 
 Edge deletion verifies and deletes the canonical record and its two exact
 adjacency entries in one batch. Node deletion uses the two bounded adjacency
 prefixes, deduplicates self-edges by edge ID, validates every canonical/index
 relationship, and atomically removes all incident edge representations, the
-node, and its exact-name mapping. Provisional candidates are not deleted.
+node, and its exact-name mapping. Each affected relation count is decremented
+once per deduplicated edge. An affected relation kind whose provisional and
+confirmed counts both become zero is removed with its exact-name and popularity
+entries; the removed stable IDs are returned. Unrelated zero-use kinds are not
+swept. Provisional candidates are not deleted.

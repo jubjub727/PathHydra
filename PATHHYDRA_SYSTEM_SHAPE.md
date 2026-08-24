@@ -165,8 +165,8 @@ The durable layout needs logical key spaces for:
 - exact node-name and relation-name lookup;
 - routing snapshot manifests.
 
-Decision 0010 fixes the current layout as the default metadata family plus
-eight named column families. Dense mappings and routing manifests live in the
+Decisions 0010 and 0014 fix the current layout as the default metadata family plus
+nine named column families. Dense mappings and routing manifests live in the
 rebuildable five-file routing bundle rather than authoritative graph families.
 
 Outgoing and incoming adjacency use one fixed-width `(NodeId, EdgeId)` key per
@@ -439,7 +439,30 @@ Subgraph operations change only the caller-owned result container. They do not m
 
 Newly proposed graph material enters the Rust layer as provisional candidate data. It remains excluded from confirmed lookup, snapshot compilation, graph selection, and hydration. After validation occurs outside this system, an explicit confirmation promotes it into the confirmed graph in one atomic mutation.
 
-How candidates are produced, validated, grouped, revised, rejected, or reviewed is outside scope. The core contract covers only provisional insertion, exclusion before confirmation, and atomic promotion after validation.
+One bounded insertion may contain an ordered homogeneous or mixed batch. Edge
+entries may refer forward or backward to node and relation-kind entries by
+zero-based request position. The durable edge candidate stores the allocated
+candidate IDs, never local positions or names. Insertion resolves and checks
+the complete reference graph before one atomic candidate commit. Confirmation
+requires a unique dependency-complete candidate set and creates all nodes,
+relation kinds, edges, adjacency, exact-name mappings, usage counts, and index
+changes in one atomic confirmed commit.
+
+Stable IDs are allocated deterministically in selected request order, in the
+separate node, relation-kind, and edge identity domains. Duplicate exact node
+or relation names consume independently but resolve to one stable confirmed
+record. A changed confirmed batch causes one complete routing rebuild and at
+most one publication. A duplicate-name-only batch consumes its candidates and
+reports that publication was not required.
+
+Each confirmed relation kind durably records provisional direct edge-candidate
+references and confirmed canonical edge uses. A popularity index orders their
+checked total descending, confirmed count descending, then stable ID ascending.
+Edge and node-cascade deletion update these counts atomically and remove an
+affected relation kind only when both resulting counts are zero. Provisional
+node references prevent node deletion from creating a dangling candidate.
+
+How candidates are produced, validated, revised, rejected, or reviewed is outside scope. The core contract covers bounded grouping, provisional insertion, exclusion before confirmation, and atomic promotion after validation.
 
 ## Confirmed graph deletion
 
@@ -447,7 +470,10 @@ The Rust API supports direct removal of a confirmed directed relation and remova
 
 Deletion must be reflected when the routing image is rebuilt. The routing layer must not admit new work against an image known to contain deleted graph material.
 
-A provisional candidate that refers to an endpoint removed before promotion cannot be confirmed without a new valid endpoint state.
+A confirmed node with a durable provisional edge reference cannot be removed;
+this prevents an ordinary mutation from manufacturing a dangling stable
+candidate reference. Corrupt or externally modified dangling references are
+rejected by strict open and verification.
 
 ## Rust public API
 
@@ -598,7 +624,7 @@ consolidates the selections and points to their detailed evidence:
 | Algorithm/tuning | Frontier default; explicit positive-delta stepping; compact active tasks; one lane/zero delay default. |
 | Numeric representation | Canonical binary32 operands, separate checked binary64 multiply/add, stable predecessor tie policy. |
 | Edge identity | Stable standalone `EdgeId`; parallel/self edges retained independently. |
-| RocksDB layout | Default metadata plus eight named families; fixed big-endian keys and exact length-checked values. |
+| RocksDB layout | Default metadata plus nine named families; fixed big-endian keys and exact length-checked values. |
 | Adjacency/high degree | One outgoing/incoming durable entry per edge; bounded routing source segments. |
 | Publication | Complete immutable rebuild; no overlay or incremental publication. |
 | Hydration snapshots | Current-state record hydration with explicit missing evidence. |

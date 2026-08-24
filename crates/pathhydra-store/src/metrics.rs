@@ -25,6 +25,7 @@ pub enum WriteOperationClass {
 pub struct WriteMetrics {
     pub attempts: u64,
     pub failures: u64,
+    pub committed_entries: u64,
     pub committed_bytes: u64,
 }
 
@@ -123,9 +124,17 @@ impl StoreMetrics {
         }
     }
 
-    pub(crate) fn record_write_success(&self, class: WriteOperationClass, bytes: usize) {
+    pub(crate) fn record_write_success(
+        &self,
+        class: WriteOperationClass,
+        entries: usize,
+        bytes: usize,
+    ) {
         if let Ok(mut state) = self.state.lock() {
             let value = state.writes.entry(class).or_default();
+            value.committed_entries = value
+                .committed_entries
+                .saturating_add(u64::try_from(entries).unwrap_or(u64::MAX));
             value.committed_bytes = value
                 .committed_bytes
                 .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));

@@ -1,6 +1,7 @@
 use pathhydra_core::{
-    BaseWeight, Candidate, CandidateId, EdgeId, EdgeRecord, MAX_NODE_PAYLOAD_BYTES, NodeId,
-    NodeName, NodePayload, NodeRecord, RelationId, RelationName, RelationRecord,
+    BaseWeight, Candidate, CandidateId, CandidateNodeReference, CandidateRelationReference, EdgeId,
+    EdgeRecord, MAX_NODE_PAYLOAD_BYTES, NodeId, NodeName, NodePayload, NodeRecord, RelationId,
+    RelationName, RelationRecord,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -10,6 +11,7 @@ pub(crate) enum CodecError {
     InvalidLength(u32),
     InvalidUtf8,
     InvalidCandidateKind(u8),
+    InvalidCandidateReferenceKind(u8),
     InvalidBaseWeight(u32),
     IdMismatch { expected: u64, found: u64 },
     NameTooLong(usize),
@@ -24,6 +26,9 @@ impl std::fmt::Display for CodecError {
             Self::InvalidLength(length) => write!(formatter, "invalid byte length {length}"),
             Self::InvalidUtf8 => formatter.write_str("invalid UTF-8"),
             Self::InvalidCandidateKind(kind) => write!(formatter, "unknown candidate kind {kind}"),
+            Self::InvalidCandidateReferenceKind(kind) => {
+                write!(formatter, "unknown candidate reference kind {kind}")
+            }
             Self::InvalidBaseWeight(bits) => {
                 write!(formatter, "invalid base-weight bits 0x{bits:08x}")
             }
@@ -208,16 +213,27 @@ pub(crate) fn decode_u64_record(bytes: &[u8]) -> Result<u64, CodecError> {
 pub(crate) fn encode_candidate(candidate: &Candidate) -> Result<Vec<u8>, CodecError> {
     let mut output = Vec::new();
     match candidate {
-        Candidate::Node { id, name, payload } => {
+        Candidate::Node {
+            id,
+            name,
+            payload,
+            incoming_reference_count,
+        } => {
             output.push(1);
             output.extend_from_slice(&id.as_u64().to_be_bytes());
             push_string(&mut output, name.as_str())?;
             push_bytes(&mut output, payload.as_bytes())?;
+            output.extend_from_slice(&incoming_reference_count.to_be_bytes());
         }
-        Candidate::Relation { id, name } => {
+        Candidate::Relation {
+            id,
+            name,
+            incoming_reference_count,
+        } => {
             output.push(2);
             output.extend_from_slice(&id.as_u64().to_be_bytes());
             push_string(&mut output, name.as_str())?;
+            output.extend_from_slice(&incoming_reference_count.to_be_bytes());
         }
         Candidate::Edge {
             id,
@@ -228,9 +244,9 @@ pub(crate) fn encode_candidate(candidate: &Candidate) -> Result<Vec<u8>, CodecEr
         } => {
             output.push(3);
             output.extend_from_slice(&id.as_u64().to_be_bytes());
-            output.extend_from_slice(&source.as_u64().to_be_bytes());
-            output.extend_from_slice(&destination.as_u64().to_be_bytes());
-            output.extend_from_slice(&relation_kind.as_u64().to_be_bytes());
+            encode_node_reference(&mut output, *source);
+            encode_node_reference(&mut output, *destination);
+            encode_relation_reference(&mut output, *relation_kind);
             output.extend_from_slice(&base_weight.to_bits().to_be_bytes());
         }
     }
@@ -247,16 +263,18 @@ pub(crate) fn decode_candidate(bytes: &[u8], expected_id: u64) -> Result<Candida
             id,
             name: NodeName::new(reader.string()?),
             payload: reader.payload()?,
+            incoming_reference_count: reader.u64()?,
         },
         2 => Candidate::Relation {
             id,
             name: RelationName::new(reader.string()?),
+            incoming_reference_count: reader.u64()?,
         },
         3 => Candidate::Edge {
             id,
-            source: NodeId::from_u64(reader.u64()?),
-            destination: NodeId::from_u64(reader.u64()?),
-            relation_kind: RelationId::from_u64(reader.u64()?),
+            source: decode_node_reference(&mut reader)?,
+            destination: decode_node_reference(&mut reader)?,
+            relation_kind: decode_relation_reference(&mut reader)?,
             base_weight: reader.weight()?,
         },
         other => return Err(CodecError::InvalidCandidateKind(other)),
@@ -283,7 +301,10 @@ pub(crate) fn decode_node(bytes: &[u8], expected_id: u64) -> Result<NodeRecord, 
 }
 
 pub(crate) fn encode_relation(record: &RelationRecord) -> Result<Vec<u8>, CodecError> {
-    encode_named_record(record.id().as_u64(), record.name().as_str())
+    let mut output = encode_named_record(record.id().as_u64(), record.name().as_str())?;
+    output.extend_from_slice(&record.provisional_reference_count().to_be_bytes());
+    output.extend_from_slice(&record.confirmed_edge_count().to_be_bytes());
+    Ok(output)
 }
 
 pub(crate) fn decode_relation(
@@ -293,11 +314,90 @@ pub(crate) fn decode_relation(
     let mut reader = Reader::new(bytes);
     let id = checked_id(&mut reader, expected_id)?;
     let name = reader.string()?;
+    let provisional_reference_count = reader.u64()?;
+    let confirmed_edge_count = reader.u64()?;
     reader.finish()?;
-    Ok(RelationRecord::new(
+    provisional_reference_count
+        .checked_add(confirmed_edge_count)
+        .ok_or(CodecError::InvalidLength(u32::MAX))?;
+    Ok(RelationRecord::with_usage(
         RelationId::from_u64(id),
         RelationName::new(name),
+        provisional_reference_count,
+        confirmed_edge_count,
     ))
+}
+
+fn encode_node_reference(output: &mut Vec<u8>, reference: CandidateNodeReference) {
+    match reference {
+        CandidateNodeReference::Confirmed(id) => {
+            output.push(1);
+            output.extend_from_slice(&id.as_u64().to_be_bytes());
+        }
+        CandidateNodeReference::Candidate(id) => {
+            output.push(2);
+            output.extend_from_slice(&id.as_u64().to_be_bytes());
+        }
+    }
+}
+
+fn decode_node_reference(reader: &mut Reader<'_>) -> Result<CandidateNodeReference, CodecError> {
+    match reader.byte()? {
+        1 => Ok(CandidateNodeReference::Confirmed(NodeId::from_u64(
+            reader.u64()?,
+        ))),
+        2 => Ok(CandidateNodeReference::Candidate(CandidateId::from_u64(
+            reader.u64()?,
+        ))),
+        other => Err(CodecError::InvalidCandidateReferenceKind(other)),
+    }
+}
+
+fn encode_relation_reference(output: &mut Vec<u8>, reference: CandidateRelationReference) {
+    match reference {
+        CandidateRelationReference::Confirmed(id) => {
+            output.push(1);
+            output.extend_from_slice(&id.as_u64().to_be_bytes());
+        }
+        CandidateRelationReference::Candidate(id) => {
+            output.push(2);
+            output.extend_from_slice(&id.as_u64().to_be_bytes());
+        }
+    }
+}
+
+fn decode_relation_reference(
+    reader: &mut Reader<'_>,
+) -> Result<CandidateRelationReference, CodecError> {
+    match reader.byte()? {
+        1 => Ok(CandidateRelationReference::Confirmed(RelationId::from_u64(
+            reader.u64()?,
+        ))),
+        2 => Ok(CandidateRelationReference::Candidate(
+            CandidateId::from_u64(reader.u64()?),
+        )),
+        other => Err(CodecError::InvalidCandidateReferenceKind(other)),
+    }
+}
+
+pub(crate) fn encode_popularity_key(record: &RelationRecord) -> Result<[u8; 24], CodecError> {
+    let total = record
+        .total_reference_count()
+        .ok_or(CodecError::InvalidLength(u32::MAX))?;
+    let mut output = [0; 24];
+    output[..8].copy_from_slice(&(!total).to_be_bytes());
+    output[8..16].copy_from_slice(&(!record.confirmed_edge_count()).to_be_bytes());
+    output[16..].copy_from_slice(&record.id().as_u64().to_be_bytes());
+    Ok(output)
+}
+
+pub(crate) fn decode_popularity_key(bytes: &[u8]) -> Result<(u64, u64, RelationId), CodecError> {
+    let mut reader = Reader::new(bytes);
+    let total = !reader.u64()?;
+    let confirmed = !reader.u64()?;
+    let id = RelationId::from_u64(reader.u64()?);
+    reader.finish()?;
+    Ok((total, confirmed, id))
 }
 
 fn encode_named_record(id: u64, name: &str) -> Result<Vec<u8>, CodecError> {
@@ -353,12 +453,13 @@ mod tests {
             id: CandidateId::from_u64(7),
             name: NodeName::new(" toke\u{301}n "),
             payload: NodePayload::from([0, 0xff]),
+            incoming_reference_count: 0,
         };
         let edge_candidate = Candidate::Edge {
             id: CandidateId::from_u64(8),
-            source: NodeId::from_u64(2),
-            destination: NodeId::from_u64(3),
-            relation_kind: RelationId::from_u64(4),
+            source: CandidateNodeReference::Confirmed(NodeId::from_u64(2)),
+            destination: CandidateNodeReference::Confirmed(NodeId::from_u64(3)),
+            relation_kind: CandidateRelationReference::Confirmed(RelationId::from_u64(4)),
             base_weight: BaseWeight::new(0.25).unwrap(),
         };
         let node = NodeRecord::new(

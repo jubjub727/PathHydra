@@ -14,8 +14,12 @@ mod options;
 mod paths;
 
 pub use catalog::{
-    ActiveRoutingImage, Catalog, CatalogConfig, ConfirmedGraphRecords, ConfirmedGraphScan,
-    ConfirmedRecordBatch, ScanError,
+    ActiveRoutingImage, BatchNodeReference, BatchRelationReference, CandidateBatchConfirmation,
+    CandidateBatchCounts, CandidateBatchEntry, CandidateBatchInsertResult, Catalog, CatalogConfig,
+    ConfirmedGraphRecords, ConfirmedGraphScan, ConfirmedRecordBatch, DeletionResult,
+    MAXIMUM_CANDIDATE_BATCH_ENTRIES, MAXIMUM_CANDIDATE_BATCH_ESTIMATED_BYTES,
+    MAXIMUM_CANDIDATE_BATCH_NAME_BYTES, MAXIMUM_CANDIDATE_BATCH_PAYLOAD_BYTES, RelationKindUsage,
+    ScanError,
 };
 pub use error::{CatalogError, ConfirmedId, EdgeEndpoint, RecordKind};
 pub use metrics::{
@@ -30,9 +34,9 @@ pub use operations::{
 };
 pub use options::{WAL_SYNC_POLICY, WalSyncPolicy};
 pub use pathhydra_core::{
-    BaseWeight, Candidate, CandidateId, ConfirmedRecord, EdgeId, EdgeRecord, InvalidBaseWeight,
-    MAX_NODE_PAYLOAD_BYTES, NodeId, NodeName, NodePayload, NodeRecord, RelationId, RelationName,
-    RelationRecord,
+    BaseWeight, Candidate, CandidateId, CandidateNodeReference, CandidateRelationReference,
+    ConfirmedRecord, EdgeId, EdgeRecord, InvalidBaseWeight, MAX_NODE_PAYLOAD_BYTES, NodeId,
+    NodeName, NodePayload, NodeRecord, RelationId, RelationName, RelationRecord,
 };
 pub use paths::{
     OperationalPathRequest, PathTarget, ResolvedOperationalPaths, validate_operational_paths,

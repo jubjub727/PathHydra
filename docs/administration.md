@@ -1,5 +1,12 @@
 # Local administration
 
+Relation popularity is authoritative current catalog metadata, not a runtime
+query statistic. `most_used_relation_kinds` performs a bounded ordered snapshot
+read. Verification, checkpoint validation, and restore independently reconcile
+both usage domains and the popularity index. Administrators must not edit
+candidate, edge, adjacency, relation usage, or popularity records directly;
+all graph mutations go through catalog operations under the mutation lock.
+
 `pathhydra-admin` is a finite local administration tool, not a RocksDB shell.
 Inspection opens an existing catalog through the strict read-only store API and
 never initializes a missing directory. Successful output is one compact JSON

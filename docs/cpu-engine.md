@@ -9,11 +9,18 @@ examined-edge budgets remain CPU-only. The API is pre-release and concrete.
 ## Publication
 
 Provisional candidates cannot affect confirmed lookup, routing, or hydration,
-so inserting them does not publish. Every successful confirmed promotion, edge
-removal, or cascading node removal holds the publication write lock from before
-durable mutation through a consistent streaming confirmed scan, complete bundle
-compilation, validation, and image publication. The replacement becomes visible
-only after all configured topology/metadata limits and technical checks pass.
+so singleton or batch insertion does not publish. Every graph-changing
+singleton or batch confirmation, edge removal, or cascading node removal holds
+the publication write lock from before its one durable mutation through one
+consistent streaming confirmed scan, complete bundle compilation, validation,
+and image publication. A batch never rebuilds once per entry. The replacement
+becomes visible only after all configured topology/metadata limits and
+technical checks pass.
+
+A duplicate-name-only node/relation confirmation consumes all selected
+candidates without invalidating the active routing pointer. It reports
+`NotRequired` and performs no bundle build or state swap. A changed batch has
+one `Published` or `RoutingUnavailable` outcome for its complete durable result.
 
 The mutation result separates its durable result from `Published` or `RoutingUnavailable`. A post-commit failure therefore cannot encourage a caller to retry a consumed candidate. When unavailable, the catalog remains usable for inspection and repair. `rebuild_routing_image` explicitly retries a full build.
 

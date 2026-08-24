@@ -311,18 +311,112 @@ pub enum CandidateDto {
         id: CandidateIdDto,
         name: String,
         payload: PayloadDto,
+        incoming_reference_count: DecimalU64Dto,
     },
     RelationKind {
         id: CandidateIdDto,
         name: String,
+        incoming_reference_count: DecimalU64Dto,
     },
     Edge {
         id: CandidateIdDto,
-        source: NodeIdDto,
-        destination: NodeIdDto,
-        relation_kind: RelationIdDto,
+        source: CandidateNodeReferenceDto,
+        destination: CandidateNodeReferenceDto,
+        relation_kind: CandidateRelationReferenceDto,
         base_weight: Binary32Dto,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+pub enum CandidateNodeReferenceDto {
+    ConfirmedNode { id: NodeIdDto },
+    Candidate { id: CandidateIdDto },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+pub enum CandidateRelationReferenceDto {
+    ConfirmedRelationKind { id: RelationIdDto },
+    Candidate { id: CandidateIdDto },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+pub enum BatchNodeReferenceDto {
+    ConfirmedNode { id: NodeIdDto },
+    BatchNode { entry_index: DecimalU64Dto },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+pub enum BatchRelationReferenceDto {
+    ConfirmedRelationKind { id: RelationIdDto },
+    BatchRelationKind { entry_index: DecimalU64Dto },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+pub enum CandidateBatchEntryDto {
+    Node {
+        exact_name: String,
+        payload: PayloadDto,
+    },
+    RelationKind {
+        exact_name: String,
+    },
+    Edge {
+        source: BatchNodeReferenceDto,
+        destination: BatchNodeReferenceDto,
+        relation_kind: BatchRelationReferenceDto,
+        base_weight: Binary32Dto,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InsertCandidateBatchRequestDto {
+    pub entries: Vec<CandidateBatchEntryDto>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateBatchCountsDto {
+    pub nodes: DecimalU64Dto,
+    pub relation_kinds: DecimalU64Dto,
+    pub edges: DecimalU64Dto,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InsertCandidateBatchResultDto {
+    pub candidate_ids: Vec<CandidateIdDto>,
+    pub counts: CandidateBatchCountsDto,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmCandidateBatchRequestDto {
+    pub candidate_ids: Vec<CandidateIdDto>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmedBatchEntryDto {
+    pub candidate_id: CandidateIdDto,
+    pub record: ConfirmedRecordDto,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmCandidateBatchResultDto {
+    pub entries: Vec<ConfirmedBatchEntryDto>,
+    pub counts: CandidateBatchCountsDto,
+    pub candidates_consumed: DecimalU64Dto,
+    pub created_nodes: DecimalU64Dto,
+    pub created_relation_kinds: DecimalU64Dto,
+    pub graph_changed: bool,
+    pub publication: PublicationOutcomeDto,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -336,6 +430,21 @@ pub struct NodeRecordDto {
 pub struct RelationKindRecordDto {
     pub id: RelationIdDto,
     pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationKindUsageDto {
+    pub relation_kind: RelationKindRecordDto,
+    pub provisional_reference_count: DecimalU64Dto,
+    pub confirmed_edge_count: DecimalU64Dto,
+    pub total_reference_count: DecimalU64Dto,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationKindUsageResultDto {
+    pub relation_kinds: Vec<RelationKindUsageDto>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -973,6 +1082,7 @@ pub struct ImageBuildReportDto {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, tag = "outcome", rename_all = "snake_case")]
 pub enum PublicationOutcomeDto {
+    NotRequired,
     Published {
         report: ImageBuildReportDto,
     },
@@ -990,8 +1100,14 @@ pub enum PublicationOutcomeDto {
 )]
 pub enum MutationDurableResultDto {
     Confirmed(ConfirmedRecordDto),
-    EdgeRemoved(EdgeIdDto),
-    NodeRemoved(NodeIdDto),
+    EdgeRemoved {
+        edge: EdgeIdDto,
+        removed_relation_kinds: Vec<RelationIdDto>,
+    },
+    NodeRemoved {
+        node: NodeIdDto,
+        removed_relation_kinds: Vec<RelationIdDto>,
+    },
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1054,6 +1170,15 @@ pub struct ApiLimitsDto {
     pub maximum_diagnostic_text_bytes: DecimalU64Dto,
     pub maximum_nesting_depth: DecimalU64Dto,
     pub maximum_json_values: DecimalU64Dto,
+    pub maximum_batch_entries: DecimalU64Dto,
+    pub maximum_batch_node_entries: DecimalU64Dto,
+    pub maximum_batch_relation_kind_entries: DecimalU64Dto,
+    pub maximum_batch_edge_entries: DecimalU64Dto,
+    pub maximum_batch_name_bytes: DecimalU64Dto,
+    pub maximum_batch_payload_bytes: DecimalU64Dto,
+    pub maximum_batch_references: DecimalU64Dto,
+    pub maximum_batch_estimated_bytes: DecimalU64Dto,
+    pub maximum_relation_kind_usage_results: DecimalU64Dto,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

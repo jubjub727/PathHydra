@@ -26,8 +26,8 @@ if ($rowMatches.Count -eq 0) {
 if ($rowMatches.Count -ne $allRows.Count) {
     throw "one or more SS rows lack the complete schema or an allowed terminal status"
 }
-if ($rowMatches.Count -lt 141) {
-    throw "the current system-shape inventory contains fewer than its 141 reviewed requirements"
+if ($rowMatches.Count -lt 146) {
+    throw "the current system-shape inventory contains fewer than its 146 reviewed requirements"
 }
 $seen = [Collections.Generic.HashSet[string]]::new()
 foreach ($row in $rowMatches) {

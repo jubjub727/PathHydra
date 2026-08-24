@@ -1,5 +1,13 @@
 # Backup and restore
 
+Checkpoints include provisional mixed batches, stable candidate-to-candidate
+references, relation-kind usage counts, and the complete popularity index.
+Validation and restore recompute dependency, provisional-use, and
+confirmed-edge counts from candidates and canonical edges; a missing, extra,
+stale, or malformed popularity entry is corruption. A restored unconfirmed
+mixed batch can be confirmed with the same dependency-complete candidate-ID
+selection. Routing bundles remain rebuildable and optional.
+
 RocksDB checkpoint is PathHydra's local backup contract. Confirmed records and
 provisional candidates are authoritative and are included. Routing-image
 bundles are rebuildable and are omitted by default.

@@ -6,8 +6,9 @@ pub(crate) const RELATION_NAMES: &str = "relation_names";
 pub(crate) const EDGES: &str = "edges";
 pub(crate) const OUTGOING_EDGES: &str = "outgoing_edges";
 pub(crate) const INCOMING_EDGES: &str = "incoming_edges";
+pub(crate) const RELATION_POPULARITY: &str = "relation_popularity";
 
-pub(crate) const ALL: [&str; 8] = [
+pub(crate) const ALL: [&str; 9] = [
     CANDIDATES,
     NODES,
     NODE_NAMES,
@@ -16,4 +17,5 @@ pub(crate) const ALL: [&str; 8] = [
     EDGES,
     OUTGOING_EDGES,
     INCOMING_EDGES,
+    RELATION_POPULARITY,
 ];

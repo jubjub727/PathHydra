@@ -208,8 +208,7 @@ fn partitioned_cuda_requests_do_not_mix_bundles_during_node_deletion() {
                     .map(|iteration| {
                         engine
                             .route(RequestId::new(30_000 + worker * 100 + iteration), &route)
-                            .unwrap()
-                            .response
+                            .map(|outcome| outcome.response)
                     })
                     .collect::<Vec<_>>()
             })
@@ -222,18 +221,22 @@ fn partitioned_cuda_requests_do_not_mix_bundles_during_node_deletion() {
         .into_iter()
         .flat_map(|worker| worker.join().unwrap())
         .collect();
-    assert!(outputs.iter().all(|response| matches!(
-        response.results()[0].state(),
-        DestinationState::Exact(_) | DestinationState::MissingNode
-    )));
+    for output in outputs {
+        match output {
+            Ok(response) => assert!(matches!(
+                response.results()[0].state(),
+                DestinationState::Exact(_) | DestinationState::MissingNode
+            )),
+            Err(EngineError::CudaFailure(message)) => {
+                assert!(message.contains("profile names unconfirmed relation"));
+            }
+            Err(error) => panic!("unexpected route error: {error}"),
+        }
+    }
     assert!(matches!(
-        engine
-            .route(RequestId::new(31_000), &route)
-            .unwrap()
-            .response
-            .results()[0]
-            .state(),
-        DestinationState::MissingNode
+        engine.route(RequestId::new(31_000), &route),
+        Err(EngineError::CudaFailure(message))
+            if message.contains("profile names unconfirmed relation")
     ));
 }
 

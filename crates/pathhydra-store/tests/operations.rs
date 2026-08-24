@@ -14,7 +14,7 @@ use pathhydra_store::{
 use rocksdb::{DB, IteratorMode, Options};
 use tempfile::TempDir;
 
-const COLUMN_FAMILIES: [&str; 8] = [
+const COLUMN_FAMILIES: [&str; 9] = [
     "candidates",
     "nodes",
     "node_names",
@@ -23,6 +23,7 @@ const COLUMN_FAMILIES: [&str; 8] = [
     "edges",
     "outgoing_edges",
     "incoming_edges",
+    "relation_popularity",
 ];
 
 #[test]
@@ -175,7 +176,8 @@ fn checkpoint_and_restore_preserve_candidates_confirmed_state_and_deletion_histo
         b"not a backup"
     );
 
-    catalog.remove_node(restored_node.id()).unwrap();
+    let removed_after_checkpoint = confirm_node(&catalog, "removed-after-checkpoint");
+    catalog.remove_node(removed_after_checkpoint.id()).unwrap();
     catalog.insert_node_candidate("after-checkpoint").unwrap();
     let restore = directory.path().join("restore");
     let restored = catalog

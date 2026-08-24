@@ -19,6 +19,8 @@ pub enum CodecLimit {
     SubgraphNodes,
     SubgraphEdges,
     DiagnosticTextBytes,
+    BatchEntries,
+    RelationKindUsageResults,
 }
 
 /// Syntax classes callers may safely branch on without inspecting input.
@@ -586,6 +588,103 @@ impl CanonicalDto for CandidateDto {
             Self::RelationKind { name, .. } => validate_name(name, limits),
             Self::Edge { base_weight, .. } => validate_base_weight(base_weight),
         }
+    }
+}
+
+impl CanonicalDto for CandidateBatchEntryDto {
+    fn validate_boundary(&self, limits: &ApiLimits) -> Result<(), ApiCodecError> {
+        match self {
+            Self::Node {
+                exact_name,
+                payload,
+            } => {
+                validate_name(exact_name, limits)?;
+                payload.validate_boundary(limits)
+            }
+            Self::RelationKind { exact_name } => validate_name(exact_name, limits),
+            Self::Edge { base_weight, .. } => validate_base_weight(base_weight),
+        }
+    }
+}
+
+impl CanonicalDto for InsertCandidateBatchRequestDto {
+    fn validate_boundary(&self, limits: &ApiLimits) -> Result<(), ApiCodecError> {
+        bounded_len(
+            CodecLimit::BatchEntries,
+            limits.maximum_batch_entries,
+            self.entries.len(),
+        )?;
+        if self.entries.is_empty() {
+            return Err(ApiCodecError::contextual_validation());
+        }
+        for entry in &self.entries {
+            entry.validate_boundary(limits)?;
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalDto for InsertCandidateBatchResultDto {
+    fn validate_boundary(&self, limits: &ApiLimits) -> Result<(), ApiCodecError> {
+        bounded_len(
+            CodecLimit::BatchEntries,
+            limits.maximum_batch_entries,
+            self.candidate_ids.len(),
+        )
+    }
+}
+
+impl CanonicalDto for ConfirmCandidateBatchRequestDto {
+    fn validate_boundary(&self, limits: &ApiLimits) -> Result<(), ApiCodecError> {
+        bounded_len(
+            CodecLimit::BatchEntries,
+            limits.maximum_batch_entries,
+            self.candidate_ids.len(),
+        )?;
+        if self.candidate_ids.is_empty() {
+            return Err(ApiCodecError::contextual_validation());
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalDto for ConfirmedBatchEntryDto {
+    fn validate_boundary(&self, limits: &ApiLimits) -> Result<(), ApiCodecError> {
+        self.record.validate_boundary(limits)
+    }
+}
+
+impl CanonicalDto for ConfirmCandidateBatchResultDto {
+    fn validate_boundary(&self, limits: &ApiLimits) -> Result<(), ApiCodecError> {
+        bounded_len(
+            CodecLimit::BatchEntries,
+            limits.maximum_batch_entries,
+            self.entries.len(),
+        )?;
+        for entry in &self.entries {
+            entry.validate_boundary(limits)?;
+        }
+        self.publication.validate_boundary(limits)
+    }
+}
+
+impl CanonicalDto for RelationKindUsageDto {
+    fn validate_boundary(&self, limits: &ApiLimits) -> Result<(), ApiCodecError> {
+        self.relation_kind.validate_boundary(limits)
+    }
+}
+
+impl CanonicalDto for RelationKindUsageResultDto {
+    fn validate_boundary(&self, limits: &ApiLimits) -> Result<(), ApiCodecError> {
+        bounded_len(
+            CodecLimit::RelationKindUsageResults,
+            limits.maximum_relation_kind_usage_results,
+            self.relation_kinds.len(),
+        )?;
+        for record in &self.relation_kinds {
+            record.validate_boundary(limits)?;
+        }
+        Ok(())
     }
 }
 
@@ -1236,6 +1335,7 @@ impl CanonicalDto for ImageBuildReportDto {
 impl CanonicalDto for PublicationOutcomeDto {
     fn validate_boundary(&self, limits: &ApiLimits) -> Result<(), ApiCodecError> {
         match self {
+            Self::NotRequired => Ok(()),
             Self::Published { report } | Self::RoutingUnavailable { report, .. } => {
                 report.validate_boundary(limits)
             }
@@ -1247,7 +1347,18 @@ impl CanonicalDto for MutationDurableResultDto {
     fn validate_boundary(&self, limits: &ApiLimits) -> Result<(), ApiCodecError> {
         match self {
             Self::Confirmed(record) => record.validate_boundary(limits),
-            Self::EdgeRemoved(_) | Self::NodeRemoved(_) => Ok(()),
+            Self::EdgeRemoved {
+                removed_relation_kinds,
+                ..
+            }
+            | Self::NodeRemoved {
+                removed_relation_kinds,
+                ..
+            } => bounded_len(
+                CodecLimit::RelationKindUsageResults,
+                limits.maximum_relation_kind_usage_results,
+                removed_relation_kinds.len(),
+            ),
         }
     }
 }

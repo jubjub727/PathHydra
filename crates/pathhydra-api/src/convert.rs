@@ -1,6 +1,6 @@
 use pathhydra_core::{
-    BaseWeight, Candidate, CandidateId, ConfirmedRecord, EdgeId, EdgeRecord, NodeId, NodeRecord,
-    RelationId, RelationRecord,
+    BaseWeight, Candidate, CandidateId, CandidateNodeReference, CandidateRelationReference,
+    ConfirmedRecord, EdgeId, EdgeRecord, NodeId, NodeRecord, RelationId, RelationRecord,
 };
 use pathhydra_engine::{
     ActiveOperationCounts, CancellationOutcome, CudaAlgorithmSelection, CudaAvailability,
@@ -19,8 +19,9 @@ use pathhydra_routing::{
     RoutingRequest, RoutingResponse, SearchBudget, TiePolicy,
 };
 use pathhydra_store::{
-    CatalogSummary, CheckpointReport, CompactionFamilyReport, CompactionReport, MetricValue,
-    RestoreReport, StoreMetricsSnapshot, VerificationLimits, VerificationReport,
+    CandidateBatchCounts, CatalogSummary, CheckpointReport, CompactionFamilyReport,
+    CompactionReport, DeletionResult, MetricValue, RelationKindUsage, RestoreReport,
+    StoreMetricsSnapshot, VerificationLimits, VerificationReport,
 };
 use pathhydra_subgraph::{Subgraph, SubgraphHandles};
 
@@ -116,14 +117,25 @@ impl TryFrom<&RequestIdDto> for pathhydra_engine::RequestId {
 impl From<&Candidate> for CandidateDto {
     fn from(value: &Candidate) -> Self {
         match value {
-            Candidate::Node { id, name, payload } => Self::Node {
+            Candidate::Node {
+                id,
+                name,
+                payload,
+                incoming_reference_count,
+            } => Self::Node {
                 id: (*id).into(),
                 name: name.as_str().to_owned(),
                 payload: PayloadDto::from_bytes(payload.as_bytes()),
+                incoming_reference_count: DecimalU64Dto::from_u64(*incoming_reference_count),
             },
-            Candidate::Relation { id, name } => Self::RelationKind {
+            Candidate::Relation {
+                id,
+                name,
+                incoming_reference_count,
+            } => Self::RelationKind {
                 id: (*id).into(),
                 name: name.as_str().to_owned(),
+                incoming_reference_count: DecimalU64Dto::from_u64(*incoming_reference_count),
             },
             Candidate::Edge {
                 id,
@@ -138,6 +150,54 @@ impl From<&Candidate> for CandidateDto {
                 relation_kind: (*relation_kind).into(),
                 base_weight: Binary32Dto::from_bits(base_weight.to_bits()),
             },
+        }
+    }
+}
+
+impl From<CandidateNodeReference> for CandidateNodeReferenceDto {
+    fn from(value: CandidateNodeReference) -> Self {
+        match value {
+            CandidateNodeReference::Confirmed(id) => Self::ConfirmedNode { id: id.into() },
+            CandidateNodeReference::Candidate(id) => Self::Candidate { id: id.into() },
+        }
+    }
+}
+
+impl From<CandidateRelationReference> for CandidateRelationReferenceDto {
+    fn from(value: CandidateRelationReference) -> Self {
+        match value {
+            CandidateRelationReference::Confirmed(id) => {
+                Self::ConfirmedRelationKind { id: id.into() }
+            }
+            CandidateRelationReference::Candidate(id) => Self::Candidate { id: id.into() },
+        }
+    }
+}
+
+impl From<CandidateBatchCounts> for CandidateBatchCountsDto {
+    fn from(value: CandidateBatchCounts) -> Self {
+        Self {
+            nodes: count(value.nodes),
+            relation_kinds: count(value.relation_kinds),
+            edges: count(value.edges),
+        }
+    }
+}
+
+impl From<&RelationKindUsage> for RelationKindUsageDto {
+    fn from(value: &RelationKindUsage) -> Self {
+        let record = &value.relation_kind;
+        Self {
+            relation_kind: record.into(),
+            provisional_reference_count: DecimalU64Dto::from_u64(
+                record.provisional_reference_count(),
+            ),
+            confirmed_edge_count: DecimalU64Dto::from_u64(record.confirmed_edge_count()),
+            total_reference_count: DecimalU64Dto::from_u64(
+                record
+                    .total_reference_count()
+                    .expect("verified relation usage total remains representable"),
+            ),
         }
     }
 }
@@ -1049,6 +1109,7 @@ impl From<&ImageBuildReport> for ImageBuildReportDto {
 impl From<&PublicationOutcome> for PublicationOutcomeDto {
     fn from(value: &PublicationOutcome) -> Self {
         match value {
+            PublicationOutcome::NotRequired => Self::NotRequired,
             PublicationOutcome::Published(report) => Self::Published {
                 report: report.into(),
             },
@@ -1069,19 +1130,37 @@ impl From<&pathhydra_engine::ConfirmedMutation<ConfirmedRecord>> for MutationOut
 }
 pub(crate) fn edge_removal_outcome(
     edge: EdgeId,
-    value: &pathhydra_engine::ConfirmedMutation<()>,
+    value: &pathhydra_engine::ConfirmedMutation<DeletionResult>,
 ) -> MutationOutcomeDto {
     MutationOutcomeDto {
-        durable_result: MutationDurableResultDto::EdgeRemoved(edge.into()),
+        durable_result: MutationDurableResultDto::EdgeRemoved {
+            edge: edge.into(),
+            removed_relation_kinds: value
+                .durable_result()
+                .removed_relation_kinds
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect(),
+        },
         publication: value.publication().into(),
     }
 }
 pub(crate) fn node_removal_outcome(
     node: NodeId,
-    value: &pathhydra_engine::ConfirmedMutation<()>,
+    value: &pathhydra_engine::ConfirmedMutation<DeletionResult>,
 ) -> MutationOutcomeDto {
     MutationOutcomeDto {
-        durable_result: MutationDurableResultDto::NodeRemoved(node.into()),
+        durable_result: MutationDurableResultDto::NodeRemoved {
+            node: node.into(),
+            removed_relation_kinds: value
+                .durable_result()
+                .removed_relation_kinds
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect(),
+        },
         publication: value.publication().into(),
     }
 }
@@ -1141,6 +1220,15 @@ impl From<&ApiLimits> for ApiLimitsDto {
             maximum_diagnostic_text_bytes: count(v.maximum_diagnostic_text_bytes),
             maximum_nesting_depth: count(v.maximum_nesting_depth),
             maximum_json_values: count(v.maximum_json_values),
+            maximum_batch_entries: count(v.maximum_batch_entries),
+            maximum_batch_node_entries: count(v.maximum_batch_node_entries),
+            maximum_batch_relation_kind_entries: count(v.maximum_batch_relation_kind_entries),
+            maximum_batch_edge_entries: count(v.maximum_batch_edge_entries),
+            maximum_batch_name_bytes: count(v.maximum_batch_name_bytes),
+            maximum_batch_payload_bytes: count(v.maximum_batch_payload_bytes),
+            maximum_batch_references: count(v.maximum_batch_references),
+            maximum_batch_estimated_bytes: count(v.maximum_batch_estimated_bytes),
+            maximum_relation_kind_usage_results: count(v.maximum_relation_kind_usage_results),
         }
     }
 }
@@ -1176,6 +1264,39 @@ impl TryFrom<&ApiLimitsDto> for ApiLimits {
             )?,
             maximum_nesting_depth: usize_from(&v.maximum_nesting_depth, "maximum nesting depth")?,
             maximum_json_values: usize_from(&v.maximum_json_values, "maximum JSON values")?,
+            maximum_batch_entries: usize_from(&v.maximum_batch_entries, "maximum batch entries")?,
+            maximum_batch_node_entries: usize_from(
+                &v.maximum_batch_node_entries,
+                "maximum batch node entries",
+            )?,
+            maximum_batch_relation_kind_entries: usize_from(
+                &v.maximum_batch_relation_kind_entries,
+                "maximum batch relation-kind entries",
+            )?,
+            maximum_batch_edge_entries: usize_from(
+                &v.maximum_batch_edge_entries,
+                "maximum batch edge entries",
+            )?,
+            maximum_batch_name_bytes: usize_from(
+                &v.maximum_batch_name_bytes,
+                "maximum batch name bytes",
+            )?,
+            maximum_batch_payload_bytes: usize_from(
+                &v.maximum_batch_payload_bytes,
+                "maximum batch payload bytes",
+            )?,
+            maximum_batch_references: usize_from(
+                &v.maximum_batch_references,
+                "maximum batch references",
+            )?,
+            maximum_batch_estimated_bytes: usize_from(
+                &v.maximum_batch_estimated_bytes,
+                "maximum estimated batch bytes",
+            )?,
+            maximum_relation_kind_usage_results: usize_from(
+                &v.maximum_relation_kind_usage_results,
+                "maximum relation-kind usage results",
+            )?,
         })
     }
 }

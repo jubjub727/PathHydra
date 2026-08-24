@@ -866,6 +866,7 @@ fn verify_db(db: &DB, limits: VerificationLimits) -> Result<VerificationReport, 
                 column_families::INCOMING_EDGES => {
                     summary.incoming_entries = summary.incoming_entries.saturating_add(1)
                 }
+                column_families::RELATION_POPULARITY => {}
                 "default" => {}
                 _ => unreachable!(),
             }
